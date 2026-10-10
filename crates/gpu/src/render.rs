@@ -564,7 +564,8 @@ pub fn render(
     let lap = |what: &str, t: &mut Option<std::time::Instant>, cx: &mut Cx<'_>| match t {
         Some(t) => {
             cx.sync();
-            eprintln!("  gpu {what}: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+            let (peak, now) = crate::ctx::take_peak();
+            eprintln!("  gpu {what}: {:.1} ms (device buffers: peak {} MB, now {} MB)", t.elapsed().as_secs_f64() * 1e3, peak >> 20, now >> 20);
             *t = std::time::Instant::now();
         }
         None => cx.flush(),
