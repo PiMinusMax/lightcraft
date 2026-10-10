@@ -32,6 +32,7 @@ mod dng;
 pub mod dngwrite;
 pub mod gaintable;
 pub mod highlight;
+mod hotpixel;
 #[cfg(feature = "jxl")]
 mod jxl;
 pub mod ljpeg;
@@ -357,6 +358,23 @@ pub(crate) enum Mode {
 }
 
 fn decode_with(bytes: &[u8], mode: Mode) -> Result<RawImage> {
+    let mut r = decode_samples(bytes, mode)?;
+    if mode == Mode::Full && hot_pixels_enabled() {
+        let t = std::time::Instant::now();
+        let n = r.suppress_hot_pixels();
+        if std::env::var_os("LIGHTCRAFT_PROFILE").is_some() {
+            eprintln!("  raw hot pixels: {n} replaced in {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+    Ok(r)
+}
+
+/// PROTOTYPE: hot pixel suppression is on unless `LIGHTCRAFT_HOT_PIXELS=0`.
+pub fn hot_pixels_enabled() -> bool {
+    std::env::var("LIGHTCRAFT_HOT_PIXELS").map_or(true, |v| v != "0")
+}
+
+fn decode_samples(bytes: &[u8], mode: Mode) -> Result<RawImage> {
     match probe(bytes).ok_or(RawError::NotRaw)? {
         RawFormat::Dng => dng::decode(bytes, mode).map(lift_clipped),
         RawFormat::Cr2 => vendor::cr2::decode(bytes, mode),
