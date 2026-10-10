@@ -297,43 +297,124 @@ pub fn nrc_recombine(p: [f32; 3], q: [f32; 3], off: f32) -> [f32; 3] {
     if y1 > 1e-7 && yl > 0.0 { c.map(|v| v * (yl / y1)) } else { [yl.max(0.0); 3] }
 }
 
-/// One self-guided pass on each of three channels (see [`NrcPass`]).
-fn self_guided3(d: &Rgb32f, pass: &NrcPass) -> Rgb32f {
-    use lightcraft_raster::resample::{Filter, resize};
-    let step = pass.step.max(1);
-    let lo = if step > 1 { resize(d, d.width.div_ceil(step).max(1), d.height.div_ceil(step).max(1), Filter::Box) } else { d.clone() };
-    let sg = pass.sigma / step as f32;
-    let (mean, corr) = par_join(|| gaussian(&lo, sg), || gaussian(&lo.map(|c| c.map(|v| v * v)), sg));
+/// Self-guided coefficients of one pass at its subsampled size (see [`NrcPass`]): `a` and `b`
+/// per pixel of `lo`, blurred.
+fn nrc_coeffs(lo: &Rgb32f, pass: &NrcPass) -> (Rgb32f, Rgb32f) {
+    let sg = pass.sigma / pass.step.max(1) as f32;
+    let (mean, corr) = par_join(|| gaussian(lo, sg), || gaussian(&lo.map(|c| c.map(|v| v * v)), sg));
     let var = corr.zip_map(&mean, |c, m| [0, 1, 2].map(|i| (c[i] - m[i] * m[i]).max(0.0)));
     let stride = nrc_sample_stride(var.data.len());
     let samples: Vec<[f32; 3]> = var.data.iter().step_by(stride).copied().collect();
     let eps = nrc_eps(&samples, pass.k, pass.pct);
     let a = var.map(|v| [0, 1, 2].map(|i| v[i] / (v[i] + eps[i])));
     let b = mean.zip_map(&a, |m, a| [0, 1, 2].map(|i| m[i] - a[i] * m[i]));
-    let (a, b) = par_join(|| gaussian(&a, sg), || gaussian(&b, sg));
-    let (a, b) = if step > 1 {
-        par_join(|| resize(&a, d.width, d.height, Filter::Bilinear), || resize(&b, d.width, d.height, Filter::Bilinear))
-    } else {
-        (a, b)
-    };
-    let ab = a.zip_map(&b, |a, b| [a, b]);
-    d.zip_map(&ab, |d, ab| [0, 1, 2].map(|i| ab[0][i] * d[i] + ab[1][i]))
+    par_join(|| gaussian(&a, sg), || gaussian(&b, sg))
+}
+
+/// One pass's coefficients and the taps that upsample them to the full size
+/// (`resize(…, Filter::Bilinear)`, evaluated a row at a time).
+struct NrcUp {
+    a: Rgb32f,
+    b: Rgb32f,
+    ux: Vec<(usize, Vec<f32>)>,
+    uy: Vec<(usize, Vec<f32>)>,
+}
+
+#[inline]
+fn madd3(acc: [f32; 3], v: [f32; 3], f: f32) -> [f32; 3] {
+    [acc[0] + f * v[0], acc[1] + f * v[1], acc[2] + f * v[2]]
+}
+
+impl NrcUp {
+    /// Apply this pass to `d`, row `y` of the full-size chroma, in place.
+    fn apply_row(&self, y: usize, d: &mut [[f32; 3]], va: &mut Vec<[f32; 3]>, vb: &mut Vec<[f32; 3]>) {
+        let lw = self.a.width;
+        va.clear();
+        va.resize(lw, [0.0; 3]);
+        vb.clear();
+        vb.resize(lw, [0.0; 3]);
+        if let Some((y0, wy)) = self.uy.get(y) {
+            for (j, &f) in wy.iter().enumerate() {
+                let (Some(ra), Some(rb)) = (self.a.data.get((y0 + j) * lw..(y0 + j + 1) * lw), self.b.data.get((y0 + j) * lw..(y0 + j + 1) * lw)) else { continue };
+                for x in 0..lw {
+                    va[x] = madd3(va[x], ra[x], f);
+                    vb[x] = madd3(vb[x], rb[x], f);
+                }
+            }
+        }
+        for (x, p) in d.iter_mut().enumerate() {
+            let Some((x0, wx)) = self.ux.get(x) else { continue };
+            let (mut ca, mut cb) = ([0.0; 3], [0.0; 3]);
+            for (k, &f) in wx.iter().enumerate() {
+                if let (Some(a), Some(b)) = (va.get(x0 + k), vb.get(x0 + k)) {
+                    ca = madd3(ca, *a, f);
+                    cb = madd3(cb, *b, f);
+                }
+            }
+            *p = [0, 1, 2].map(|i| ca[i] * p[i] + cb[i]);
+        }
+    }
+}
+
+/// Row `y` of the chroma after the passes in `ups`, computed from the image row `src`.
+fn nrc_row(src: &[[f32; 3]], y: usize, ups: &[NrcUp], off: f32, va: &mut Vec<[f32; 3]>, vb: &mut Vec<[f32; 3]>) -> Vec<[f32; 3]> {
+    let mut d: Vec<[f32; 3]> = src.iter().map(|c| nrc_chroma(*c, off)).collect();
+    for up in ups {
+        up.apply_row(y, &mut d, va, vb);
+    }
+    d
 }
 
 /// Colour noise reduction, second method: chroma as differences of square roots (noise of about
 /// the same size at every brightness, and no blow-up near black as `c / Y` has), smoothed by a
 /// self-guided filter whose threshold follows the noise measured in the image, the luminance kept.
+///
+/// No full-size intermediate is stored: each pass's subsampled input is gathered row by row from
+/// the image (its chroma after the earlier passes, recomputed per row), and the last step applies
+/// every pass and recombines a row at a time.
 pub fn color_nr_v2(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long: usize) {
+    use lightcraft_raster::resample::{Filter, weights};
     let Some(p) = nrc_params(s, src_long, out_long) else { return };
     let _t = crate::profiling().then(std::time::Instant::now);
-    let mut q = img.map(|c| nrc_chroma(c, p.off));
+    let (w, h) = (img.width, img.height);
+    let mut ups: Vec<NrcUp> = Vec::with_capacity(p.passes.len());
     for pass in &p.passes {
-        q = self_guided3(&q, pass);
+        let step = pass.step.max(1);
+        let (lw, lh) = (w.div_ceil(step).max(1), h.div_ceil(step).max(1));
+        // `resize(chroma after the earlier passes, lw, lh, Filter::Box)`
+        let (bx, by) = (weights(w, lw, Filter::Box), weights(h, lh, Filter::Box));
+        let mut lo = Rgb32f::new(lw, lh);
+        let src = &*img;
+        let done = &ups;
+        for_rows(&mut lo.data, lw, |yo, row| {
+            let (mut va, mut vb) = (Vec::new(), Vec::new());
+            let Some((y0, wy)) = by.get(yo) else { return };
+            for (j, &f) in wy.iter().enumerate() {
+                if f == 0.0 || y0 + j >= h {
+                    continue;
+                }
+                let d = nrc_row(src.row(y0 + j), y0 + j, done, p.off, &mut va, &mut vb);
+                for (xo, o) in row.iter_mut().enumerate() {
+                    let Some((x0, wx)) = bx.get(xo) else { continue };
+                    let mut acc = [0.0; 3];
+                    for (k, &g) in wx.iter().enumerate() {
+                        if let Some(v) = d.get(x0 + k) {
+                            acc = madd3(acc, *v, g);
+                        }
+                    }
+                    *o = madd3(*o, acc, f);
+                }
+            }
+        });
+        let (a, b) = nrc_coeffs(&lo, pass);
+        ups.push(NrcUp { a, b, ux: weights(lw, w, Filter::Bilinear), uy: weights(lh, h, Filter::Bilinear) });
     }
-    let w = img.width;
+    let off = p.off;
     for_rows(&mut img.data, w, |y, row| {
-        for (x, px) in row.iter_mut().enumerate() {
-            *px = nrc_recombine(*px, q.data[y * w + x], p.off);
+        let (mut va, mut vb) = (Vec::new(), Vec::new());
+        let q = nrc_row(row, y, &ups, off, &mut va, &mut vb);
+        for (px, qv) in row.iter_mut().zip(q) {
+            *px = nrc_recombine(*px, qv, off);
         }
     });
     if let Some(t) = _t {
