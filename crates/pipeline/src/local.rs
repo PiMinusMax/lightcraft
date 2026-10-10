@@ -215,30 +215,99 @@ fn knob(name: &str, default: f32) -> f32 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-/// The `q`-quantile of every 7th value of `p` (a cheap estimate over the whole plane).
-fn quantile(p: &Plane, q: f32) -> f32 {
-    let mut v: Vec<f32> = p.data.iter().step_by(7).copied().filter(|x| x.is_finite()).collect();
-    if v.is_empty() {
-        return 0.0;
-    }
-    let i = ((v.len() - 1) as f32 * q.clamp(0.0, 1.0)) as usize;
-    let (_, m, _) = v.select_nth_unstable_by(i, f32::total_cmp);
-    *m
+/// Most samples the noise level of the new colour noise reduction is measured from. The CPU and
+/// the GPU sample the same pixels (every [`nrc_sample_stride`]-th of the plane).
+pub const NRC_SAMPLES: usize = 131_072;
+
+/// Distance between the measured samples of a plane of `len` pixels.
+pub fn nrc_sample_stride(len: usize) -> usize {
+    len.div_ceil(NRC_SAMPLES).max(7)
 }
 
-/// One self-guided pass on each of three channels: `q = a·d + b` with `a = var / (var + eps)` in
-/// Gaussian windows of `sigma`, `eps` = `k` × the `pct`-quantile of the local variance (the noise
-/// level, as flat areas show it). Returns the filtered channels.
-fn self_guided3(d: &Rgb32f, sigma: f32, k: f32, pct: f32) -> Rgb32f {
+/// One self-guided pass of the new colour noise reduction: Gaussian windows of `sigma` px, the
+/// coefficients computed on a plane subsampled by `step`, `eps = k ×` the `pct`-quantile of the
+/// local variance.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NrcPass {
+    pub sigma: f32,
+    pub step: usize,
+    pub k: f32,
+    pub pct: f32,
+}
+
+/// Parameters of the new colour noise reduction: the offset of the square roots and the passes
+/// (fine, then coarse).
+#[derive(Clone, Debug, PartialEq)]
+pub struct NrcParams {
+    pub off: f32,
+    pub passes: Vec<NrcPass>,
+}
+
+/// The new colour noise reduction's parameters at an output long edge of `out_long` px, `None`
+/// when Color is 0.
+pub fn nrc_params(s: &DevelopSettings, src_long: usize, out_long: usize) -> Option<NrcParams> {
+    let amount = (s.detail.nr_color / 100.0) as f32;
+    if amount <= 0.0 {
+        return None;
+    }
+    let detail = (s.detail.nr_color_detail / 100.0) as f32;
+    let smooth = 1.0 + (s.detail.nr_color_smoothness / 100.0) as f32;
+    let scale = (out_long as f32 / src_long.max(1) as f32).clamp(0.05, 1.0);
+    let sigma = (knob("NRV2_S0", 2.0) + knob("NRV2_S1", 10.0) * amount) * smooth * scale;
+    let k = knob("NRV2_K", 16.0) * amount * (1.5 - detail);
+    let pct = knob("NRV2_PCT", 0.2);
+    let coarse = knob("NRV2_COARSE", 3.0);
+    // the coefficients vary over about sigma: a grid of sigma / 2 holds them
+    let div = knob("NRV2_STEPDIV", 2.0).max(1.0);
+    let pass = |sigma: f32| NrcPass { sigma, step: (sigma / div).floor().clamp(1.0, 16.0) as usize, k, pct };
+    let mut passes = vec![pass(sigma)];
+    if coarse > 1.0 {
+        passes.push(pass(sigma * coarse));
+    }
+    Some(NrcParams { off: knob("NRV2_OFF", 0.003), passes })
+}
+
+/// `eps` per channel from the sampled local variances.
+pub fn nrc_eps(samples: &[[f32; 3]], k: f32, pct: f32) -> [f32; 3] {
+    [0, 1, 2].map(|c| {
+        let mut v: Vec<f32> = samples.iter().map(|s| s[c]).filter(|x| x.is_finite()).collect();
+        if v.is_empty() {
+            return 1e-12;
+        }
+        let i = ((v.len() - 1) as f32 * pct.clamp(0.0, 1.0)) as usize;
+        let (_, m, _) = v.select_nth_unstable_by(i, f32::total_cmp);
+        k * m.max(1e-12)
+    })
+}
+
+/// Chroma of a pixel as differences of square roots (`√(c + off) − √(Y + off)`).
+#[inline]
+pub fn nrc_chroma(c: [f32; 3], off: f32) -> [f32; 3] {
+    let y = (luminance_2020(c).max(0.0) + off).sqrt();
+    c.map(|v| (v.max(0.0) + off).sqrt() - y)
+}
+
+/// A pixel with its chroma replaced by `q`, its luminance kept.
+#[inline]
+pub fn nrc_recombine(p: [f32; 3], q: [f32; 3], off: f32) -> [f32; 3] {
+    let yl = luminance_2020(p);
+    let ys = (yl.max(0.0) + off).sqrt();
+    let c = q.map(|dv| ((ys + dv).max(0.0).powi(2) - off).max(0.0));
+    let y1 = luminance_2020(c);
+    if y1 > 1e-7 && yl > 0.0 { c.map(|v| v * (yl / y1)) } else { [yl.max(0.0); 3] }
+}
+
+/// One self-guided pass on each of three channels (see [`NrcPass`]).
+fn self_guided3(d: &Rgb32f, pass: &NrcPass) -> Rgb32f {
     use lightcraft_raster::resample::{Filter, resize};
-    // the coefficients are smooth: compute them on a plane subsampled by about sigma / 3 and
-    // upsample (as `guided_fast`), the output keeps full-resolution edges
-    let step = if knob("NRV2_FAST", 1.0) > 0.0 { guided_fast_step(sigma) } else { 1 };
+    let step = pass.step.max(1);
     let lo = if step > 1 { resize(d, d.width.div_ceil(step).max(1), d.height.div_ceil(step).max(1), Filter::Box) } else { d.clone() };
-    let sg = sigma / step as f32;
+    let sg = pass.sigma / step as f32;
     let (mean, corr) = par_join(|| gaussian(&lo, sg), || gaussian(&lo.map(|c| c.map(|v| v * v)), sg));
     let var = corr.zip_map(&mean, |c, m| [0, 1, 2].map(|i| (c[i] - m[i] * m[i]).max(0.0)));
-    let eps: [f32; 3] = [0, 1, 2].map(|i| k * quantile(&var.map(|v| v[i]), pct).max(1e-12));
+    let stride = nrc_sample_stride(var.data.len());
+    let samples: Vec<[f32; 3]> = var.data.iter().step_by(stride).copied().collect();
+    let eps = nrc_eps(&samples, pass.k, pass.pct);
     let a = var.map(|v| [0, 1, 2].map(|i| v[i] / (v[i] + eps[i])));
     let b = mean.zip_map(&a, |m, a| [0, 1, 2].map(|i| m[i] - a[i] * m[i]));
     let (a, b) = par_join(|| gaussian(&a, sg), || gaussian(&b, sg));
@@ -255,39 +324,20 @@ fn self_guided3(d: &Rgb32f, sigma: f32, k: f32, pct: f32) -> Rgb32f {
 /// the same size at every brightness, and no blow-up near black as `c / Y` has), smoothed by a
 /// self-guided filter whose threshold follows the noise measured in the image, the luminance kept.
 pub fn color_nr_v2(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long: usize) {
+    let Some(p) = nrc_params(s, src_long, out_long) else { return };
     let _t = crate::profiling().then(std::time::Instant::now);
-    let amount = (s.detail.nr_color / 100.0) as f32;
-    let detail = (s.detail.nr_color_detail / 100.0) as f32;
-    let smooth = 1.0 + (s.detail.nr_color_smoothness / 100.0) as f32;
-    let scale = (out_long as f32 / src_long.max(1) as f32).clamp(0.05, 1.0);
-    let off = knob("NRV2_OFF", 0.003);
-    let sigma = (knob("NRV2_S0", 2.0) + knob("NRV2_S1", 10.0) * amount) * smooth * scale;
-    let k = knob("NRV2_K", 16.0) * amount * (1.5 - detail);
-    let pct = knob("NRV2_PCT", 0.2);
-    let sq = |v: f32| (v.max(0.0) + off).sqrt();
-    let d = img.map(|c| {
-        let y = sq(luminance_2020(c));
-        c.map(|v| sq(v) - y)
-    });
-    let mut q = self_guided3(&d, sigma, k, pct);
-    let coarse = knob("NRV2_COARSE", 3.0);
-    if coarse > 1.0 {
-        q = self_guided3(&q, sigma * coarse, k, pct);
+    let mut q = img.map(|c| nrc_chroma(c, p.off));
+    for pass in &p.passes {
+        q = self_guided3(&q, pass);
     }
     let w = img.width;
     for_rows(&mut img.data, w, |y, row| {
-        for (x, p) in row.iter_mut().enumerate() {
-            let i = y * w + x;
-            let yl = luminance_2020(*p);
-            let ys = sq(yl);
-            let c = q.data[i].map(|dv| ((ys + dv).max(0.0).powi(2) - off).max(0.0));
-            let y1 = luminance_2020(c);
-            // keep the pixel's luminance (only its colour is smoothed)
-            *p = if y1 > 1e-7 && yl > 0.0 { c.map(|v| v * (yl / y1)) } else { [yl.max(0.0); 3] };
+        for (x, px) in row.iter_mut().enumerate() {
+            *px = nrc_recombine(*px, q.data[y * w + x], p.off);
         }
     });
     if let Some(t) = _t {
-        eprintln!("    nr colour v2: {:.1} ms (sigma {sigma:.1}, k {k:.2})", t.elapsed().as_secs_f64() * 1e3);
+        eprintln!("    nr colour v2: {:.1} ms ({:?})", t.elapsed().as_secs_f64() * 1e3, p.passes.iter().map(|q| q.sigma).collect::<Vec<_>>());
     }
 }
 

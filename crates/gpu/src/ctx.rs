@@ -53,6 +53,12 @@ const MODULES: &[Module] = &[
             "xguided_pre",
             "xguided_ab",
             "xguided_apply",
+            "nrc_down",
+            "nrc_sq",
+            "nrc_var_sample",
+            "nrc_a",
+            "nrc_b",
+            "nrc_apply",
         ],
     },
     Module {

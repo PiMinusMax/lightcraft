@@ -783,10 +783,10 @@ fn denoise(cx: &mut Cx<'_>, img: Buf, plan: &Plan<'_>) -> Buf {
         img = out;
     }
     if col.is_some() && local::nr_v2_enabled() {
-        // PROTOTYPE: the new colour noise reduction runs on the CPU
-        let mut host = cx.read_rgb(&img, w, h);
-        local::color_nr_v2(&mut host, &plan.settings, plan.src_long, plan.frame.output_long(w, h));
-        return cx.gpu.upload(rgb_words(&host));
+        if let Some(p) = local::nrc_params(&plan.settings, plan.src_long, plan.frame.output_long(w, h)) {
+            return color_nr_v2(cx, &img, w, h, &p);
+        }
+        return img;
     }
     if let Some(nr) = col {
         let chroma = cx.gpu.buffer(n * 3);
@@ -797,6 +797,84 @@ fn denoise(cx: &mut Cx<'_>, img: Buf, plan: &Plan<'_>) -> Buf {
         img = out;
     }
     img
+}
+
+/// The new colour noise reduction (`local::color_nr_v2`). The image's chroma is never stored at
+/// full size: the first pass reads it from the image while downsampling and applying, the last
+/// pass recombines as it applies.
+fn color_nr_v2(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, p: &local::NrcParams) -> Buf {
+    let n = w * h;
+    let off = p.off.to_bits();
+    let mut prev: Option<Buf> = None;
+    let mut out = None;
+    for (i, pass) in p.passes.iter().enumerate() {
+        let last = i + 1 == p.passes.len();
+        let step = pass.step.max(1);
+        let (lw, lh) = (w.div_ceil(step).max(1), h.div_ceil(step).max(1));
+        let lo = match &prev {
+            None => {
+                let mut prm = vec![w as u32, lw as u32, off, 0, 0];
+                tap_tables(&mut prm, (w, lw), (h, lh), Filter::Box, 4);
+                let lo = cx.gpu.buffer(lw * lh * 3);
+                map(cx, "nrc_down", lw * lh, &prm, [Some(img), None, None], &lo);
+                lo
+            }
+            Some(q) => resize(cx, q, (w, h), (lw, lh), 3, Filter::Box),
+        };
+        let ab = nrc_coeffs(cx, &lo, lw, lh, pass);
+        let mut prm = vec![lw as u32, lh as u32, w as u32, off, (lw * lh * 3) as u32, prev.is_some() as u32, 0, 0, last as u32];
+        tap_tables(&mut prm, (lw, w), (lh, h), Filter::Bilinear, 7);
+        let q = cx.gpu.buffer(n * 3);
+        map(cx, "nrc_apply", n, &prm, [Some(img), Some(&ab), prev.as_ref()], &q);
+        if last {
+            out = Some(q);
+        } else {
+            prev = Some(q);
+        }
+    }
+    out.unwrap_or_else(|| cx.copy(img))
+}
+
+/// Append the `resize` tap tables for x (`sx → dx`) and y to the kernel parameters `prm` (which
+/// will follow the pixel count, so word `i` of `prm` is `P[i + 1]`), and store where each starts
+/// (as a P index) at `P[at]`, `P[at + 1]`. Weight words in a table count from its start.
+fn tap_tables(prm: &mut Vec<u32>, (sx, dx): (usize, usize), (sy, dy): (usize, usize), filter: Filter, at: usize) {
+    let tx = prm.len() + 1;
+    prm.extend(taps(sx, dx, filter));
+    let ty = prm.len() + 1;
+    prm.extend(taps(sy, dy, filter));
+    prm[at - 1] = tx as u32;
+    prm[at] = ty as u32;
+}
+
+/// Self-guided coefficients of one pass at its subsampled size (`local::self_guided3`): all a,
+/// then all b, blurred. Reads back the sampled local variances (at most `local::NRC_SAMPLES` × 3
+/// values) for the noise level. (The blur takes at most three channels: d and d², a and b are
+/// separate buffers.)
+fn nrc_coeffs(cx: &mut Cx<'_>, lo: &Buf, lw: usize, lh: usize, pass: &local::NrcPass) -> Buf {
+    let ln = lw * lh;
+    let sg = pass.sigma / pass.step.max(1) as f32;
+    let sq = cx.gpu.buffer(ln * 3);
+    map(cx, "nrc_sq", ln, &[], [Some(lo), None, None], &sq);
+    let m = gaussian(cx, lo, lw, lh, 3, sg);
+    let c2 = gaussian(cx, &sq, lw, lh, 3, sg);
+    let stride = local::nrc_sample_stride(ln);
+    let count = ln.div_ceil(stride);
+    let smp = cx.gpu.buffer(count * 3);
+    map(cx, "nrc_var_sample", count, &[stride as u32], [Some(&m), Some(&c2), None], &smp);
+    let v: Vec<f32> = cx.read(&smp, count * 3);
+    let samples: Vec<[f32; 3]> = v.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+    let eps = local::nrc_eps(&samples, pass.k, pass.pct);
+    let ca = cx.gpu.buffer(ln * 3);
+    map(cx, "nrc_a", ln, &eps.map(f32::to_bits), [Some(&m), Some(&c2), None], &ca);
+    let cb = cx.gpu.buffer(ln * 3);
+    map(cx, "nrc_b", ln, &[], [Some(&m), Some(&ca), None], &cb);
+    let ca = gaussian(cx, &ca, lw, lh, 3, sg);
+    let cb = gaussian(cx, &cb, lw, lh, 3, sg);
+    let ab = cx.gpu.buffer(ln * 6);
+    cx.copy_into(&ca, &ab, 0);
+    cx.copy_into(&cb, &ab, ln * 3);
+    ab
 }
 
 /// The planes the per-pixel stage reads.
