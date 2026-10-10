@@ -179,6 +179,10 @@ pub fn denoise(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long:
             eprintln!("    nr luminance: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
         }
     }
+    if col.is_some() && std::env::var_os("LIGHTCRAFT_NR_V2").is_some() {
+        color_nr_v2(img, s, src_long, out_long);
+        return;
+    }
     if let Some(nr) = col {
         let _t = crate::profiling().then(std::time::Instant::now);
         let chroma = img.map(|c| {
@@ -198,6 +202,87 @@ pub fn denoise(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long:
         if let Some(t) = _t {
             eprintln!("    nr colour: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
         }
+    }
+}
+
+// PROTOTYPE (tuning knobs via env while the method is worked out)
+fn knob(name: &str, default: f32) -> f32 {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// The `q`-quantile of every 7th value of `p` (a cheap estimate over the whole plane).
+fn quantile(p: &Plane, q: f32) -> f32 {
+    let mut v: Vec<f32> = p.data.iter().step_by(7).copied().filter(|x| x.is_finite()).collect();
+    if v.is_empty() {
+        return 0.0;
+    }
+    let i = ((v.len() - 1) as f32 * q.clamp(0.0, 1.0)) as usize;
+    let (_, m, _) = v.select_nth_unstable_by(i, f32::total_cmp);
+    *m
+}
+
+/// One self-guided pass on each of three channels: `q = a·d + b` with `a = var / (var + eps)` in
+/// Gaussian windows of `sigma`, `eps` = `k` × the `pct`-quantile of the local variance (the noise
+/// level, as flat areas show it). Returns the filtered channels.
+fn self_guided3(d: &Rgb32f, sigma: f32, k: f32, pct: f32) -> Rgb32f {
+    use lightcraft_raster::resample::{Filter, resize};
+    // the coefficients are smooth: compute them on a plane subsampled by about sigma / 3 and
+    // upsample (as `guided_fast`), the output keeps full-resolution edges
+    let step = if knob("NRV2_FAST", 1.0) > 0.0 { guided_fast_step(sigma) } else { 1 };
+    let lo = if step > 1 { resize(d, d.width.div_ceil(step).max(1), d.height.div_ceil(step).max(1), Filter::Box) } else { d.clone() };
+    let sg = sigma / step as f32;
+    let (mean, corr) = par_join(|| gaussian(&lo, sg), || gaussian(&lo.map(|c| c.map(|v| v * v)), sg));
+    let var = corr.zip_map(&mean, |c, m| [0, 1, 2].map(|i| (c[i] - m[i] * m[i]).max(0.0)));
+    let eps: [f32; 3] = [0, 1, 2].map(|i| k * quantile(&var.map(|v| v[i]), pct).max(1e-12));
+    let a = var.map(|v| [0, 1, 2].map(|i| v[i] / (v[i] + eps[i])));
+    let b = mean.zip_map(&a, |m, a| [0, 1, 2].map(|i| m[i] - a[i] * m[i]));
+    let (a, b) = par_join(|| gaussian(&a, sg), || gaussian(&b, sg));
+    let (a, b) = if step > 1 {
+        par_join(|| resize(&a, d.width, d.height, Filter::Bilinear), || resize(&b, d.width, d.height, Filter::Bilinear))
+    } else {
+        (a, b)
+    };
+    let ab = a.zip_map(&b, |a, b| [a, b]);
+    d.zip_map(&ab, |d, ab| [0, 1, 2].map(|i| ab[0][i] * d[i] + ab[1][i]))
+}
+
+/// Colour noise reduction, second method: chroma as differences of square roots (noise of about
+/// the same size at every brightness, and no blow-up near black as `c / Y` has), smoothed by a
+/// self-guided filter whose threshold follows the noise measured in the image, the luminance kept.
+fn color_nr_v2(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long: usize) {
+    let _t = crate::profiling().then(std::time::Instant::now);
+    let amount = (s.detail.nr_color / 100.0) as f32;
+    let detail = (s.detail.nr_color_detail / 100.0) as f32;
+    let smooth = 1.0 + (s.detail.nr_color_smoothness / 100.0) as f32;
+    let scale = (out_long as f32 / src_long.max(1) as f32).clamp(0.05, 1.0);
+    let off = knob("NRV2_OFF", 0.003);
+    let sigma = (knob("NRV2_S0", 2.0) + knob("NRV2_S1", 10.0) * amount) * smooth * scale;
+    let k = knob("NRV2_K", 16.0) * amount * (1.5 - detail);
+    let pct = knob("NRV2_PCT", 0.2);
+    let sq = |v: f32| (v.max(0.0) + off).sqrt();
+    let d = img.map(|c| {
+        let y = sq(luminance_2020(c));
+        c.map(|v| sq(v) - y)
+    });
+    let mut q = self_guided3(&d, sigma, k, pct);
+    let coarse = knob("NRV2_COARSE", 3.0);
+    if coarse > 1.0 {
+        q = self_guided3(&q, sigma * coarse, k, pct);
+    }
+    let w = img.width;
+    for_rows(&mut img.data, w, |y, row| {
+        for (x, p) in row.iter_mut().enumerate() {
+            let i = y * w + x;
+            let yl = luminance_2020(*p);
+            let ys = sq(yl);
+            let c = q.data[i].map(|dv| ((ys + dv).max(0.0).powi(2) - off).max(0.0));
+            let y1 = luminance_2020(c);
+            // keep the pixel's luminance (only its colour is smoothed)
+            *p = if y1 > 1e-7 && yl > 0.0 { c.map(|v| v * (yl / y1)) } else { [yl.max(0.0); 3] };
+        }
+    });
+    if let Some(t) = _t {
+        eprintln!("    nr colour v2: {:.1} ms (sigma {sigma:.1}, k {k:.2})", t.elapsed().as_secs_f64() * 1e3);
     }
 }
 
