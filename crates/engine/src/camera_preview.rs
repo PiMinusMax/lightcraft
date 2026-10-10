@@ -833,6 +833,9 @@ fn to_prophoto() -> Mat3 {
     PROPHOTO.from_xyz().mul(&bradford(D65, D50)).mul(&REC2020.to_xyz())
 }
 
+/// [`HueSat::apply`] restores luminance only if the table kept at least this share of it.
+const MIN_HS_LUMINANCE_SHARE: f32 = 0.25;
+
 /// A fitted [`CameraLook::hue_sat`] table, ready to apply to linear Rec.2020 pixels. It changes
 /// hue and saturation only: luminance is restored, the camera tone curve owns it.
 pub(crate) struct HueSat<'a> {
@@ -852,7 +855,16 @@ impl<'a> HueSat<'a> {
         let mul = |m: &[[f32; 3]; 3], v: [f32; 3]| -> [f32; 3] { std::array::from_fn(|i| m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2]) };
         let out = mul(&self.from, self.table.apply(mul(&self.to, rgb)));
         let (before, after) = (luminance_2020(rgb), luminance_2020(out));
-        if before > 0.0 && after > 0.0 && out.iter().all(|v| v.is_finite()) { out.map(|v| v * before / after) } else { rgb }
+        // Restoring the luminance divides by the table's output: near black, where noise makes some channels
+        // negative, the table can bring it close to 0 and the gain would turn the pixel white (issue #820).
+        // A table never darkens a colour that much on purpose; such pixels keep their colour.
+        // PROTOTYPE: `LIGHTCRAFT_HS_GUARD=0` restores the old behaviour for comparison.
+        let guard = std::env::var("LIGHTCRAFT_HS_GUARD").map_or(true, |v| v != "0");
+        if before > 0.0 && after > 0.0 && out.iter().all(|v| v.is_finite()) && (!guard || after > MIN_HS_LUMINANCE_SHARE * before) {
+            out.map(|v| v * before / after)
+        } else {
+            rgb
+        }
     }
 }
 
