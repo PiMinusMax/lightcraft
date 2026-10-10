@@ -782,6 +782,12 @@ fn denoise(cx: &mut Cx<'_>, img: Buf, plan: &Plan<'_>) -> Buf {
         map(cx, "nr_lum", n, &[nr.k.to_bits()], [Some(&img), Some(&l), Some(&f)], &out);
         img = out;
     }
+    if col.is_some() && local::nr_v2_enabled() {
+        // PROTOTYPE: the new colour noise reduction runs on the CPU
+        let mut host = cx.read_rgb(&img, w, h);
+        local::color_nr_v2(&mut host, &plan.settings, plan.src_long, plan.frame.output_long(w, h));
+        return cx.gpu.upload(rgb_words(&host));
+    }
     if let Some(nr) = col {
         let chroma = cx.gpu.buffer(n * 3);
         map(cx, "chroma_k", n, &[], [Some(&img), None, None], &chroma);

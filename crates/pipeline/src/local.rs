@@ -179,7 +179,7 @@ pub fn denoise(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long:
             eprintln!("    nr luminance: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
         }
     }
-    if col.is_some() && std::env::var_os("LIGHTCRAFT_NR_V2").is_some() {
+    if col.is_some() && nr_v2_enabled() {
         color_nr_v2(img, s, src_long, out_long);
         return;
     }
@@ -206,6 +206,11 @@ pub fn denoise(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long:
 }
 
 // PROTOTYPE (tuning knobs via env while the method is worked out)
+/// The new colour noise reduction is on unless `LIGHTCRAFT_NR_V2=0`.
+pub fn nr_v2_enabled() -> bool {
+    std::env::var("LIGHTCRAFT_NR_V2").map_or(true, |v| v != "0")
+}
+
 fn knob(name: &str, default: f32) -> f32 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
@@ -249,7 +254,7 @@ fn self_guided3(d: &Rgb32f, sigma: f32, k: f32, pct: f32) -> Rgb32f {
 /// Colour noise reduction, second method: chroma as differences of square roots (noise of about
 /// the same size at every brightness, and no blow-up near black as `c / Y` has), smoothed by a
 /// self-guided filter whose threshold follows the noise measured in the image, the luminance kept.
-fn color_nr_v2(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long: usize) {
+pub fn color_nr_v2(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long: usize) {
     let _t = crate::profiling().then(std::time::Instant::now);
     let amount = (s.detail.nr_color / 100.0) as f32;
     let detail = (s.detail.nr_color_detail / 100.0) as f32;
