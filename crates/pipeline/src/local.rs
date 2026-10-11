@@ -378,9 +378,9 @@ pub fn nrc_linear() -> bool {
     nrc_linear_cached()
 }
 
-/// Experimental joint guide; kept opt-in while native-resolution CPU cost is evaluated.
-pub(crate) fn nrc_joint_enabled() -> bool {
-    nr_v2_enabled() && nrc_linear() && knob("NRV2_JOINT", 0.0) > 0.5
+/// The joint guide (`nrc_joint`), on unless `NRV2_JOINT=0` (PROTOTYPE switch).
+pub fn nrc_joint_enabled() -> bool {
+    nr_v2_enabled() && nrc_linear() && knob("NRV2_JOINT", 1.0) > 0.5
 }
 
 /// Chroma of a pixel: linear differences `c − Y` (see [`nrc_linear`]), else differences of square roots

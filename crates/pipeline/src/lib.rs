@@ -33,7 +33,7 @@ pub mod local;
 pub mod local_tone;
 pub mod lut;
 pub mod masks;
-mod nrc_joint;
+pub mod nrc_joint;
 #[cfg(test)]
 mod nrc_joint_reference;
 pub mod optics;

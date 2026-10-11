@@ -783,6 +783,16 @@ fn denoise(cx: &mut Cx<'_>, img: Buf, plan: &Plan<'_>) -> Buf {
         map(cx, "nr_lum", n, &[nr.k.to_bits()], [Some(&img), Some(&l), Some(&f)], &out);
         img = out;
     }
+    if col.is_some()
+        && local::nrc_joint_enabled()
+        && std::env::var("NRV2_JOINT_STEP").map_or(true, |v| v.trim() == "1")
+        && let Some(p) = local::nrc_params(&plan.settings, plan.src_long, plan.frame.output_long(w, h))
+    {
+        let s = &plan.settings.detail;
+        if let Some(out) = color_nr_joint(cx, &img, w, h, &p, (s.nr_color_detail / 100.0) as f32, (s.nr_color / 100.0) as f32) {
+            return out;
+        }
+    }
     if col.is_some() && local::nr_v2_enabled() && local::nrc_linear() {
         // PROTOTYPE: the linear mode has no GPU kernels yet, it runs on the CPU
         let mut host = cx.read_rgb(&img, w, h);
@@ -809,6 +819,118 @@ fn denoise(cx: &mut Cx<'_>, img: Buf, plan: &Plan<'_>) -> Buf {
 /// The new colour noise reduction (`local::color_nr_v2`). The image's chroma is never stored at
 /// full size: the first pass reads it from the image while downsampling and applying, the last
 /// pass recombines as it applies.
+/// Run a `nrcj.wgsl` kernel on `n` items with inputs `a`, `b` and output `out`.
+fn nrcj(cx: &mut Cx<'_>, k: &str, n: usize, p: &[u32], a: &Buf, b: Option<&Buf>, out: &Buf) {
+    cx.run(k, p, &[Some(a), b, Some(out)], groups1(n));
+}
+
+/// The joint colour noise reduction (`lightcraft_pipeline::nrc_joint`) on the GPU, the same steps as the
+/// CPU: only the noise samples are read back (the noise model is fitted on the CPU, by the same code).
+/// Large images are filtered in horizontal bands whose halo covers every step's reach, so each kept pixel
+/// gets the whole-image result; the noise model is the whole image's. `None` when the image is too small
+/// for the noise samples (the caller falls back to the CPU).
+fn color_nr_joint(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, p: &local::NrcParams, detail: f32, amount: f32) -> Option<Buf> {
+    use lightcraft_pipeline::nrc_joint;
+    let strength = nrc_joint::strength(amount);
+    if w < 3 || h < 3 {
+        return None;
+    }
+    if strength <= 0.0 {
+        return Some(cx.copy(img));
+    }
+    let n = w * h;
+    // noise samples of the whole image: same pixels as the CPU, fitted by the same code
+    let stride = nrc_joint::noise_sample_stride(n);
+    let count = n.div_ceil(stride);
+    let smp = cx.gpu.buffer(11 * count);
+    nrcj(cx, "nrcj_samples", count, &[count as u32, w as u32, h as u32, stride as u32], img, None, &smp);
+    let raw: Vec<f32> = cx.read(&smp, 11 * count);
+    drop(smp);
+    let samples: Vec<nrc_joint::NoiseSample> = raw
+        .as_chunks::<11>()
+        .0
+        .iter()
+        .filter(|s| s[0] == 1.0 && s.iter().all(|v| v.is_finite()))
+        .map(|s| (s[1], [[s[2], s[3], s[4]], [s[5], s[6], s[7]], [s[8], s[9], s[10]]]))
+        .collect();
+    let mut noise = nrc_joint::noise_from_samples(samples);
+    noise.tolerance = nrc_joint::tolerance(detail);
+    let sigma = p.passes.last().map_or(0.0, |q| q.sigma);
+    let plan = nrc_joint::scale_plan(sigma, w, h);
+    // rows a kept pixel depends on: the diffusion reaches 2·delta per scale, the paths and weights of a
+    // scale up to 2·delta more, the guide's blur and pilot a few
+    let halo = plan.iter().map(|d| 4 * d.0).sum::<usize>() + 8;
+    // about 15 values per pixel are held while a band is filtered
+    let budget = std::env::var("NRV2_GPU_BAND_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2048) << 20;
+    let rows = (budget / (60 * w)).max(1);
+    let core = if rows >= h { h } else { rows.saturating_sub(2 * halo).max(64) };
+    let out = cx.gpu.buffer(3 * n);
+    let mut y0 = 0;
+    while y0 < h {
+        let y1 = (y0 + core).min(h);
+        let (b0, b1) = if core >= h { (0, h) } else { (y0.saturating_sub(halo), (y1 + halo).min(h)) };
+        let filtered = joint_band(cx, img, w, b0, b1 - b0, &noise, &plan);
+        let kept = (y1 - y0) * w;
+        nrcj(cx, "nrcj_recon", kept, &[kept as u32, strength.to_bits(), (y0 * w) as u32, (b0 * w) as u32], img, Some(&filtered), &out);
+        drop(filtered);
+        // wait: the driver frees a dropped buffer only once the GPU is done with it, and a band's
+        // buffers are large (without waiting, freed memory piled up to the whole 4 GB of a Quadro M2200)
+        cx.sync();
+        y0 = y1;
+    }
+    Some(out)
+}
+
+/// The filtered chroma pairs of rows `b0 .. b0 + bh` of the image, treated as an image of their own.
+fn joint_band(
+    cx: &mut Cx<'_>,
+    img: &Buf,
+    w: usize,
+    b0: usize,
+    bh: usize,
+    noise: &lightcraft_pipeline::nrc_joint::JointNoise,
+    plan: &[(usize, f32)],
+) -> Buf {
+    let n = w * bh;
+    let mut np = vec![n as u32, w as u32, bh as u32];
+    np.extend(noise.model.alpha.iter().chain(&noise.model.beta).chain(&noise.ymax).map(|v| v.to_bits()));
+    np.push(noise.tolerance.to_bits());
+    let yuv = cx.gpu.buffer(3 * n);
+    nrcj(cx, "nrcj_yuv", n, &[n as u32, (b0 * w) as u32], img, None, &yuv);
+    let blurred = gaussian(cx, &yuv, w, bh, 3, 0.8);
+    let guide = cx.gpu.buffer(3 * n);
+    nrcj(cx, "nrcj_pilot", n, &np, &yuv, Some(&blurred), &guide);
+    drop(blurred);
+    let mut filtered = cx.gpu.buffer(2 * n);
+    nrcj(cx, "nrcj_uv", n, &[n as u32], &yuv, None, &filtered);
+    drop(yuv);
+    // dropped buffers only become reusable (and their memory free) once the GPU is done with them
+    cx.sync();
+    let mut quads = cx.gpu.buffer(4 * n);
+    nrcj(cx, "nrcj_links1", n, &np, &guide, None, &quads);
+    // the next scale's paths and weights go to the other of two buffers (no new one per scale)
+    let mut spare = cx.gpu.buffer(4 * n);
+    let mut scratch = cx.gpu.buffer(2 * n);
+    for (k, &(delta, rate)) in plan.iter().enumerate() {
+        let dp = [n as u32, w as u32, bh as u32, delta as u32, rate.to_bits()];
+        for _ in 0..2 {
+            nrcj(cx, "nrcj_dh", n, &dp, &filtered, Some(&quads), &scratch);
+            std::mem::swap(&mut filtered, &mut scratch);
+            nrcj(cx, "nrcj_dv", n, &dp, &filtered, Some(&quads), &scratch);
+            std::mem::swap(&mut filtered, &mut scratch);
+        }
+        if let Some(&(next, _)) = plan.get(k + 1) {
+            let mut qp = np.clone();
+            qp.extend([delta as u32, next as u32]);
+            nrcj(cx, "nrcj_next", n, &qp, &guide, Some(&quads), &spare);
+            std::mem::swap(&mut quads, &mut spare);
+        }
+    }
+    drop((scratch, quads, spare, guide));
+    cx.sync();
+    filtered
+}
+
 fn color_nr_v2(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, p: &local::NrcParams) -> Buf {
     let n = w * h;
     let off = p.off.to_bits();

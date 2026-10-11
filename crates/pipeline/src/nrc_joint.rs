@@ -11,16 +11,16 @@ use crate::{
     local::{NrcNoise, NrcParams, fit_nonneg_line},
 };
 
-#[derive(Debug)]
-struct JointNoise {
-    model: NrcNoise,
+#[derive(Clone, Copy, Debug)]
+pub struct JointNoise {
+    pub model: NrcNoise,
     /// Do not extrapolate beyond bands that contain usable noise measurements.
-    ymax: [f32; 3],
-    tolerance: f32,
+    pub ymax: [f32; 3],
+    pub tolerance: f32,
 }
 
 impl JointNoise {
-    fn var(&self, i: usize, y: f32) -> f32 {
+    pub fn var(&self, i: usize, y: f32) -> f32 {
         self.model.var(i, y.min(self.ymax[i]))
     }
 }
@@ -35,9 +35,8 @@ fn yuv(c: [f32; 3]) -> [f32; 3] {
 /// Luminance bands with predominantly texture may only lower their weight in the fit: they
 /// cannot force a shadow scene's extrapolated highlight noise arbitrarily high.
 fn noise_model(img: &Rgb32f) -> JointNoise {
-    const BANDS: usize = 16;
     let mut samples = Vec::new();
-    let stride = img.len().div_ceil(crate::local::NRC_SAMPLES).max(1) | 1;
+    let stride = noise_sample_stride(img.len());
     if img.width < 3 || img.height < 3 {
         return JointNoise { model: NrcNoise { alpha: [0.0; 3], beta: [1e-14; 3] }, ymax: [0.0; 3], tolerance: 1.0 };
     }
@@ -69,7 +68,22 @@ fn noise_model(img: &Rgb32f) -> JointNoise {
             samples.push((brightness.max(0.0), residual));
         }
     }
+    noise_from_samples(samples)
+}
+
+/// Distance between the noise samples of a `len`-pixel plane (CPU and GPU take the same pixels).
+pub fn noise_sample_stride(len: usize) -> usize {
+    len.div_ceil(crate::local::NRC_SAMPLES).max(1) | 1
+}
+
+/// One noise sample: the mean brightness of its neighbourhoods and the squared high-pass residual of
+/// Y, R−Y, B−Y at spacings 1, 2 and 4.
+pub type NoiseSample = (f32, [[f32; 3]; 3]);
+
+/// The fitted noise model from the samples, in pixel order (see `noise_model`).
+pub fn noise_from_samples(mut samples: Vec<NoiseSample>) -> JointNoise {
     samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+    const BANDS: usize = 16;
     let per = samples.len().div_ceil(BANDS).max(32);
     let mut pts: [Vec<(f64, f64, f64)>; 3] = std::array::from_fn(|_| Vec::new());
     for band in samples.chunks(per).filter(|b| b.len() >= 32) {
@@ -239,11 +253,36 @@ fn diffuse_v(src: &PairImage, dst: &mut PairImage, links: &PairImage, delta: usi
     });
 }
 
+/// The diffusion scales for a final spatial `sigma` (in grid pixels) on a `w × h` grid: each step's
+/// neighbour distance and rate, in order. CPU and GPU run exactly these.
+pub fn scale_plan(sigma: f32, w: usize, h: usize) -> Vec<(usize, f32)> {
+    let mut plan = Vec::new();
+    let mut remaining = sigma * sigma;
+    let mut delta = 1usize;
+    while remaining > 0.01 && delta <= w.max(h) {
+        let rate = (remaining / (4.0 * (delta as f32).powi(2))).min(0.25);
+        plan.push((delta, rate));
+        remaining -= 4.0 * rate * (delta as f32).powi(2);
+        delta = delta.saturating_mul(2);
+    }
+    plan
+}
+
+/// Share of the filtered colour at Color `amount` (0..=1): a ramp up to the default 25.
+pub fn strength(amount: f32) -> f32 {
+    (4.0 * amount).clamp(0.0, 1.0)
+}
+
+/// Edge tolerance at Color Detail `detail` (0..=1).
+pub fn tolerance(detail: f32) -> f32 {
+    (1.5 - detail).clamp(0.5, 1.5)
+}
+
 pub(crate) fn denoise(img: &mut Rgb32f, params: &NrcParams, detail: f32, amount: f32) {
     let step = std::env::var("NRV2_JOINT_STEP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1).clamp(1, 2);
     // Continuous ramp from zero; from the ordinary default Color=25 onward the spatial
     // scale controls the extra smoothing. Noise calibration and edge decisions stay fixed.
-    denoise_grid(img, params, step, detail, (4.0 * amount).clamp(0.0, 1.0));
+    denoise_grid(img, params, step, detail, strength(amount));
 }
 
 fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, strength: f32) {
@@ -294,7 +333,7 @@ fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, 
     lap("transform", &mut tt);
     let mut noise = noise_model(&original);
     lap("noise model", &mut tt);
-    noise.tolerance = (1.5 - detail).clamp(0.5, 1.5);
+    noise.tolerance = tolerance(detail);
     let guide = pilot(&original, &noise);
     lap("pilot", &mut tt);
     if std::env::var_os("NRV2_DEBUG").is_some() {
@@ -334,22 +373,16 @@ fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, 
     // Scale is independent of the edge decision. K has no role in deciding whether a leaf
     // is noise. Two dyadic sweeps provide broad smoothing with a fixed number of scales.
     let sigma = params.passes.last().map_or(0.0, |p| p.sigma / step as f32);
-    let mut remaining = sigma * sigma;
-    let mut delta = 1usize;
-    while remaining > 0.01 && delta <= w.max(h) {
-        let rate = (remaining / (4.0 * (delta as f32).powi(2))).min(0.25);
+    let plan = scale_plan(sigma, w, h);
+    for (k, &(delta, rate)) in plan.iter().enumerate() {
         for _ in 0..2 {
             diffuse(&filtered, &mut scratch, &links, delta, false, rate);
             std::mem::swap(&mut filtered, &mut scratch);
             diffuse(&filtered, &mut scratch, &links, delta, true, rate);
             std::mem::swap(&mut filtered, &mut scratch);
         }
-        remaining -= 4.0 * rate * (delta as f32).powi(2);
-        let next = delta.saturating_mul(2);
         lap(&format!("scale {delta}"), &mut tt);
-        if !(remaining > 0.01 && next <= w.max(h)) {
-            break;
-        }
+        let Some(&(next, _)) = plan.get(k + 1) else { break };
         // In one pass: maxima over paths of length 2·delta (from the two adjacent delta-length paths,
         // read from `paths`, written to `scratch`) and the next scale's pair weights from them.
         {
@@ -381,7 +414,6 @@ fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, 
             });
         }
         std::mem::swap(&mut paths, &mut scratch);
-        delta = next;
     }
     drop(scratch);
     drop(paths);

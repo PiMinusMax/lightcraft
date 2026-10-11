@@ -62,6 +62,11 @@ const MODULES: &[Module] = &[
         ],
     },
     Module {
+        src: include_str!("wgsl/nrcj.wgsl"),
+        bindings: &[("a", false, "f32"), ("b", false, "f32"), ("dst", true, "f32")],
+        entries: &["nrcj_yuv", "nrcj_uv", "nrcj_samples", "nrcj_pilot", "nrcj_links1", "nrcj_next", "nrcj_dh", "nrcj_dv", "nrcj_recon"],
+    },
+    Module {
         src: include_str!("wgsl/mask.wgsl"),
         bindings: &[("img", false, "f32"), ("log_l", false, "f32"), ("aux", false, "f32"), ("c", true, "f32"), ("alpha", true, "f32")],
         entries: &["shape", "combine", "finalize"],

@@ -59,6 +59,10 @@ impl DevelopSettings {
             // PROTOTYPE: and the linear mode apart from the square-root one
             if std::env::var("NRV2_LINEAR").map_or(true, |v| v != "0") {
                 h ^= 0x6e72_7633_5f6c_696e;
+                // and the joint guide apart from the per-channel linear mode
+                if std::env::var("NRV2_JOINT").map_or(true, |v| v != "0") {
+                    h ^= 0x6a6f_696e_745f_6e72;
+                }
             }
         }
         h
