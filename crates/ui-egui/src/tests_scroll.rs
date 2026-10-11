@@ -208,3 +208,48 @@ fn filmstrip_shows_every_selected_photo() {
     assert_eq!(r["ok"], true, "{r}");
     assert_eq!(fill(&mut h, second), active);
 }
+
+/// The same photo stays active while another source is shown, but sits elsewhere in it: the
+/// filmstrip and the grid follow it instead of keeping the old offset, which would show other
+/// photos than the active one.
+#[test]
+fn showing_another_source_brings_the_active_photo_back_into_view() {
+    for view in ["detail", "photoGrid"] {
+        let mut h = demo(view);
+        let ids = h.app.session.visible_cloned();
+        let at = ids.len() / 2;
+        let photo = ids[at];
+        // an album of the first half of All Photographs up to the active photo: an album lists
+        // its photos in the opposite order here, so the photo comes (near) first there
+        let album = h.app.run("album.create", json!({"name": "First Half", "addSelected": false})).unwrap()["id"].as_u64().unwrap();
+        let rest: Vec<u64> = ids[..=at].iter().map(|p| p.0).collect();
+        h.app.run("album.addPhotos", json!({"id": album, "ids": rest})).unwrap();
+        h.app.run("library.select", json!({"ids": [photo.0]})).unwrap();
+        idle(&mut h, 30);
+        let scroll = |h: &Headless| if view == "detail" { film_x(h) } else { grid_y(h) };
+        // a cell far off screen is not drawn (and has no widget) at all
+        let in_view = |h: &Headless| {
+            let key = format!("{}:{}", if view == "detail" { "film" } else { "thumb" }, photo.0);
+            h.app.widgets.iter().find(|(w, _)| *w == key).is_some_and(|(_, cell)| {
+                if view == "detail" { cell.left() >= 0.0 && cell.right() <= 1200.0 } else { cell.intersects(h.app.canvas_rect.unwrap()) }
+            })
+        };
+        let before = scroll(&h);
+        assert!(before > 600.0, "the active photo is far from the beginning: {view}, {before}");
+        assert!(in_view(&h), "{view}: in view in All Photographs");
+        for (source, index) in [(json!({"kind": "album", "id": album}), None), (json!({"kind": "all"}), Some(at))] {
+            h.app.run("library.source", source.clone()).unwrap();
+            idle(&mut h, 60);
+            assert_eq!(h.app.session.active(), Some(photo), "{view}, {source}: the photo stays active");
+            let i = h.app.session.visible_cloned().iter().position(|p| *p == photo).unwrap();
+            match index {
+                Some(at) => assert_eq!(i, at, "{view}, {source}"),
+                None => assert!(i + ids.len() / 4 < at, "{view}, {source}: the photo moved ({at} → {i})"),
+            }
+            assert!(in_view(&h), "{view}, {source}: the active photo is in view (scroll {})", scroll(&h));
+            let after = scroll(&h);
+            idle(&mut h, 60);
+            assert_eq!(scroll(&h), after, "{view}, {source}: idle frames preserve the new position");
+        }
+    }
+}
