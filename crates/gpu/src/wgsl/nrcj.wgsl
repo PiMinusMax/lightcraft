@@ -197,6 +197,11 @@ fn reach8(p: f32, v0: f32, v1: f32, v2: f32, v3: f32, v4: f32, v5: f32, v6: f32,
     return max(abs(p - lo), abs(p - hi));
 }
 
+// The two largest values so far (`t.x` ≥ `t.y`) with `s` added, as the CPU's fold.
+fn top2(t: vec2<f32>, s: f32) -> vec2<f32> {
+    return select(vec2<f32>(t.x, max(t.y, s)), vec2<f32>(s, t.x), s > t.x);
+}
+
 // One border pixel's share of the colour shift (`speck_share`).
 fn sshare(q: vec3<f32>, m: vec3<f32>, du: f32, dv: f32, vu: f32, vv: f32, excess: f32) -> f32 {
     return ((q.y - m.y) * du / vu + (q.z - m.z) * dv / vv) / excess;
@@ -246,23 +251,25 @@ fn nrcj_speck(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgrou
                 let luminance = dy * dy / nvar(0u, ym);
                 let alone = clamp((1.5 * excess - luminance) / excess, 0.0, 1.0);
                 if (alone > 0.0) {
-                    var reach = max(0.0, sshare(r0, m, du, dv, vu, vv, excess));
-                    reach = max(reach, sshare(r1, m, du, dv, vu, vv, excess));
-                    reach = max(reach, sshare(r2, m, du, dv, vu, vv, excess));
-                    reach = max(reach, sshare(r3, m, du, dv, vu, vv, excess));
-                    reach = max(reach, sshare(r4, m, du, dv, vu, vv, excess));
-                    reach = max(reach, sshare(r5, m, du, dv, vu, vv, excess));
-                    reach = max(reach, sshare(r6, m, du, dv, vu, vv, excess));
-                    reach = max(reach, sshare(r7, m, du, dv, vu, vv, excess));
-                    reach = max(reach, sshare(ja(up - 1u), m, du, dv, vu, vv, excess));
-                    reach = max(reach, sshare(ja(up + 1u), m, du, dv, vu, vv, excess));
-                    reach = max(reach, sshare(ja(i - w - 2u), m, du, dv, vu, vv, excess));
-                    reach = max(reach, sshare(ja(i - w + 2u), m, du, dv, vu, vv, excess));
-                    reach = max(reach, sshare(ja(i + w - 2u), m, du, dv, vu, vv, excess));
-                    reach = max(reach, sshare(ja(i + w + 2u), m, du, dv, vu, vv, excess));
-                    reach = max(reach, sshare(ja(dn - 1u), m, du, dv, vu, vv, excess));
-                    reach = max(reach, sshare(ja(dn + 1u), m, du, dv, vu, vv, excess));
-                    let compact = clamp((0.6 - reach) / 0.3, 0.0, 1.0);
+                    // the two largest border shares (`speck_share`)
+                    var top = vec2<f32>(0.0, 0.0);
+                    top = top2(top, sshare(r0, m, du, dv, vu, vv, excess));
+                    top = top2(top, sshare(r1, m, du, dv, vu, vv, excess));
+                    top = top2(top, sshare(r2, m, du, dv, vu, vv, excess));
+                    top = top2(top, sshare(r3, m, du, dv, vu, vv, excess));
+                    top = top2(top, sshare(r4, m, du, dv, vu, vv, excess));
+                    top = top2(top, sshare(r5, m, du, dv, vu, vv, excess));
+                    top = top2(top, sshare(r6, m, du, dv, vu, vv, excess));
+                    top = top2(top, sshare(r7, m, du, dv, vu, vv, excess));
+                    top = top2(top, sshare(ja(up - 1u), m, du, dv, vu, vv, excess));
+                    top = top2(top, sshare(ja(up + 1u), m, du, dv, vu, vv, excess));
+                    top = top2(top, sshare(ja(i - w - 2u), m, du, dv, vu, vv, excess));
+                    top = top2(top, sshare(ja(i - w + 2u), m, du, dv, vu, vv, excess));
+                    top = top2(top, sshare(ja(i + w - 2u), m, du, dv, vu, vv, excess));
+                    top = top2(top, sshare(ja(i + w + 2u), m, du, dv, vu, vv, excess));
+                    top = top2(top, sshare(ja(dn - 1u), m, du, dv, vu, vv, excess));
+                    top = top2(top, sshare(ja(dn + 1u), m, du, dv, vu, vv, excess));
+                    let compact = clamp((0.8 - top.y) / 0.3, 0.0, 1.0);
                     let t = clamp((excess - threshold) / threshold, 0.0, 1.0);
                     let k = share * t * t * (3.0 - 2.0 * t) * alone * compact;
                     if (k > 0.0) {

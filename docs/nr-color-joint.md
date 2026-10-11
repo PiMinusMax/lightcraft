@@ -15,7 +15,8 @@ experiment, not a release default. GPU renders use the existing linear-mode CPU 
 - Speck brake (before the guide): a pixel whose chroma stands out from the median of the 8
   pixels at distance 2 by more than a threshold (in noise variances), whose luminance step is
   small against that colour step, and whose colour shift does not reach the 16-pixel border of
-  its 5 × 5 square (a line or an edge would) gets its chroma moved towards that median.
+  its 5 × 5 square at two places (a line or an edge through it always does) gets its chroma moved
+  towards that median.
   Threshold 64 and at most half at Color 25, threshold 25 and fully at 100. Luminance is never
   changed, so a bright point (a star) keeps its brightness and, by the luminance test, its colour.
   `NRV2_SPECK_OFF=1` turns it off for comparisons.

@@ -457,9 +457,16 @@ fn speck_share(p: [f32; 3], ring: &[[f32; 3]; 8], rest: impl Iterator<Item = [f3
     if alone <= 0.0 {
         return (0.0, m);
     }
-    // compactness: the largest share of the pixel's colour shift that a border pixel also has
-    let shared = ring.iter().copied().chain(rest).map(|q| ((q[1] - m[1]) * du / vu + (q[2] - m[2]) * dv / vv) / excess).fold(0.0f32, f32::max);
-    let compact = ((0.6 - shared) / 0.3).clamp(0.0, 1.0);
+    // compactness: the second largest share of the pixel's colour shift that a border pixel also has (a
+    // line or an edge through the pixel crosses the border at least twice; one noisy border pixel that
+    // happens to lean the same way does not protect a speck)
+    let (_, second) = ring
+        .iter()
+        .copied()
+        .chain(rest)
+        .map(|q| ((q[1] - m[1]) * du / vu + (q[2] - m[2]) * dv / vv) / excess)
+        .fold((0.0f32, 0.0f32), |(a, b), s| if s > a { (s, a) } else { (a, b.max(s)) });
+    let compact = ((0.8 - second) / 0.3).clamp(0.0, 1.0);
     (brake.share * smoothstep(brake.threshold, 2.0 * brake.threshold, excess) * alone * compact, m)
 }
 

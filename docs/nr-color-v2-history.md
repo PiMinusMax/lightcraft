@@ -91,16 +91,23 @@ dumps of the transformed image (`NRV2_DUMP`) of the two #820 files:
   A threshold of 12 at Color 100 also moved the mean of a synthetic flat patch (2.2e-6, the test allows 2e-6);
   now 64 at 25 and 25 at 100, at most half the colour replaced at 25.
 
+- First compactness rule "the largest border share stays below 0.6": one noisy border pixel leaning the same
+  way protected a speck (the three dots below a lit leaf tip in the candle file: border shares 0.44 and 0.71
+  kept two of them). Now the **second** largest share decides (0.5 → full brake, 0.8 → none): a line or an
+  edge through the pixel always crosses the border at least twice.
+
 | Full-size, 8-bit, against the same build without the brake | Joint | with brake |
 |---|---|---|
-| Leaves (candle), C* at 25 / 100 | 97 % / 97 % | 97 % / 97 % |
-| Cat dark mean R / G / B at 100 | −14.1 / +1.2 / +6.7 % | −13.6 / +1.6 / +5.3 % |
-| Candle dark mean B at 25 / 100 | −26.1 / −26.0 % | −26.2 / −27.4 % |
-| Cat flat dark spread / blotch at 25 | 6.46 / 2.78 | 6.15 / 2.69 |
-| Cat flat dark spread / blotch at 100 | 6.11 / 2.37 | 5.37 / 2.08 |
+| Leaves (candle), C* at 25 / 100 | 97 % / 97 % | 97 % / 98 % |
+| Cat dark mean R / G / B at 100 | −14.1 / +1.2 / +6.7 % | −11.9 / +2.0 / +2.9 % |
+| Candle dark mean B at 25 / 100 | −26.1 / −26.0 % | −26.4 / −29.8 % |
+| Cat flat dark spread / blotch at 25 | 6.46 / 2.78 | 5.81 / 2.57 |
+| Cat flat dark spread / blotch at 100 | 6.11 / 2.37 | 4.17 / 1.47 |
+| Candle flat dark spread / blotch at 100 | 4.67 / 3.13 | 4.10 / 2.97 |
 
 Crops of the 10 most visible specks per file: blue specks on black become grey at 100, a magenta speck in
-orange almost disappears; at 25 they are only weakened. The largest changes in bright areas are specks too
+orange almost disappears, the three dots below the candle's leaf tip go except for faint dark traces
+(luminance); at 25 they are only weakened. The largest changes in bright areas are specks too
 (pink dots in the cat's blue, yellow dots in cream); no edge or line changed visibly. Synthetic test
 `speck_brake_removes_compact_colour_specks_but_not_stars`: an isoluminant 2 × 2 speck loses most of its colour
 at 100, less at 25; a coloured 2 × 2 star keeps its colour within 2 %.
