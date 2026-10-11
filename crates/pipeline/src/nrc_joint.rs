@@ -121,14 +121,22 @@ fn noise_model(img: &Rgb32f) -> JointNoise {
 fn distance(a: [f32; 3], b: [f32; 3], noise: &JointNoise) -> f32 {
     let y = 0.5 * (a[0] + b[0]);
     let allowance = (0.025 * y.max(0.0)).powi(2);
-    (0..3)
-        .map(|i| {
-            let v = noise.var(i, y);
-            // The 3x3 pilot blur reduces uncorrelated noise to 1/9. Keep a conservative
-            // allowance for correlations left by demosaicing and grid resampling.
-            ((a[i] - b[i]).powi(2) - v).max(0.0) / (3.0 * noise.tolerance * v + allowance)
-        })
-        .sum::<f32>()
+    let terms: [f32; 3] = std::array::from_fn(|i| {
+        let v = noise.var(i, y);
+        let excess = ((a[i] - b[i]).powi(2) - v).max(0.0);
+        // The 3x3 pilot blur reduces uncorrelated noise to 1/9. Keep a conservative
+        // allowance for correlations left by demosaicing and grid resampling.
+        // (A difference within the noise adds exactly 0: no division needed.)
+        if excess == 0.0 { 0.0 } else { excess / (3.0 * noise.tolerance * v + allowance) }
+    });
+    terms.into_iter().sum::<f32>()
+}
+
+/// The exchange weight `exp(−max(distance, path))`; exactly 1 when both are 0 (no `exp` needed).
+#[inline]
+fn weight(distance: f32, path: f32) -> f32 {
+    let m = distance.max(path);
+    if m == 0.0 { 1.0 } else { (-m).exp() }
 }
 
 /// Denoise the pilot along a clearly smoother axis at strong edges. An isotropic blur
@@ -166,9 +174,6 @@ fn pilot(original: &Rgb32f, noise: &JointNoise) -> Rgb32f {
     guide
 }
 
-/// One conservative horizontal/vertical diffusion step. Pair weights are symmetric; the
-/// guide is never replaced by the filtered result. Long taps also account for the intervening
-/// guide edges, so a wide pass cannot jump over a thin differently coloured object.
 /// The two chroma components `R − Y`, `B − Y`, or a pair of per-axis values (horizontal, vertical).
 type Pair = [f32; 2];
 type PairImage = lightcraft_raster::Image<Pair>;
@@ -182,25 +187,53 @@ fn rgb2(y: f32, uv: Pair) -> [f32; 3] {
 /// One conservative horizontal/vertical diffusion step. Pair weights are symmetric; the
 /// guide is never replaced by the filtered result. Long taps also account for the intervening
 /// guide edges, so a wide pass cannot jump over a thin differently coloured object.
+///
+/// Per pixel: `out = p`, then the lower neighbour's exchange, then the upper one's, in that order
+/// (the order the result depends on, bit for bit).
 fn diffuse(src: &PairImage, dst: &mut PairImage, links: &PairImage, delta: usize, vertical: bool, rate: f32) {
+    if vertical { diffuse_v(src, dst, links, delta, rate) } else { diffuse_h(src, dst, links, delta, rate) }
+}
+
+#[inline(always)]
+fn exchange(out: &mut Pair, p: Pair, q: Pair, weight: f32) {
+    out[0] += weight * (q[0] - p[0]);
+    out[1] += weight * (q[1] - p[1]);
+}
+
+fn diffuse_h(src: &PairImage, dst: &mut PairImage, links: &PairImage, delta: usize, rate: f32) {
+    let w = src.width;
+    for_rows(&mut dst.data, w, |y, out| {
+        let (Some(s), Some(l)) = (src.data.get(y * w..(y + 1) * w), links.data.get(y * w..(y + 1) * w)) else { return };
+        for (x, o) in out.iter_mut().enumerate() {
+            let p = s[x];
+            *o = p;
+            if x >= delta {
+                exchange(o, p, s[x - delta], rate * l[x - delta][0]);
+            }
+            if x + delta < w {
+                exchange(o, p, s[x + delta], rate * l[x][0]);
+            }
+        }
+    });
+}
+
+fn diffuse_v(src: &PairImage, dst: &mut PairImage, links: &PairImage, delta: usize, rate: f32) {
     let (w, h) = (src.width, src.height);
-    let axis = usize::from(vertical);
-    for_rows(&mut dst.data, w, |y, row| {
-        for (x, out) in row.iter_mut().enumerate() {
-            let index = y * w + x;
-            let Some(&p) = src.data.get(index) else { continue };
-            *out = p;
-            let coordinate = if vertical { y } else { x };
-            let length = if vertical { h } else { w };
-            for neighbour in [coordinate.checked_sub(delta), coordinate.checked_add(delta).filter(|&v| v < length)].into_iter().flatten() {
-                let ni = if vertical { neighbour * w + x } else { y * w + neighbour };
-                let start = coordinate.min(neighbour);
-                let pi = if vertical { start * w + x } else { y * w + start };
-                let (Some(&q), Some(link)) = (src.data.get(ni), links.data.get(pi)) else { continue };
-                let weight = rate * link[axis];
-                for i in 0..2 {
-                    out[i] += weight * (q[i] - p[i]);
-                }
+    for_rows(&mut dst.data, w, |y, out| {
+        let Some(s) = src.data.get(y * w..(y + 1) * w) else { return };
+        out.copy_from_slice(s);
+        if y >= delta
+            && let (Some(up), Some(lu)) = (src.data.get((y - delta) * w..(y - delta + 1) * w), links.data.get((y - delta) * w..(y - delta + 1) * w))
+        {
+            for (((o, &p), &q), lk) in out.iter_mut().zip(s).zip(up).zip(lu) {
+                exchange(o, p, q, rate * lk[1]);
+            }
+        }
+        if y + delta < h
+            && let (Some(down), Some(ld)) = (src.data.get((y + delta) * w..(y + delta + 1) * w), links.data.get(y * w..(y + 1) * w))
+        {
+            for (((o, &p), &q), lk) in out.iter_mut().zip(s).zip(down).zip(ld) {
+                exchange(o, p, q, rate * lk[1]);
             }
         }
     });
@@ -286,13 +319,13 @@ fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, 
                     && let Some(&b) = guide.data.get(index + 1)
                 {
                     out[0] = distance(g, b, &noise);
-                    link[0] = (-out[0]).exp();
+                    link[0] = weight(out[0], out[0]);
                 }
                 if y + 1 < h
                     && let Some(&b) = guide.data.get(index + w)
                 {
                     out[1] = distance(g, b, &noise);
-                    link[1] = (-out[1]).exp();
+                    link[1] = weight(out[1], out[1]);
                 }
             }
         });
@@ -341,7 +374,7 @@ fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, 
                     let Some(&g) = guide.data.get(index) else { continue };
                     for (axis, offset, valid) in [(0, next, x + next < w), (1, next * w, y + next < h)] {
                         if valid && let Some(&other) = guide.data.get(index + offset) {
-                            link[axis] = (-distance(g, other, &noise).max(out[axis])).exp();
+                            link[axis] = weight(distance(g, other, &noise), out[axis]);
                         }
                     }
                 }
@@ -482,6 +515,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// BENCH (ignored, prints): the optimised filter against the reference on the same 24 MP image,
+    /// interleaved so both see the same machine load. Median of 3 each.
+    #[test]
+    #[ignore]
+    fn bench_joint_against_reference() {
+        let (w, h) = (6000usize, 4000usize);
+        let mut clean = Rgb32f::new(w, h);
+        for (i, p) in clean.data.iter_mut().enumerate() {
+            let (x, y) = (i % w, i / w);
+            *p = if (x / 300 + y / 300) % 2 == 0 { [0.03, 0.02, 0.01] } else { [0.004, 0.006, 0.012] };
+        }
+        let input = noisy(&clean, 0x2545_f491_4f6c_dd1d, 0.004);
+        let p = NrcParams { off: 0.003, passes: vec![NrcPass { sigma: 27.0, step: 1, k: 64.0, pct: 0.2 }] };
+        let (mut new, mut old) = (Vec::new(), Vec::new());
+        for _ in 0..3 {
+            let mut a = input.clone();
+            let t = std::time::Instant::now();
+            denoise_grid(&mut a, &p, 1, 0.5, 1.0);
+            new.push(t.elapsed().as_secs_f64());
+            let mut b = input.clone();
+            let t = std::time::Instant::now();
+            crate::nrc_joint_reference::denoise_grid(&mut b, &p, 1, 0.5, 1.0);
+            old.push(t.elapsed().as_secs_f64());
+        }
+        new.sort_by(f64::total_cmp);
+        old.sort_by(f64::total_cmp);
+        println!("joint 24 MP: optimised {:.2} s, reference {:.2} s (medians of {new:.2?} / {old:.2?})", new[1], old[1]);
     }
 
     #[test]
