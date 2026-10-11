@@ -347,9 +347,10 @@ fn decode_with(bytes: &[u8], mode: Mode) -> Result<RawImage> {
     Ok(r)
 }
 
-/// PROTOTYPE: hot pixel suppression is on unless `LIGHTCRAFT_HOT_PIXELS=0`.
+/// PROTOTYPE: hot pixel suppression is off unless `LIGHTCRAFT_HOT_PIXELS=1` (optional: cameras correct most
+/// themselves, it costs time and can catch real point lights).
 pub fn hot_pixels_enabled() -> bool {
-    std::env::var("LIGHTCRAFT_HOT_PIXELS").map_or(true, |v| v != "0")
+    std::env::var("LIGHTCRAFT_HOT_PIXELS").is_ok_and(|v| v == "1")
 }
 
 fn decode_samples(bytes: &[u8], mode: Mode) -> Result<RawImage> {
