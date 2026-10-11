@@ -824,6 +824,10 @@ fn nrcj(cx: &mut Cx<'_>, k: &str, n: usize, p: &[u32], a: &Buf, b: Option<&Buf>,
     cx.run(k, p, &[Some(a), b, Some(out)], groups1(n));
 }
 
+/// Device memory left aside when the joint NR plans its bands from the free memory (the rest of the
+/// render, the display, other programs).
+const VRAM_RESERVE: u64 = 384 << 20;
+
 /// The joint colour noise reduction (`lightcraft_pipeline::nrc_joint`) on the GPU, the same steps as the
 /// CPU: only the noise samples are read back (the noise model is fitted on the CPU, by the same code).
 /// Large images are filtered in horizontal bands whose halo covers every step's reach, so each kept pixel
@@ -864,8 +868,28 @@ fn color_nr_joint(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, p: &local::Nrc
     let halo = plan.iter().map(|d| 2 * d.0).sum::<usize>() + plan.last().map_or(0, |d| d.0) + 8;
     // Memory: the whole output (3 values per pixel) is held besides the input; a band then holds about
     // 15 values per pixel (guide 3, two chroma buffers 2 + 2, two path/weight buffers 4 + 4; 12 while
-    // the guide is built). PROTOTYPE: `NRV2_GPU_BAND_MB` sets the budget (MB) for both together.
-    let budget = std::env::var("NRV2_GPU_BAND_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2048) << 20;
+    // the guide is built). The budget for both together is the device memory free right now (where the
+    // driver can be asked, `crate::vram`) plus our own pooled buffers, which we reuse, less a reserve for
+    // the rest of the render and other programs; else a fixed 2 GB. PROTOTYPE: `NRV2_GPU_BAND_MB` overrides it.
+    let fixed = std::env::var("NRV2_GPU_BAND_MB").ok().and_then(|v| v.parse::<usize>().ok()).map(|mb| mb << 20);
+    let measured = crate::vram::free_bytes(&cx.gpu.info).map(|free| {
+        let pooled = crate::ctx::memory().pooled;
+        (free.saturating_add(pooled).saturating_sub(VRAM_RESERVE)) as usize
+    });
+    let budget = fixed.or(measured).unwrap_or(2048 << 20);
+    if profiling() {
+        eprintln!(
+            "  gpu joint budget: {} MB ({})",
+            budget >> 20,
+            if fixed.is_some() {
+                "NRV2_GPU_BAND_MB"
+            } else if measured.is_some() {
+                "free device memory"
+            } else {
+                "fixed default"
+            }
+        );
+    }
     let out_bytes = 12 * n;
     let per_row = 60 * w;
     // no band may exceed the device's largest buffer either (the path/weight buffers are the largest)

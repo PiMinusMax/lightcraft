@@ -39,6 +39,7 @@ pub mod nn;
 mod params;
 #[cfg(not(target_arch = "wasm32"))]
 mod render;
+mod vram;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use render::GpuStages;
