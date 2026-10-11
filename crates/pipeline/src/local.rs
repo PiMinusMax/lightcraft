@@ -287,45 +287,62 @@ impl NrcNoise {
 pub fn nrc_noise_model(var: &Rgb32f, ym: &Rgb32f, pct: f32) -> NrcNoise {
     const BANDS: usize = 16;
     let stride = nrc_sample_stride(var.data.len()).min(4);
-    let ymax = ym.data.iter().step_by(stride).map(|y| y[0]).filter(|y| y.is_finite()).fold(1e-9f32, f32::max);
-    let mut bands: Vec<(Vec<[f32; 3]>, f64)> = vec![(Vec::new(), 0.0); BANDS];
-    for (v, y) in var.data.iter().zip(&ym.data).step_by(stride) {
-        if !(y[0].is_finite() && v.iter().all(|x| x.is_finite())) {
-            continue;
-        }
-        let b = (((y[0].max(0.0) / ymax).sqrt() * BANDS as f32) as usize).min(BANDS - 1);
-        bands[b].0.push(*v);
-        bands[b].1 += y[0].max(0.0) as f64;
-    }
+    let mut samples: Vec<(f32, [f32; 3])> = var
+        .data
+        .iter()
+        .zip(&ym.data)
+        .step_by(stride)
+        .filter(|(v, y)| y[0].is_finite() && v.iter().all(|x| x.is_finite()))
+        .map(|(v, y)| (y[0].max(0.0), *v))
+        .collect();
+    // equal-count bands by luminance: shadows keep their own bands however bright the highlights are
+    samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let per = (samples.len() / BANDS).max(1);
+    let bands: Vec<&[(f32, [f32; 3])]> = samples.chunks(per).filter(|c| c.len() >= 32).collect();
     let mut alpha = [0.0f32; 3];
-    let mut beta = [0.0f32; 3];
+    let mut beta = [1e-12f32; 3];
     for i in 0..3 {
+        // per band: mean luminance, `pct`-quantile of the variance (its noise floor), weight
         let pts: Vec<(f64, f64, f64)> = bands
-            .iter_mut()
-            .filter(|(v, _)| v.len() >= 32)
-            .map(|(v, ysum)| {
-                let n = v.len();
-                let k = ((n - 1) as f32 * pct.clamp(0.0, 1.0)) as usize;
-                let mut c: Vec<f32> = v.iter().map(|x| x[i]).collect();
+            .iter()
+            .map(|b| {
+                let mut c: Vec<f32> = b.iter().map(|s| s.1[i]).collect();
+                let k = ((c.len() - 1) as f32 * pct.clamp(0.0, 1.0)) as usize;
                 let (_, q, _) = c.select_nth_unstable_by(k, f32::total_cmp);
-                (*ysum / n as f64, *q as f64, n as f64)
+                (b.iter().map(|s| s.0 as f64).sum::<f64>() / b.len() as f64, *q as f64, b.len() as f64)
             })
             .collect();
         if pts.is_empty() {
-            beta[i] = 1e-12;
             continue;
         }
-        let sw: f64 = pts.iter().map(|p| p.2).sum();
-        let (ml, mv) = (pts.iter().map(|p| p.2 * p.0).sum::<f64>() / sw, pts.iter().map(|p| p.2 * p.1).sum::<f64>() / sw);
-        let (cov, vl) = pts.iter().fold((0.0, 0.0), |(c, v), p| (c + p.2 * (p.0 - ml) * (p.1 - mv), v + p.2 * (p.0 - ml) * (p.0 - ml)));
-        let a = if vl > 0.0 { (cov / vl).max(0.0) } else { 0.0 };
+        let (a, b) = fit_nonneg_line(&pts);
         alpha[i] = a as f32;
-        beta[i] = (mv - a * ml).max(0.0) as f32;
+        beta[i] = (b as f32).max(1e-12);
     }
     if std::env::var_os("NRV2_DEBUG").is_some() {
-        eprintln!("    nr colour v2 noise model: alpha {alpha:?} beta {beta:?}");
+        eprintln!("    nr colour v2 noise model: alpha {alpha:?} beta {beta:?} ({} bands)", bands.len());
     }
     NrcNoise { alpha, beta }
+}
+
+/// Weighted least squares `v = a · l + b` over `(l, v, weight)` with `a, b ≥ 0`: the free fit if both come out
+/// non-negative, else the better of the line through the origin (`b = 0`) and the constant (`a = 0`).
+pub fn fit_nonneg_line(pts: &[(f64, f64, f64)]) -> (f64, f64) {
+    let sw: f64 = pts.iter().map(|p| p.2).sum::<f64>().max(1e-300);
+    let (ml, mv) = (pts.iter().map(|p| p.2 * p.0).sum::<f64>() / sw, pts.iter().map(|p| p.2 * p.1).sum::<f64>() / sw);
+    let (cov, vl) = pts.iter().fold((0.0, 0.0), |(c, v), p| (c + p.2 * (p.0 - ml) * (p.1 - mv), v + p.2 * (p.0 - ml) * (p.0 - ml)));
+    if vl > 0.0 {
+        let a = cov / vl;
+        let b = mv - a * ml;
+        if a >= 0.0 && b >= 0.0 {
+            return (a, b);
+        }
+    }
+    let sse = |a: f64, b: f64| pts.iter().map(|p| p.2 * (p.1 - a * p.0 - b).powi(2)).sum::<f64>();
+    let ll: f64 = pts.iter().map(|p| p.2 * p.0 * p.0).sum();
+    let origin = if ll > 0.0 { (pts.iter().map(|p| p.2 * p.0 * p.1).sum::<f64>() / ll).max(0.0) } else { 0.0 };
+    let constant = mv.max(0.0);
+    if sse(origin, 0.0) < sse(0.0, constant) { (origin, 0.0) } else { (0.0, constant) }
 }
 
 /// `eps` per channel from the sampled local variances.
@@ -426,7 +443,15 @@ fn madd3(acc: [f32; 3], v: [f32; 3], f: f32) -> [f32; 3] {
 impl NrcUp {
     /// Apply this pass to `d`, row `y` of the full-size chroma, in place, and add the variance it
     /// removes to `removed`.
-    fn apply_row(&self, y: usize, d: &mut [[f32; 3]], removed: &mut [[f32; 3]], va: &mut Vec<[f32; 3]>, vb: &mut Vec<[f32; 3]>, vr: &mut Vec<[f32; 3]>) {
+    fn apply_row(
+        &self,
+        y: usize,
+        d: &mut [[f32; 3]],
+        removed: &mut [[f32; 3]],
+        va: &mut Vec<[f32; 3]>,
+        vb: &mut Vec<[f32; 3]>,
+        vr: &mut Vec<[f32; 3]>,
+    ) {
         let lw = self.a.width;
         for v in [&mut *va, &mut *vb, &mut *vr] {
             v.clear();
@@ -435,7 +460,9 @@ impl NrcUp {
         if let Some((y0, wy)) = self.uy.get(y) {
             for (j, &f) in wy.iter().enumerate() {
                 let rows = (y0 + j) * lw..(y0 + j + 1) * lw;
-                let (Some(ra), Some(rb), Some(rr)) = (self.a.data.get(rows.clone()), self.b.data.get(rows.clone()), self.r.data.get(rows)) else { continue };
+                let (Some(ra), Some(rb), Some(rr)) = (self.a.data.get(rows.clone()), self.b.data.get(rows.clone()), self.r.data.get(rows)) else {
+                    continue;
+                };
                 for x in 0..lw {
                     va[x] = madd3(va[x], ra[x], f);
                     vb[x] = madd3(vb[x], rb[x], f);
@@ -736,39 +763,72 @@ mod tests {
     fn probe_nrc_mean_drift() {
         use lightcraft_develop::DevelopSettings;
         let (w, h) = (768usize, 768usize);
-        let mut seed = 0x2545_f491_4f6c_dd1du64;
-        let mut gauss = || {
-            (0..4)
-                .map(|_| {
-                    seed ^= seed << 13;
-                    seed ^= seed >> 7;
-                    seed ^= seed << 17;
-                    (seed >> 11) as f32 / (1u64 << 53) as f32 - 0.5
-                })
-                .sum::<f32>()
-                * 1.732
-        };
-        for (name, base, sigma) in [("dark warm, blue near 0", [0.006f32, 0.004, 0.0008], [0.002f32, 0.0015, 0.003]), ("cat-like, red near 0", [0.0015, 0.004, 0.009], [0.004, 0.003, 0.005])] {
-            let mut img = Rgb32f::new(w, h);
-            for p in img.data.iter_mut() {
-                *p = [0, 1, 2].map(|i| base[i] + sigma[i] * gauss());
-            }
-            let mean = |im: &Rgb32f| {
-                let n = im.data.len() as f64;
-                [0, 1, 2].map(|i| im.data.iter().map(|p| p[i] as f64).sum::<f64>() / n)
+        let mut worst = 0.0f64;
+        for seed0 in [0x2545_f491_4f6c_dd1du64, 0x9e37_79b9_7f4a_7c15, 0x1234_5678_9abc_def1] {
+            let mut seed = seed0;
+            let mut gauss = || {
+                (0..4)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        (seed >> 11) as f32 / (1u64 << 53) as f32 - 0.5
+                    })
+                    .sum::<f32>()
+                    * 1.732
             };
-            let m0 = mean(&img);
-            for nr in [25.0, 100.0] {
-                let mut s = DevelopSettings::default();
-                s.detail.nr_color = nr;
-                let mut a = img.clone();
-                color_nr_v2(&mut a, &s, w, w);
-                let m = mean(&a);
-                let clipped0 = mean(&img.map(|p| p.map(|v| v.max(0.0))));
-                let sd = |im: &Rgb32f, mm: [f64; 3]| [0, 1, 2].map(|i| (im.data.iter().map(|p| (p[i] as f64 - mm[i]).powi(2)).sum::<f64>() / im.data.len() as f64).sqrt());
-                println!("{name} NR {nr}: true mean {m0:.5?}, clipped noisy mean {clipped0:.5?}, after v2 {m:.5?} → {:+.1?} % vs true; noise sd {:.5?} → {:.5?}", [0, 1, 2].map(|i| 100.0 * (m[i] / m0[i] - 1.0)), sd(&img, m0), sd(&a, m));
+            for (name, base, sigma) in [
+                ("dark warm, blue near 0", [0.006f32, 0.004, 0.0008], [0.002f32, 0.0015, 0.003]),
+                ("cat-like, red near 0", [0.0015, 0.004, 0.009], [0.004, 0.003, 0.005]),
+            ] {
+                let mut img = Rgb32f::new(w, h);
+                for p in img.data.iter_mut() {
+                    *p = [0, 1, 2].map(|i| base[i] + sigma[i] * gauss());
+                }
+                let mean = |im: &Rgb32f| {
+                    let n = im.data.len() as f64;
+                    [0, 1, 2].map(|i| im.data.iter().map(|p| p[i] as f64).sum::<f64>() / n)
+                };
+                let m0 = mean(&img);
+                for nr in [25.0, 100.0] {
+                    let mut s = DevelopSettings::default();
+                    s.detail.nr_color = nr;
+                    let mut a = img.clone();
+                    color_nr_v2(&mut a, &s, w, w);
+                    let m = mean(&a);
+                    let clipped0 = mean(&img.map(|p| p.map(|v| v.max(0.0))));
+                    let sd = |im: &Rgb32f, mm: [f64; 3]| {
+                        [0, 1, 2].map(|i| (im.data.iter().map(|p| (p[i] as f64 - mm[i]).powi(2)).sum::<f64>() / im.data.len() as f64).sqrt())
+                    };
+                    if nrc_linear() {
+                        worst = worst.max([0, 1, 2].iter().map(|&i| (m[i] / m0[i] - 1.0).abs()).fold(0.0, f64::max));
+                    }
+                    println!(
+                        "{name} NR {nr}: true mean {m0:.5?}, clipped noisy mean {clipped0:.5?}, after v2 {m:.5?} → {:+.3?} % vs true; noise sd {:.5?} → {:.5?}",
+                        [0, 1, 2].map(|i| 100.0 * (m[i] / m0[i] - 1.0)),
+                        sd(&img, m0),
+                        sd(&a, m)
+                    );
+                }
             }
         }
+        if nrc_linear() {
+            println!("worst mean deviation {:.4} %", 100.0 * worst);
+            assert!(worst < 0.01, "linear mode moved a channel's mean by {:.3} %", 100.0 * worst);
+        }
+    }
+
+    #[test]
+    fn nrc_noise_fit_is_non_negative() {
+        // a falling cloud would give a negative slope: the constant fits instead
+        let (a, b) = fit_nonneg_line(&[(0.0, 4.0, 1.0), (1.0, 3.0, 1.0), (2.0, 2.0, 1.0)]);
+        assert!(a == 0.0 && (b - 3.0).abs() < 1e-9);
+        // a line through a negative intercept: refitted through the origin
+        let (a, b) = fit_nonneg_line(&[(1.0, 1.0, 1.0), (2.0, 3.0, 1.0), (3.0, 5.0, 1.0)]);
+        assert!(a > 0.0 && b == 0.0);
+        // an exact shot + read noise line is found as it is
+        let (a, b) = fit_nonneg_line(&[(0.0, 2.0, 1.0), (1.0, 5.0, 1.0), (2.0, 8.0, 1.0)]);
+        assert!((a - 3.0).abs() < 1e-9 && (b - 2.0).abs() < 1e-9);
     }
     use super::*;
 
