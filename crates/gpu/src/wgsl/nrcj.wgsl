@@ -119,6 +119,90 @@ fn nrcj_samples(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgr
     dst[o + 1u] = max(brightness, 0.0);
 }
 
+// `nrc_joint::median8`: the same 19-comparator network.
+fn med8(v: array<f32, 8>) -> f32 {
+    var s = v;
+    let net = array<vec2<u32>, 19>(
+        vec2<u32>(0u, 2u), vec2<u32>(1u, 3u), vec2<u32>(4u, 6u), vec2<u32>(5u, 7u), vec2<u32>(0u, 4u),
+        vec2<u32>(1u, 5u), vec2<u32>(2u, 6u), vec2<u32>(3u, 7u), vec2<u32>(0u, 1u), vec2<u32>(2u, 3u),
+        vec2<u32>(4u, 5u), vec2<u32>(6u, 7u), vec2<u32>(2u, 4u), vec2<u32>(3u, 5u), vec2<u32>(1u, 4u),
+        vec2<u32>(3u, 6u), vec2<u32>(1u, 2u), vec2<u32>(3u, 4u), vec2<u32>(5u, 6u));
+    for (var k = 0u; k < 19u; k++) {
+        let i = net[k].x;
+        let j = net[k].y;
+        let lo = min(s[i], s[j]);
+        let hi = max(s[i], s[j]);
+        s[i] = lo;
+        s[j] = hi;
+    }
+    return 0.5 * (s[3] + s[4]);
+}
+
+// `nrc_joint::despeck` + `speck_share`: `a` = transformed image, writes it with the chroma of compact
+// colour specks replaced. Noise parameters as `nrcj_pilot`; P[13] = threshold, P[14] = share.
+@compute @workgroup_size(256)
+fn nrcj_speck(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+    let i = lin_index(g, nw);
+    if (i >= pu(0u)) {
+        return;
+    }
+    let w = pu(1u);
+    let h = pu(2u);
+    let x = i % w;
+    let y = i / w;
+    let p = ja(i);
+    var o = p;
+    if (x >= 2u && y >= 2u && x + 2u < w && y + 2u < h) {
+        let threshold = pf(13u);
+        let share = pf(14u);
+        let up = i - 2u * w;
+        let dn = i + 2u * w;
+        // ring: corners and edge centres of the 5 × 5 square (`RING` order on the CPU)
+        let ring = array<vec3<f32>, 8>(ja(up - 2u), ja(up), ja(up + 2u), ja(i - 2u), ja(i + 2u), ja(dn - 2u), ja(dn), ja(dn + 2u));
+        var ry: array<f32, 8>;
+        var ru: array<f32, 8>;
+        var rv: array<f32, 8>;
+        var ysum = 0.0;
+        for (var k = 0u; k < 8u; k++) {
+            ry[k] = ring[k].x;
+            ru[k] = ring[k].y;
+            rv[k] = ring[k].z;
+            ysum += ring[k].x;
+        }
+        let ym = ysum / 8.0;
+        var m = vec3<f32>(0.0, med8(ru), med8(rv));
+        let vu = nvar(1u, ym);
+        let vv = nvar(2u, ym);
+        let du = p.y - m.y;
+        let dv = p.z - m.z;
+        let excess = du * du / vu + dv * dv / vv;
+        if (excess > threshold) {
+            m.x = med8(ry);
+            let dy = p.x - m.x;
+            let luminance = dy * dy / nvar(0u, ym);
+            let alone = clamp((1.5 * excess - luminance) / excess, 0.0, 1.0);
+            if (alone > 0.0) {
+                let rest = array<vec3<f32>, 8>(ja(up - 1u), ja(up + 1u), ja(i - w - 2u), ja(i - w + 2u), ja(i + w - 2u), ja(i + w + 2u), ja(dn - 1u), ja(dn + 1u));
+                var reach = 0.0;
+                for (var k = 0u; k < 8u; k++) {
+                    reach = max(reach, ((ring[k].y - m.y) * du / vu + (ring[k].z - m.z) * dv / vv) / excess);
+                    reach = max(reach, ((rest[k].y - m.y) * du / vu + (rest[k].z - m.z) * dv / vv) / excess);
+                }
+                let compact = clamp((0.6 - reach) / 0.3, 0.0, 1.0);
+                let t = clamp((excess - threshold) / threshold, 0.0, 1.0);
+                let kk = share * t * t * (3.0 - 2.0 * t) * alone * compact;
+                if (kk > 0.0) {
+                    o.y += kk * (m.y - p.y);
+                    o.z += kk * (m.z - p.z);
+                }
+            }
+        }
+    }
+    dst[3u * i] = o.x;
+    dst[3u * i + 1u] = o.y;
+    dst[3u * i + 2u] = o.z;
+}
+
 // `nrc_joint::pilot`: `a` = transformed image, `b` = its gaussian(0.8); writes the guide.
 @compute @workgroup_size(256)
 fn nrcj_pilot(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {

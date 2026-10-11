@@ -278,14 +278,138 @@ pub fn tolerance(detail: f32) -> f32 {
     (1.5 - detail).clamp(0.5, 1.5)
 }
 
+/// The speck brake at Color `amount` (0..=1): the chroma excess (in noise variances of the two chroma
+/// components together) from which a pixel starts to count as a colour speck (fully at twice that), and
+/// the largest share of its colour that is replaced. Weak at the default 25 (only extreme specks, at most
+/// half), stronger up to 100. Below 25 the final blend (`strength`) fades it out with the rest.
+pub fn speck_brake(amount: f32) -> SpeckBrake {
+    let t = ((amount - 0.25) / 0.75).clamp(0.0, 1.0);
+    let off = std::env::var_os("NRV2_SPECK_OFF").is_some();
+    SpeckBrake { threshold: 64.0 - 39.0 * t, share: if off { 0.0 } else { 0.5 + 0.5 * t } }
+}
+
+/// See [`speck_brake`]; `share` 0 turns the brake off.
+#[derive(Clone, Copy, Debug)]
+pub struct SpeckBrake {
+    pub threshold: f32,
+    pub share: f32,
+}
+
+impl SpeckBrake {
+    pub const OFF: SpeckBrake = SpeckBrake { threshold: f32::INFINITY, share: 0.0 };
+}
+
+/// The median (mean of the middle two) of 8 values, by an optimal 19-comparator sorting network
+/// (the GPU kernel uses the same one).
+fn median8(v: [f32; 8]) -> f32 {
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = v;
+    let cmp = |x: &mut f32, y: &mut f32| {
+        let (lo, hi) = (x.min(*y), x.max(*y));
+        (*x, *y) = (lo, hi);
+    };
+    cmp(&mut a, &mut c);
+    cmp(&mut b, &mut d);
+    cmp(&mut e, &mut g);
+    cmp(&mut f, &mut h);
+    cmp(&mut a, &mut e);
+    cmp(&mut b, &mut f);
+    cmp(&mut c, &mut g);
+    cmp(&mut d, &mut h);
+    cmp(&mut a, &mut b);
+    cmp(&mut c, &mut d);
+    cmp(&mut e, &mut f);
+    cmp(&mut g, &mut h);
+    cmp(&mut c, &mut e);
+    cmp(&mut d, &mut f);
+    cmp(&mut b, &mut e);
+    cmp(&mut d, &mut g);
+    cmp(&mut b, &mut c);
+    cmp(&mut d, &mut e);
+    cmp(&mut f, &mut g);
+    let _ = (a, b, c, f, g, h);
+    0.5 * (d + e)
+}
+
+fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// How much of a pixel's chroma the speck brake replaces by the median of the ring around it, and that
+/// median (Y, R−Y, B−Y), from the pixel `p`, the ring `ring` and the rest of the 5 × 5 border `rest`. A
+/// speck stands out in colour far beyond the noise, but not in luminance (a star, a lit point or any real
+/// small detail almost always has a luminance step), and it is compact: the colour shift does not reach
+/// the border (a line or an edge carries it on). Demosaicing spreads high-ISO specks over 2 × 2 to
+/// 3 × 3 pixels, which all lie inside. The noise is taken at the ring's mean luminance (a median of it
+/// is only needed for the few pixels past the threshold).
+fn speck_share(p: [f32; 3], ring: &[[f32; 3]; 8], rest: impl Iterator<Item = [f32; 3]>, noise: &JointNoise, brake: SpeckBrake) -> (f32, [f32; 3]) {
+    let y = ring.iter().map(|q| q[0]).sum::<f32>() / 8.0;
+    let m = [0.0, median8(ring.map(|q| q[1])), median8(ring.map(|q| q[2]))];
+    let (vu, vv) = (noise.var(1, y), noise.var(2, y));
+    let (du, dv) = (p[1] - m[1], p[2] - m[2]);
+    let excess = du * du / vu + dv * dv / vv;
+    if excess <= brake.threshold {
+        return (0.0, m);
+    }
+    let m = [median8(ring.map(|q| q[0])), m[1], m[2]];
+    // luminance: full brake up to half the chroma excess, none from 1.5 times it
+    let dy = p[0] - m[0];
+    let luminance = dy * dy / noise.var(0, y);
+    let alone = ((1.5 * excess - luminance) / excess).clamp(0.0, 1.0);
+    if alone <= 0.0 {
+        return (0.0, m);
+    }
+    // compactness: the largest share of the pixel's colour shift that a border pixel also has
+    let shared = ring.iter().copied().chain(rest).map(|q| ((q[1] - m[1]) * du / vu + (q[2] - m[2]) * dv / vv) / excess).fold(0.0f32, f32::max);
+    let compact = ((0.6 - shared) / 0.3).clamp(0.0, 1.0);
+    (brake.share * smoothstep(brake.threshold, 2.0 * brake.threshold, excess) * alone * compact, m)
+}
+
+/// Replace the chroma of compact colour specks by that of their surroundings (see `speck_share`), in the
+/// transformed image (Y, R−Y, B−Y); luminance is never touched. Runs before the guide is built, so a speck
+/// is neither kept by the edge-aware weights nor spread by them.
+fn despeck(img: &Rgb32f, noise: &JointNoise, brake: SpeckBrake) -> Rgb32f {
+    let mut out = img.clone();
+    if brake.share <= 0.0 || img.width < 5 || img.height < 5 {
+        return out;
+    }
+    let (w, h) = (img.width, img.height);
+    for_rows(&mut out.data, w, |y, row| {
+        if y < 2 || y + 2 >= h {
+            return;
+        }
+        let rows: [Option<&[[f32; 3]]>; 5] = std::array::from_fn(|k| img.data.get((y + k - 2) * w..(y + k - 1) * w));
+        let [Some(r0), Some(r1), Some(r2), Some(r3), Some(r4)] = rows else { return };
+        for (((((o, w0), w1), w2), w3), w4) in
+            row.iter_mut().skip(2).zip(r0.windows(5)).zip(r1.windows(5)).zip(r2.windows(5)).zip(r3.windows(5)).zip(r4.windows(5))
+        {
+            let (&[a0, a1, a2, a3, a4], &[b0, _, _, _, b4], &[c0, _, p, _, c4], &[d0, _, _, _, d4], &[e0, e1, e2, e3, e4]) = (w0, w1, w2, w3, w4)
+            else {
+                continue;
+            };
+            // the ring: corners and edge centres of the 5 × 5 square, far enough that a speck spread over
+            // its direct neighbours by demosaicing does not reach them; the rest of the border: with the
+            // ring, every thin line or edge through the pixel crosses at least one of the 16 at any angle
+            let ring = [a0, a2, a4, c0, c4, e0, e2, e4];
+            let rest = [a1, a3, b0, b4, d0, d4, e1, e3];
+            let (k, m) = speck_share(p, &ring, rest.into_iter(), noise, brake);
+            if k > 0.0 {
+                o[1] += k * (m[1] - p[1]);
+                o[2] += k * (m[2] - p[2]);
+            }
+        }
+    });
+    out
+}
+
 pub(crate) fn denoise(img: &mut Rgb32f, params: &NrcParams, detail: f32, amount: f32) {
     let step = std::env::var("NRV2_JOINT_STEP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1).clamp(1, 2);
     // Continuous ramp from zero; from the ordinary default Color=25 onward the spatial
     // scale controls the extra smoothing. Noise calibration and edge decisions stay fixed.
-    denoise_grid(img, params, step, detail, strength(amount));
+    denoise_grid(img, params, step, detail, strength(amount), speck_brake(amount));
 }
 
-fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, strength: f32) {
+fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, strength: f32, brake: SpeckBrake) {
     if img.is_empty() || strength <= 0.0 {
         return;
     }
@@ -334,6 +458,21 @@ fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, 
     let mut noise = noise_model(&original);
     lap("noise model", &mut tt);
     noise.tolerance = tolerance(detail);
+    if let Some(path) = std::env::var_os("NRV2_DUMP") {
+        // PROTOTYPE: the transformed image (w, h as u32, then Y, R−Y, B−Y as f32) and the noise model
+        let mut bytes = Vec::with_capacity(8 + 12 * original.len());
+        bytes.extend((w as u32).to_le_bytes());
+        bytes.extend((h as u32).to_le_bytes());
+        for p in &original.data {
+            for v in p {
+                bytes.extend(v.to_le_bytes());
+            }
+        }
+        let _ = std::fs::write(&path, bytes);
+        eprintln!("    nr joint dump: alpha {:?} beta {:?} ymax {:?}", noise.model.alpha, noise.model.beta, noise.ymax);
+    }
+    let original = if brake.share > 0.0 { despeck(&original, &noise, brake) } else { original };
+    lap("speck brake", &mut tt);
     let guide = pilot(&original, &noise);
     lap("pilot", &mut tt);
     if std::env::var_os("NRV2_DEBUG").is_some() {
@@ -531,7 +670,7 @@ mod tests {
                     for (detail, strength, sigma) in [(0.5, 1.0, 12.0), (0.25, 0.6, 4.0), (0.9, 1.0, 27.0)] {
                         let p = NrcParams { off: 0.003, passes: vec![NrcPass { sigma, step, k: 64.0, pct: 0.2 }] };
                         let (mut a, mut b) = (input.clone(), input.clone());
-                        denoise_grid(&mut a, &p, step, detail, strength);
+                        denoise_grid(&mut a, &p, step, detail, strength, SpeckBrake::OFF);
                         crate::nrc_joint_reference::denoise_grid(&mut b, &p, step, detail, strength);
                         for (i, (x, y)) in a.data.iter().zip(&b.data).enumerate() {
                             for c in 0..3 {
@@ -566,7 +705,7 @@ mod tests {
         for _ in 0..3 {
             let mut a = input.clone();
             let t = std::time::Instant::now();
-            denoise_grid(&mut a, &p, 1, 0.5, 1.0);
+            denoise_grid(&mut a, &p, 1, 0.5, 1.0, SpeckBrake::OFF);
             new.push(t.elapsed().as_secs_f64());
             let mut b = input.clone();
             let t = std::time::Instant::now();
@@ -578,6 +717,33 @@ mod tests {
         println!("joint 24 MP: optimised {:.2} s, reference {:.2} s (medians of {new:.2?} / {old:.2?})", new[1], old[1]);
     }
 
+    /// BENCH (ignored, prints): the speck brake alone against the whole joint filter on one 24 MP image,
+    /// interleaved. Median of 3 each.
+    #[test]
+    #[ignore]
+    fn bench_speck_brake() {
+        let (w, h) = (6000usize, 4000usize);
+        let clean = Rgb32f::from_fn(w, h, |x, y| if (x / 300 + y / 300) % 2 == 0 { [0.03, 0.02, 0.01] } else { [0.004, 0.006, 0.012] });
+        let input = noisy(&clean, 0x2545_f491_4f6c_dd1d, 0.004);
+        let p = NrcParams { off: 0.003, passes: vec![NrcPass { sigma: 27.0, step: 1, k: 64.0, pct: 0.2 }] };
+        let transformed = input.map(yuv);
+        let noise = noise_model(&transformed);
+        let (mut brake, mut joint) = (Vec::new(), Vec::new());
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let out = despeck(&transformed, &noise, speck_brake(1.0));
+            brake.push(t.elapsed().as_secs_f64());
+            assert_eq!(out.len(), transformed.len());
+            let mut a = input.clone();
+            let t = std::time::Instant::now();
+            denoise_grid(&mut a, &p, 1, 0.5, 1.0, SpeckBrake::OFF);
+            joint.push(t.elapsed().as_secs_f64());
+        }
+        brake.sort_by(f64::total_cmp);
+        joint.sort_by(f64::total_cmp);
+        println!("24 MP: speck brake {:.3} s, joint without it {:.2} s (medians of {brake:.3?} / {joint:.2?})", brake[1], joint[1]);
+    }
+
     #[test]
     fn joint_keeps_negative_means_luminance_and_reduces_chroma_noise() {
         for (w, h) in [(128, 96), (127, 95), (1, 19), (19, 1)] {
@@ -586,7 +752,7 @@ mod tests {
                 let input = noisy(&clean, seed, 0.003);
                 for step in [1, 2] {
                     let mut output = input.clone();
-                    denoise_grid(&mut output, &params(step), step, 0.5, 1.0);
+                    denoise_grid(&mut output, &params(step), step, 0.5, 1.0, speck_brake(1.0));
                     assert!(output.data.iter().flatten().all(|v| v.is_finite()));
                     for (a, b) in input.data.iter().zip(&output.data) {
                         assert!((luminance_2020(*a) - luminance_2020(*b)).abs() < 1e-7);
@@ -632,7 +798,7 @@ mod tests {
                 let input = noisy(&clean, seed, 0.003);
                 for step in [1, 2] {
                     let mut output = input.clone();
-                    denoise_grid(&mut output, &params(step), step, 0.5, 1.0);
+                    denoise_grid(&mut output, &params(step), step, 0.5, 1.0, speck_brake(1.0));
                     let step_uv = [yuv(left)[1] - yuv(right)[1], yuv(left)[2] - yuv(right)[2]];
                     let length = step_uv.iter().map(|v| v * v).sum::<f32>().sqrt();
                     for x in [92, 93, 98, 99] {
@@ -671,7 +837,7 @@ mod tests {
         red = red.map(|v| v * gain);
         let clean = Rgb32f::from_fn(192, 128, |x, _| if (94..96).contains(&x) { red } else { grey });
         let mut output = noisy(&clean, 0x2545_f491_4f6c_dd1d, 0.006);
-        denoise_grid(&mut output, &params(1), 1, 0.5, 1.0);
+        denoise_grid(&mut output, &params(1), 1, 0.5, 1.0, speck_brake(1.0));
         let reference = yuv(red);
         let mut mean = [0.0; 3];
         for y in 16..112 {
@@ -695,5 +861,44 @@ mod tests {
             let predicted = model.var(i, 0.03) as f64;
             assert!(predicted > 0.6 * variance && predicted < 1.6 * variance, "channel {i}: estimated {predicted}, actual {variance}");
         }
+    }
+
+    /// The speck brake takes the colour out of a compact, isoluminant 2 × 2 speck (as demosaicing leaves
+    /// them at high ISO), more at Color 100 than at 25, but leaves a coloured star (a luminance peak) alone.
+    #[test]
+    fn speck_brake_removes_compact_colour_specks_but_not_stars() {
+        let dark = [0.004f32; 3];
+        let mut magenta = [0.024, 0.0, 0.024];
+        magenta[1] = (luminance_2020(dark) - 0.2627 * magenta[0] - 0.0593 * magenta[2]) / 0.6780;
+        let star = [0.3, 0.2, 0.1];
+        let clean = Rgb32f::from_fn(128, 96, |x, y| match (x, y) {
+            (40..42, 40..42) => magenta,
+            (90..92, 40..42) => star,
+            _ => dark,
+        });
+        let input = noisy(&clean, 0x2545_f491_4f6c_dd1d, 0.001);
+        // share of the object's chroma (against the background) left in its 2 × 2 pixels
+        let kept = |out: &Rgb32f, x0: usize, colour: [f32; 3]| {
+            let (r, b) = (yuv(colour), yuv(dark));
+            let reference = [r[1] - b[1], r[2] - b[2]];
+            let mut mean = [0.0f32; 2];
+            for (x, y) in [(x0, 40), (x0 + 1, 40), (x0, 41), (x0 + 1, 41)] {
+                let p = yuv(out.get(x, y));
+                mean = [mean[0] + 0.25 * (p[1] - b[1]), mean[1] + 0.25 * (p[2] - b[2])];
+            }
+            (mean[0] * reference[0] + mean[1] * reference[1]) / (reference[0].powi(2) + reference[1].powi(2))
+        };
+        let run = |brake| {
+            let mut out = input.clone();
+            denoise_grid(&mut out, &params(1), 1, 0.5, 1.0, brake);
+            (kept(&out, 40, magenta), kept(&out, 90, star))
+        };
+        let (off, star_off) = run(SpeckBrake::OFF);
+        let (weak, _) = run(speck_brake(0.25));
+        let (strong, star_strong) = run(speck_brake(1.0));
+        assert!(off > 0.5, "without the brake the speck keeps {off}");
+        assert!(weak < 0.8 * off && strong < 0.2, "speck kept: off {off}, at 25 {weak}, at 100 {strong}");
+        assert!(strong < weak, "the brake is stronger at 100 ({strong}) than at 25 ({weak})");
+        assert!((star_strong - star_off).abs() < 0.02, "star colour {star_off} -> {star_strong}");
     }
 }

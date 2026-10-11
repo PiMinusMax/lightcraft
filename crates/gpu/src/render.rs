@@ -836,6 +836,7 @@ const VRAM_RESERVE: u64 = 384 << 20;
 fn color_nr_joint(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, p: &local::NrcParams, detail: f32, amount: f32) -> Option<Buf> {
     use lightcraft_pipeline::nrc_joint;
     let strength = nrc_joint::strength(amount);
+    let brake = nrc_joint::speck_brake(amount);
     if w < 3 || h < 3 {
         return None;
     }
@@ -864,8 +865,8 @@ fn color_nr_joint(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, p: &local::Nrc
     // Rows a kept pixel depends on: a wrong value at a band edge (treated as an image border) moves
     // inwards by delta per vertical sweep, two sweeps per scale; at the farthest row it reaches, a
     // scale's weight and path still read up to delta rows further (at most the largest delta); the
-    // guide's blur and pilot reach a few rows. Hence 2·Σdelta + max delta + 8.
-    let halo = plan.iter().map(|d| 2 * d.0).sum::<usize>() + plan.last().map_or(0, |d| d.0) + 8;
+    // guide's blur and pilot reach a few rows, the speck brake two more. Hence 2·Σdelta + max delta + 10.
+    let halo = plan.iter().map(|d| 2 * d.0).sum::<usize>() + plan.last().map_or(0, |d| d.0) + 10;
     // Memory: the whole output (3 values per pixel) is held besides the input; a band then holds about
     // 15 values per pixel (guide 3, two chroma buffers 2 + 2, two path/weight buffers 4 + 4; 12 while
     // the guide is built). The budget for both together is the device memory free right now (where the
@@ -908,7 +909,7 @@ fn color_nr_joint(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, p: &local::Nrc
     while y0 < h {
         let y1 = (y0 + core).min(h);
         let (b0, b1) = if core >= h { (0, h) } else { (y0.saturating_sub(halo), (y1 + halo).min(h)) };
-        let filtered = joint_band(cx, img, w, b0, b1 - b0, &noise, &plan);
+        let filtered = joint_band(cx, img, w, b0, b1 - b0, &noise, brake, &plan);
         let kept = (y1 - y0) * w;
         nrcj(cx, "nrcj_recon", kept, &[kept as u32, strength.to_bits(), (y0 * w) as u32, (b0 * w) as u32], img, Some(&filtered), &out);
         drop(filtered);
@@ -928,14 +929,22 @@ fn joint_band(
     b0: usize,
     bh: usize,
     noise: &lightcraft_pipeline::nrc_joint::JointNoise,
+    brake: lightcraft_pipeline::nrc_joint::SpeckBrake,
     plan: &[(usize, f32)],
 ) -> Buf {
     let n = w * bh;
     let mut np = vec![n as u32, w as u32, bh as u32];
     np.extend(noise.model.alpha.iter().chain(&noise.model.beta).chain(&noise.ymax).map(|v| v.to_bits()));
     np.push(noise.tolerance.to_bits());
-    let yuv = cx.gpu.buffer(3 * n);
+    let mut yuv = cx.gpu.buffer(3 * n);
     nrcj(cx, "nrcj_yuv", n, &[n as u32, (b0 * w) as u32], img, None, &yuv);
+    if brake.share > 0.0 {
+        let mut sp = np.clone();
+        sp.extend([brake.threshold.to_bits(), brake.share.to_bits()]);
+        let despecked = cx.gpu.buffer(3 * n);
+        nrcj(cx, "nrcj_speck", n, &sp, &yuv, None, &despecked);
+        yuv = despecked;
+    }
     let blurred = gaussian(cx, &yuv, w, bh, 3, 0.8);
     let guide = cx.gpu.buffer(3 * n);
     nrcj(cx, "nrcj_pilot", n, &np, &yuv, Some(&blurred), &guide);

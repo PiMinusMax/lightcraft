@@ -67,17 +67,48 @@ background load from other jobs made single timings useless (compare in one proc
 
 ### Known limits
 
-- **No outlier brake yet.** Isolated, strongly coloured single pixels in dark areas (a red, a blue speck) are
-  treated as real detail by the edge-aware weights and stay visible at Color 100, while V1's blind blur largely
-  removes them (seen on screenshots at different zoom levels; to be measured on full-size renders). Planned: before the diffusion,
-  replace a pixel's chroma by its neighbours' median only if it stands out in colour from all neighbours but not
-  in luminance (real small colour detail almost always has a luminance step or continues along an edge). Not
-  implemented or measured yet.
+- Specks that the speck brake leaves (section 3a): ones with their own luminance step (they stay as
+  grey or bright dots, as in V1) and, at Color 25, all but the strongest (on purpose, see below).
 - Flat dark areas are smoothed somewhat less than by root V2 (cat spread 6.5 vs 5.1 at 25).
 - The Color slider changes little above 25 (the blend is complete at 25; only the reach grows). To us 25 already
   removes the visible colour noise.
 - Prototype switches (`NRV2_*`, `LIGHTCRAFT_NR_V2`) instead of a process version; debug output; a test-only copy
   of an earlier version (`nrc_joint_reference.rs`) for bit-exactness checks.
+
+## 3a. Speck brake
+
+Isolated, strongly coloured pixels in dark areas (a red, a blue speck) were treated as real detail by the
+edge-aware weights and stayed visible at Color 100, while V1's blind blur largely removed them. Measured on
+dumps of the transformed image (`NRV2_DUMP`) of the two #820 files:
+
+- The specks are not single pixels at ISO 25600: demosaicing spreads them over 2 × 2 to 3 × 3 pixels. A first
+  test "no direct neighbour shares the colour shift" therefore protected them; the brake now asks whether the
+  shift reaches the 16-pixel border of the 5 × 5 square (any thin line or edge through the pixel does).
+- In the centre of the remaining cat specks the chroma excess is 250–1500 noise variances, the luminance step
+  0.02–0.17 of it, the border share ≤ 0.4: all three tests pass clearly. What stays visible afterwards is a grey
+  or bright dot (luminance noise, as in V1).
+- Real noise has far heavier tails than a Gaussian: 570 000 pixels of the candle exceed 36 (a Gaussian: 0.5).
+  A threshold of 12 at Color 100 also moved the mean of a synthetic flat patch (2.2e-6, the test allows 2e-6);
+  now 64 at 25 and 25 at 100, at most half the colour replaced at 25.
+
+| Full-size, 8-bit, against the same build without the brake | Joint | with brake |
+|---|---|---|
+| Leaves (candle), C* at 25 / 100 | 97 % / 97 % | 97 % / 97 % |
+| Cat dark mean R / G / B at 100 | −14.1 / +1.2 / +6.7 % | −13.6 / +1.6 / +5.3 % |
+| Candle dark mean B at 25 / 100 | −26.1 / −26.0 % | −26.2 / −27.4 % |
+| Cat flat dark spread / blotch at 25 | 6.46 / 2.78 | 6.15 / 2.69 |
+| Cat flat dark spread / blotch at 100 | 6.11 / 2.37 | 5.37 / 2.08 |
+
+Crops of the 10 most visible specks per file: blue specks on black become grey at 100, a magenta speck in
+orange almost disappears; at 25 they are only weakened. The largest changes in bright areas are specks too
+(pink dots in the cat's blue, yellow dots in cream); no edge or line changed visibly. Synthetic test
+`speck_brake_removes_compact_colour_specks_but_not_stars`: an isoluminant 2 × 2 speck loses most of its colour
+at 100, less at 25; a coloured 2 × 2 star keeps its colour within 2 %.
+
+Cost (machine under heavy load, so rough): CPU 24 MP synthetic 0.54 s against 4.1 s for the rest of the filter
+(a sort per median: 1.8 s; now a sorting network and the luminance median only past the threshold). GPU
+(Intel HD 630, 33 MP, white balance + NR stage): median 6.19 s with, 5.61 s without. GPU and CPU agree to 1/255
+on the cat; on the candle 26 pixels differ by up to 30/255 with and without the brake (not caused by it).
 
 ## 4. Speed
 
