@@ -267,6 +267,67 @@ pub fn nrc_params(s: &DevelopSettings, src_long: usize, out_long: usize) -> Opti
     Some(NrcParams { off: knob("NRV2_OFF", 0.003), passes })
 }
 
+/// Chroma noise variance per channel as a function of the local luminance: `α · Y + β` (shot plus read noise).
+#[derive(Clone, Copy, Debug)]
+pub struct NrcNoise {
+    pub alpha: [f32; 3],
+    pub beta: [f32; 3],
+}
+
+impl NrcNoise {
+    #[inline]
+    pub fn var(&self, i: usize, y: f32) -> f32 {
+        (self.alpha[i] * y.max(0.0) + self.beta[i]).max(1e-14)
+    }
+}
+
+/// Fit [`NrcNoise`] to the local variances `var` against the local luminance `ym` (channel 0): the pixels are
+/// split into 16 luminance bands (square-root spaced), each band's `pct`-quantile is its noise floor, and
+/// `α`, `β ≥ 0` are fitted to the bands by weighted least squares.
+pub fn nrc_noise_model(var: &Rgb32f, ym: &Rgb32f, pct: f32) -> NrcNoise {
+    const BANDS: usize = 16;
+    let stride = nrc_sample_stride(var.data.len()).min(4);
+    let ymax = ym.data.iter().step_by(stride).map(|y| y[0]).filter(|y| y.is_finite()).fold(1e-9f32, f32::max);
+    let mut bands: Vec<(Vec<[f32; 3]>, f64)> = vec![(Vec::new(), 0.0); BANDS];
+    for (v, y) in var.data.iter().zip(&ym.data).step_by(stride) {
+        if !(y[0].is_finite() && v.iter().all(|x| x.is_finite())) {
+            continue;
+        }
+        let b = (((y[0].max(0.0) / ymax).sqrt() * BANDS as f32) as usize).min(BANDS - 1);
+        bands[b].0.push(*v);
+        bands[b].1 += y[0].max(0.0) as f64;
+    }
+    let mut alpha = [0.0f32; 3];
+    let mut beta = [0.0f32; 3];
+    for i in 0..3 {
+        let pts: Vec<(f64, f64, f64)> = bands
+            .iter_mut()
+            .filter(|(v, _)| v.len() >= 32)
+            .map(|(v, ysum)| {
+                let n = v.len();
+                let k = ((n - 1) as f32 * pct.clamp(0.0, 1.0)) as usize;
+                let mut c: Vec<f32> = v.iter().map(|x| x[i]).collect();
+                let (_, q, _) = c.select_nth_unstable_by(k, f32::total_cmp);
+                (*ysum / n as f64, *q as f64, n as f64)
+            })
+            .collect();
+        if pts.is_empty() {
+            beta[i] = 1e-12;
+            continue;
+        }
+        let sw: f64 = pts.iter().map(|p| p.2).sum();
+        let (ml, mv) = (pts.iter().map(|p| p.2 * p.0).sum::<f64>() / sw, pts.iter().map(|p| p.2 * p.1).sum::<f64>() / sw);
+        let (cov, vl) = pts.iter().fold((0.0, 0.0), |(c, v), p| (c + p.2 * (p.0 - ml) * (p.1 - mv), v + p.2 * (p.0 - ml) * (p.0 - ml)));
+        let a = if vl > 0.0 { (cov / vl).max(0.0) } else { 0.0 };
+        alpha[i] = a as f32;
+        beta[i] = (mv - a * ml).max(0.0) as f32;
+    }
+    if std::env::var_os("NRV2_DEBUG").is_some() {
+        eprintln!("    nr colour v2 noise model: alpha {alpha:?} beta {beta:?}");
+    }
+    NrcNoise { alpha, beta }
+}
+
 /// `eps` per channel from the sampled local variances.
 pub fn nrc_eps(samples: &[[f32; 3]], k: f32, pct: f32) -> [f32; 3] {
     [0, 1, 2].map(|c| {
@@ -280,35 +341,71 @@ pub fn nrc_eps(samples: &[[f32; 3]], k: f32, pct: f32) -> [f32; 3] {
     })
 }
 
-/// Chroma of a pixel as differences of square roots (`√(c + off) − √(Y + off)`).
+/// PROTOTYPE: `NRV2_LINEAR=1` filters linear colour differences `c − Y` (nothing clipped, the local mean
+/// kept exactly) with a threshold from a noise model `σ²(Y) = α·Y + β`, instead of square-root differences
+/// with one threshold for the whole image.
+pub fn nrc_linear() -> bool {
+    knob("NRV2_LINEAR", 0.0) > 0.5
+}
+
+/// Chroma of a pixel: linear differences `c − Y` (see [`nrc_linear`]), else differences of square roots
+/// (`√(c + off) − √(Y + off)`).
 #[inline]
 pub fn nrc_chroma(c: [f32; 3], off: f32) -> [f32; 3] {
+    if nrc_linear() {
+        let y = luminance_2020(c);
+        return c.map(|v| v - y);
+    }
     let y = (luminance_2020(c).max(0.0) + off).sqrt();
     c.map(|v| (v.max(0.0) + off).sqrt() - y)
 }
 
-/// A pixel with its chroma replaced by `q`, its luminance kept.
+/// A pixel with its chroma replaced by `q`, its luminance kept. `removed` is the variance the passes
+/// took out of each square-root channel: smoothing averages square roots, whose square is below the mean
+/// of the squares (Jensen) by that variance, so adding it back keeps the local mean colour.
 #[inline]
-pub fn nrc_recombine(p: [f32; 3], q: [f32; 3], off: f32) -> [f32; 3] {
+pub fn nrc_recombine(p: [f32; 3], q: [f32; 3], removed: [f32; 3], off: f32) -> [f32; 3] {
+    if nrc_linear() {
+        // additive: channel = Y + filtered difference, then Y pulled back exactly (each channel has its own a)
+        let y = luminance_2020(p);
+        let c = q.map(|d| y + d);
+        let dy = y - luminance_2020(c);
+        return c.map(|v| v + dy);
+    }
     let yl = luminance_2020(p);
     let ys = (yl.max(0.0) + off).sqrt();
-    let c = q.map(|dv| ((ys + dv).max(0.0).powi(2) - off).max(0.0));
+    let c: [f32; 3] = std::array::from_fn(|i| ((ys + q[i]).max(0.0).powi(2) + removed[i] - off).max(0.0));
     let y1 = luminance_2020(c);
     if y1 > 1e-7 && yl > 0.0 { c.map(|v| v * (yl / y1)) } else { [yl.max(0.0); 3] }
 }
 
 /// Self-guided coefficients of one pass at its subsampled size (see [`NrcPass`]): `a` and `b`
 /// per pixel of `lo`, blurred.
-fn nrc_coeffs(lo: &Rgb32f, pass: &NrcPass) -> (Rgb32f, Rgb32f) {
+fn nrc_coeffs(lo: &Rgb32f, ylo: &Rgb32f, pass: &NrcPass) -> (Rgb32f, Rgb32f, Rgb32f) {
     let sg = pass.sigma / pass.step.max(1) as f32;
     let (mean, corr) = par_join(|| gaussian(lo, sg), || gaussian(&lo.map(|c| c.map(|v| v * v)), sg));
     let var = corr.zip_map(&mean, |c, m| [0, 1, 2].map(|i| (c[i] - m[i] * m[i]).max(0.0)));
-    let stride = nrc_sample_stride(var.data.len());
-    let samples: Vec<[f32; 3]> = var.data.iter().step_by(stride).copied().collect();
-    let eps = nrc_eps(&samples, pass.k, pass.pct);
-    let a = var.map(|v| [0, 1, 2].map(|i| v[i] / (v[i] + eps[i])));
+    let a = if nrc_linear() {
+        let ym = gaussian(ylo, sg);
+        let model = nrc_noise_model(&var, &ym, pass.pct);
+        var.zip_map(&ym, |v, y| [0, 1, 2].map(|i| v[i] / (v[i] + pass.k * model.var(i, y[0]))))
+    } else {
+        let stride = nrc_sample_stride(var.data.len());
+        let samples: Vec<[f32; 3]> = var.data.iter().step_by(stride).copied().collect();
+        let eps = nrc_eps(&samples, pass.k, pass.pct);
+        var.map(|v| [0, 1, 2].map(|i| v[i] / (v[i] + eps[i])))
+    };
     let b = mean.zip_map(&a, |m, a| [0, 1, 2].map(|i| m[i] - a[i] * m[i]));
-    par_join(|| gaussian(&a, sg), || gaussian(&b, sg))
+    // what `a · d + b` takes out of the variance: var − a² · var
+    let bias = if nrc_linear() { 0.0 } else { bias_knob() };
+    let removed = var.zip_map(&a, |v, a| [0, 1, 2].map(|i| (1.0 - a[i] * a[i]) * v[i] * bias));
+    let (ab, rb) = par_join(|| par_join(|| gaussian(&a, sg), || gaussian(&b, sg)), || gaussian(&removed, sg));
+    (ab.0, ab.1, rb)
+}
+
+/// PROTOTYPE: `NRV2_BIAS=0` leaves the removed variance out (the mean colour of noisy areas then drifts).
+fn bias_knob() -> f32 {
+    knob("NRV2_BIAS", 1.0)
 }
 
 /// One pass's coefficients and the taps that upsample them to the full size
@@ -316,6 +413,7 @@ fn nrc_coeffs(lo: &Rgb32f, pass: &NrcPass) -> (Rgb32f, Rgb32f) {
 struct NrcUp {
     a: Rgb32f,
     b: Rgb32f,
+    r: Rgb32f,
     ux: Vec<(usize, Vec<f32>)>,
     uy: Vec<(usize, Vec<f32>)>,
 }
@@ -326,43 +424,58 @@ fn madd3(acc: [f32; 3], v: [f32; 3], f: f32) -> [f32; 3] {
 }
 
 impl NrcUp {
-    /// Apply this pass to `d`, row `y` of the full-size chroma, in place.
-    fn apply_row(&self, y: usize, d: &mut [[f32; 3]], va: &mut Vec<[f32; 3]>, vb: &mut Vec<[f32; 3]>) {
+    /// Apply this pass to `d`, row `y` of the full-size chroma, in place, and add the variance it
+    /// removes to `removed`.
+    fn apply_row(&self, y: usize, d: &mut [[f32; 3]], removed: &mut [[f32; 3]], va: &mut Vec<[f32; 3]>, vb: &mut Vec<[f32; 3]>, vr: &mut Vec<[f32; 3]>) {
         let lw = self.a.width;
-        va.clear();
-        va.resize(lw, [0.0; 3]);
-        vb.clear();
-        vb.resize(lw, [0.0; 3]);
+        for v in [&mut *va, &mut *vb, &mut *vr] {
+            v.clear();
+            v.resize(lw, [0.0; 3]);
+        }
         if let Some((y0, wy)) = self.uy.get(y) {
             for (j, &f) in wy.iter().enumerate() {
-                let (Some(ra), Some(rb)) = (self.a.data.get((y0 + j) * lw..(y0 + j + 1) * lw), self.b.data.get((y0 + j) * lw..(y0 + j + 1) * lw)) else { continue };
+                let rows = (y0 + j) * lw..(y0 + j + 1) * lw;
+                let (Some(ra), Some(rb), Some(rr)) = (self.a.data.get(rows.clone()), self.b.data.get(rows.clone()), self.r.data.get(rows)) else { continue };
                 for x in 0..lw {
                     va[x] = madd3(va[x], ra[x], f);
                     vb[x] = madd3(vb[x], rb[x], f);
+                    vr[x] = madd3(vr[x], rr[x], f);
                 }
             }
         }
-        for (x, p) in d.iter_mut().enumerate() {
+        for (x, (p, rem)) in d.iter_mut().zip(removed.iter_mut()).enumerate() {
             let Some((x0, wx)) = self.ux.get(x) else { continue };
-            let (mut ca, mut cb) = ([0.0; 3], [0.0; 3]);
+            let (mut ca, mut cb, mut cr) = ([0.0; 3], [0.0; 3], [0.0; 3]);
             for (k, &f) in wx.iter().enumerate() {
-                if let (Some(a), Some(b)) = (va.get(x0 + k), vb.get(x0 + k)) {
+                if let (Some(a), Some(b), Some(r)) = (va.get(x0 + k), vb.get(x0 + k), vr.get(x0 + k)) {
                     ca = madd3(ca, *a, f);
                     cb = madd3(cb, *b, f);
+                    cr = madd3(cr, *r, f);
                 }
             }
             *p = [0, 1, 2].map(|i| ca[i] * p[i] + cb[i]);
+            *rem = [0, 1, 2].map(|i| rem[i] + cr[i].max(0.0));
         }
     }
 }
 
-/// Row `y` of the chroma after the passes in `ups`, computed from the image row `src`.
-fn nrc_row(src: &[[f32; 3]], y: usize, ups: &[NrcUp], off: f32, va: &mut Vec<[f32; 3]>, vb: &mut Vec<[f32; 3]>) -> Vec<[f32; 3]> {
+/// Scratch rows of [`NrcUp::apply_row`].
+#[derive(Default)]
+struct NrcScratch {
+    va: Vec<[f32; 3]>,
+    vb: Vec<[f32; 3]>,
+    vr: Vec<[f32; 3]>,
+}
+
+/// Row `y` of the chroma after the passes in `ups`, computed from the image row `src`, and the
+/// variance the passes removed per pixel.
+fn nrc_row(src: &[[f32; 3]], y: usize, ups: &[NrcUp], off: f32, s: &mut NrcScratch) -> (Vec<[f32; 3]>, Vec<[f32; 3]>) {
     let mut d: Vec<[f32; 3]> = src.iter().map(|c| nrc_chroma(*c, off)).collect();
+    let mut removed = vec![[0.0; 3]; d.len()];
     for up in ups {
-        up.apply_row(y, &mut d, va, vb);
+        up.apply_row(y, &mut d, &mut removed, &mut s.va, &mut s.vb, &mut s.vr);
     }
-    d
+    (d, removed)
 }
 
 /// Colour noise reduction, second method: chroma as differences of square roots (noise of about
@@ -387,13 +500,13 @@ pub fn color_nr_v2(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_l
         let src = &*img;
         let done = &ups;
         for_rows(&mut lo.data, lw, |yo, row| {
-            let (mut va, mut vb) = (Vec::new(), Vec::new());
+            let mut scratch = NrcScratch::default();
             let Some((y0, wy)) = by.get(yo) else { return };
             for (j, &f) in wy.iter().enumerate() {
                 if f == 0.0 || y0 + j >= h {
                     continue;
                 }
-                let d = nrc_row(src.row(y0 + j), y0 + j, done, p.off, &mut va, &mut vb);
+                let (d, _) = nrc_row(src.row(y0 + j), y0 + j, done, p.off, &mut scratch);
                 for (xo, o) in row.iter_mut().enumerate() {
                     let Some((x0, wx)) = bx.get(xo) else { continue };
                     let mut acc = [0.0; 3];
@@ -406,15 +519,36 @@ pub fn color_nr_v2(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_l
                 }
             }
         });
-        let (a, b) = nrc_coeffs(&lo, pass);
-        ups.push(NrcUp { a, b, ux: weights(lw, w, Filter::Bilinear), uy: weights(lh, h, Filter::Bilinear) });
+        // the pass's luminance at the same size (for the noise model)
+        let mut ylo = Rgb32f::new(lw, lh);
+        for_rows(&mut ylo.data, lw, |yo, row| {
+            let Some((y0, wy)) = by.get(yo) else { return };
+            for (j, &f) in wy.iter().enumerate() {
+                if f == 0.0 || y0 + j >= h {
+                    continue;
+                }
+                let srow = src.row(y0 + j);
+                for (xo, o) in row.iter_mut().enumerate() {
+                    let Some((x0, wx)) = bx.get(xo) else { continue };
+                    let mut acc = 0.0;
+                    for (k, &g) in wx.iter().enumerate() {
+                        if let Some(c) = srow.get(x0 + k) {
+                            acc += g * luminance_2020(*c);
+                        }
+                    }
+                    o[0] += f * acc;
+                }
+            }
+        });
+        let (a, b, r) = nrc_coeffs(&lo, &ylo, pass);
+        ups.push(NrcUp { a, b, r, ux: weights(lw, w, Filter::Bilinear), uy: weights(lh, h, Filter::Bilinear) });
     }
     let off = p.off;
     for_rows(&mut img.data, w, |y, row| {
-        let (mut va, mut vb) = (Vec::new(), Vec::new());
-        let q = nrc_row(row, y, &ups, off, &mut va, &mut vb);
-        for (px, qv) in row.iter_mut().zip(q) {
-            *px = nrc_recombine(*px, qv, off);
+        let mut scratch = NrcScratch::default();
+        let (q, removed) = nrc_row(row, y, &ups, off, &mut scratch);
+        for ((px, qv), r) in row.iter_mut().zip(q).zip(removed) {
+            *px = nrc_recombine(*px, qv, r, off);
         }
     });
     if let Some(t) = _t {
@@ -596,6 +730,46 @@ pub fn airlight_of(mut v: Vec<f32>) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    /// PROBE (prints, never fails): how far colour NR v2 moves the float mean of a flat, noisy, dark patch.
+    #[test]
+    #[ignore]
+    fn probe_nrc_mean_drift() {
+        use lightcraft_develop::DevelopSettings;
+        let (w, h) = (768usize, 768usize);
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut gauss = || {
+            (0..4)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed >> 11) as f32 / (1u64 << 53) as f32 - 0.5
+                })
+                .sum::<f32>()
+                * 1.732
+        };
+        for (name, base, sigma) in [("dark warm, blue near 0", [0.006f32, 0.004, 0.0008], [0.002f32, 0.0015, 0.003]), ("cat-like, red near 0", [0.0015, 0.004, 0.009], [0.004, 0.003, 0.005])] {
+            let mut img = Rgb32f::new(w, h);
+            for p in img.data.iter_mut() {
+                *p = [0, 1, 2].map(|i| base[i] + sigma[i] * gauss());
+            }
+            let mean = |im: &Rgb32f| {
+                let n = im.data.len() as f64;
+                [0, 1, 2].map(|i| im.data.iter().map(|p| p[i] as f64).sum::<f64>() / n)
+            };
+            let m0 = mean(&img);
+            for nr in [25.0, 100.0] {
+                let mut s = DevelopSettings::default();
+                s.detail.nr_color = nr;
+                let mut a = img.clone();
+                color_nr_v2(&mut a, &s, w, w);
+                let m = mean(&a);
+                let clipped0 = mean(&img.map(|p| p.map(|v| v.max(0.0))));
+                let sd = |im: &Rgb32f, mm: [f64; 3]| [0, 1, 2].map(|i| (im.data.iter().map(|p| (p[i] as f64 - mm[i]).powi(2)).sum::<f64>() / im.data.len() as f64).sqrt());
+                println!("{name} NR {nr}: true mean {m0:.5?}, clipped noisy mean {clipped0:.5?}, after v2 {m:.5?} → {:+.1?} % vs true; noise sd {:.5?} → {:.5?}", [0, 1, 2].map(|i| 100.0 * (m[i] / m0[i] - 1.0)), sd(&img, m0), sd(&a, m));
+            }
+        }
+    }
     use super::*;
 
     #[test]
