@@ -30,12 +30,6 @@ fn yuv(c: [f32; 3]) -> [f32; 3] {
     [y, c[0] - y, c[2] - y]
 }
 
-fn rgb(y: f32, uv: [f32; 3]) -> [f32; 3] {
-    let r = y + uv[1];
-    let b = y + uv[2];
-    [r, (y - 0.2627 * r - 0.0593 * b) / 0.6780, b]
-}
-
 /// Noise of Y, R-Y and B-Y measured from small high-pass residuals, not the colour variance
 /// of a wide smoothing window. The median-square calibration is for Gaussian residuals.
 /// Luminance bands with predominantly texture may only lower their weight in the fit: they
@@ -175,8 +169,22 @@ fn pilot(original: &Rgb32f, noise: &JointNoise) -> Rgb32f {
 /// One conservative horizontal/vertical diffusion step. Pair weights are symmetric; the
 /// guide is never replaced by the filtered result. Long taps also account for the intervening
 /// guide edges, so a wide pass cannot jump over a thin differently coloured object.
-fn diffuse(src: &Rgb32f, dst: &mut Rgb32f, links: &Rgb32f, delta: usize, vertical: bool, rate: f32) {
+/// The two chroma components `R − Y`, `B − Y`, or a pair of per-axis values (horizontal, vertical).
+type Pair = [f32; 2];
+type PairImage = lightcraft_raster::Image<Pair>;
+
+fn rgb2(y: f32, uv: Pair) -> [f32; 3] {
+    let r = y + uv[0];
+    let b = y + uv[1];
+    [r, (y - 0.2627 * r - 0.0593 * b) / 0.6780, b]
+}
+
+/// One conservative horizontal/vertical diffusion step. Pair weights are symmetric; the
+/// guide is never replaced by the filtered result. Long taps also account for the intervening
+/// guide edges, so a wide pass cannot jump over a thin differently coloured object.
+fn diffuse(src: &PairImage, dst: &mut PairImage, links: &PairImage, delta: usize, vertical: bool, rate: f32) {
     let (w, h) = (src.width, src.height);
+    let axis = usize::from(vertical);
     for_rows(&mut dst.data, w, |y, row| {
         for (x, out) in row.iter_mut().enumerate() {
             let index = y * w + x;
@@ -189,8 +197,8 @@ fn diffuse(src: &Rgb32f, dst: &mut Rgb32f, links: &Rgb32f, delta: usize, vertica
                 let start = coordinate.min(neighbour);
                 let pi = if vertical { start * w + x } else { y * w + start };
                 let (Some(&q), Some(link)) = (src.data.get(ni), links.data.get(pi)) else { continue };
-                let weight = rate * link[usize::from(vertical)];
-                for i in 1..3 {
+                let weight = rate * link[axis];
+                for i in 0..2 {
                     out[i] += weight * (q[i] - p[i]);
                 }
             }
@@ -216,21 +224,33 @@ fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, 
     let (w, h) = (img.width.div_ceil(step), img.height.div_ceil(step));
     // Transform before resampling; negative linear differences are valid throughout.
     let mut original = Rgb32f::new(w, h);
-    for_rows(&mut original.data, w, |y, row| {
-        for (x, p) in row.iter_mut().enumerate() {
-            let mut count = 0.0f32;
-            for sy in y * step..((y + 1) * step).min(img.height) {
-                for sx in x * step..((x + 1) * step).min(img.width) {
-                    if let Some(&c) = img.data.get(sy * img.width + sx) {
-                        let c = yuv(c);
-                        *p = std::array::from_fn(|i| p[i] + c[i]);
-                        count += 1.0;
-                    }
+    if step == 1 {
+        // the generic loop below with one sample per pixel, same operations (0 + c, / 1)
+        for_rows(&mut original.data, w, |y, row| {
+            for (x, p) in row.iter_mut().enumerate() {
+                if let Some(&c) = img.data.get(y * w + x) {
+                    let c = yuv(c);
+                    *p = c.map(|v| (0.0f32 + v) / 1.0f32);
                 }
             }
-            *p = p.map(|v| v / count.max(1.0));
-        }
-    });
+        });
+    } else {
+        for_rows(&mut original.data, w, |y, row| {
+            for (x, p) in row.iter_mut().enumerate() {
+                let mut count = 0.0f32;
+                for sy in y * step..((y + 1) * step).min(img.height) {
+                    for sx in x * step..((x + 1) * step).min(img.width) {
+                        if let Some(&c) = img.data.get(sy * img.width + sx) {
+                            let c = yuv(c);
+                            *p = std::array::from_fn(|i| p[i] + c[i]);
+                            count += 1.0;
+                        }
+                    }
+                }
+                *p = p.map(|v| v / count.max(1.0));
+            }
+        });
+    }
     let lap = |what: &str, t: &mut Option<std::time::Instant>| {
         if let Some(t0) = t {
             eprintln!("      joint {what}: {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
@@ -247,26 +267,37 @@ fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, 
     if std::env::var_os("NRV2_DEBUG").is_some() {
         eprintln!("    nr joint: {w}x{h}, Y/R-Y/B-Y alpha {:?} beta {:?}, supported Y {:?}", noise.model.alpha, noise.model.beta, noise.ymax);
     }
-    let mut filtered = original.clone();
-    let mut scratch = Rgb32f::new(w, h);
-    let mut paths = Rgb32f::new(w, h);
-    let mut links = Rgb32f::new(w, h);
-    for_rows(&mut paths.data, w, |y, row| {
-        for (x, out) in row.iter_mut().enumerate() {
-            let index = y * w + x;
-            let Some(&g) = guide.data.get(index) else { continue };
-            if x + 1 < w
-                && let Some(&b) = guide.data.get(index + 1)
-            {
-                out[0] = distance(g, b, &noise);
+    // Working buffers carry the two chroma components only (Y is restored from the image at the end).
+    let mut filtered: PairImage = original.map(|p| [p[1], p[2]]);
+    // the full-resolution reconstruction reads Y from `img`: the transformed copy is no longer needed
+    let original = (step != 1).then_some(original);
+    let mut scratch = PairImage::new(w, h);
+    let mut paths = PairImage::new(w, h);
+    let mut links = PairImage::new(w, h);
+    // Direct neighbours: the path over one step is the pair's own distance, and its weight is exp(−distance).
+    {
+        use rayon::prelude::*;
+        paths.data.par_chunks_mut(w).zip(links.data.par_chunks_mut(w)).enumerate().for_each(|(y, (prow, lrow))| {
+            for (x, (out, link)) in prow.iter_mut().zip(lrow.iter_mut()).enumerate() {
+                let index = y * w + x;
+                let Some(&g) = guide.data.get(index) else { continue };
+                *link = [0.0; 2];
+                if x + 1 < w
+                    && let Some(&b) = guide.data.get(index + 1)
+                {
+                    out[0] = distance(g, b, &noise);
+                    link[0] = (-out[0]).exp();
+                }
+                if y + 1 < h
+                    && let Some(&b) = guide.data.get(index + w)
+                {
+                    out[1] = distance(g, b, &noise);
+                    link[1] = (-out[1]).exp();
+                }
             }
-            if y + 1 < h
-                && let Some(&b) = guide.data.get(index + w)
-            {
-                out[1] = distance(g, b, &noise);
-            }
-        }
-    });
+        });
+    }
+    lap("links 1", &mut tt);
     // Scale is independent of the edge decision. K has no role in deciding whether a leaf
     // is noise. Two dyadic sweeps provide broad smoothing with a fixed number of scales.
     let sigma = params.passes.last().map_or(0.0, |p| p.sigma / step as f32);
@@ -274,20 +305,6 @@ fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, 
     let mut delta = 1usize;
     while remaining > 0.01 && delta <= w.max(h) {
         let rate = (remaining / (4.0 * (delta as f32).powi(2))).min(0.25);
-        // Each symmetric pair weight is evaluated once per scale and reused by both
-        // diffusion sweeps and both ends of the pair.
-        for_rows(&mut links.data, w, |y, row| {
-            for (x, out) in row.iter_mut().enumerate() {
-                let index = y * w + x;
-                let (Some(&g), Some(path)) = (guide.data.get(index), paths.data.get(index)) else { continue };
-                *out = [0.0; 3];
-                for (axis, offset, valid) in [(0, delta, x + delta < w), (1, delta * w, y + delta < h)] {
-                    if valid && let Some(&other) = guide.data.get(index + offset) {
-                        out[axis] = (-distance(g, other, &noise).max(path[axis])).exp();
-                    }
-                }
-            }
-        });
         for _ in 0..2 {
             diffuse(&filtered, &mut scratch, &links, delta, false, rate);
             std::mem::swap(&mut filtered, &mut scratch);
@@ -295,74 +312,96 @@ fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, 
             std::mem::swap(&mut filtered, &mut scratch);
         }
         remaining -= 4.0 * rate * (delta as f32).powi(2);
-        // Maxima over paths of length 2*delta, using the two adjacent delta-length paths.
-        // Reuse the diffusion scratch so a long tap costs O(1), irrespective of radius.
-        for_rows(&mut scratch.data, w, |y, row| {
-            for (x, out) in row.iter_mut().enumerate() {
-                let index = y * w + x;
-                let Some(&p) = paths.data.get(index) else { continue };
-                *out = p;
-                if x + delta < w
-                    && let Some(q) = paths.data.get(index + delta)
-                {
-                    out[0] = out[0].max(q[0]);
-                }
-                if y + delta < h
-                    && let Some(q) = paths.data.get(index + delta * w)
-                {
-                    out[1] = out[1].max(q[1]);
-                }
-            }
-        });
-        std::mem::swap(&mut paths, &mut scratch);
+        let next = delta.saturating_mul(2);
         lap(&format!("scale {delta}"), &mut tt);
-        delta = delta.saturating_mul(2);
+        if !(remaining > 0.01 && next <= w.max(h)) {
+            break;
+        }
+        // In one pass: maxima over paths of length 2·delta (from the two adjacent delta-length paths,
+        // read from `paths`, written to `scratch`) and the next scale's pair weights from them.
+        {
+            use rayon::prelude::*;
+            let old = &paths;
+            scratch.data.par_chunks_mut(w).zip(links.data.par_chunks_mut(w)).enumerate().for_each(|(y, (prow, lrow))| {
+                for (x, (out, link)) in prow.iter_mut().zip(lrow.iter_mut()).enumerate() {
+                    let index = y * w + x;
+                    let Some(&p) = old.data.get(index) else { continue };
+                    *out = p;
+                    if x + delta < w
+                        && let Some(q) = old.data.get(index + delta)
+                    {
+                        out[0] = out[0].max(q[0]);
+                    }
+                    if y + delta < h
+                        && let Some(q) = old.data.get(index + delta * w)
+                    {
+                        out[1] = out[1].max(q[1]);
+                    }
+                    *link = [0.0; 2];
+                    let Some(&g) = guide.data.get(index) else { continue };
+                    for (axis, offset, valid) in [(0, next, x + next < w), (1, next * w, y + next < h)] {
+                        if valid && let Some(&other) = guide.data.get(index + offset) {
+                            link[axis] = (-distance(g, other, &noise).max(out[axis])).exp();
+                        }
+                    }
+                }
+            });
+        }
+        std::mem::swap(&mut paths, &mut scratch);
+        delta = next;
     }
     drop(scratch);
     drop(paths);
     drop(links);
-    if step == 1 {
-        for (p, q) in img.data.iter_mut().zip(&filtered.data) {
-            let result = rgb(luminance_2020(*p), *q);
-            *p = std::array::from_fn(|i| p[i] + strength * (result[i] - p[i]));
+    match &original {
+        None => {
+            let fw = img.width;
+            for_rows(&mut img.data, fw, |y, row| {
+                for (x, p) in row.iter_mut().enumerate() {
+                    let Some(&q) = filtered.data.get(y * w + x) else { continue };
+                    let result = rgb2(luminance_2020(*p), q);
+                    *p = std::array::from_fn(|i| p[i] + strength * (result[i] - p[i]));
+                }
+            });
         }
-    } else {
-        // Reconstruct only rows. Keep the fine residual with a shared, noise-subtracted
-        // Wiener share; a flat noisy patch receives no automatic protection from noisy Y.
-        let mean = gaussian(&original, 1.0);
-        let corr = gaussian(&original.map(|p| p.map(|v| v * v)), 1.0);
-        let share = corr.zip_map(&mean, |c, m| {
-            let snr = (1..3).map(|i| ((c[i] - m[i] * m[i]).max(0.0) / noise.var(i, m[0]) - 1.0).max(0.0)).sum::<f32>() * 0.5;
-            [snr / (snr + 8.0); 3]
-        });
-        let share = gaussian(&share, 0.8);
-        // Resize one output row at a time using the raster resampler's exact pixel centres.
-        use lightcraft_raster::resample::weights;
-        let ux = weights(w, img.width, Filter::Bilinear);
-        let uy = weights(h, img.height, Filter::Bilinear);
-        let ow = img.width;
-        for_rows(&mut img.data, ow, |y, row| {
-            let Some((y0, wy)) = uy.get(y) else { return };
-            for (x, p) in row.iter_mut().enumerate() {
-                let Some((x0, wx)) = ux.get(x) else { continue };
-                let (mut f, mut o, mut a) = ([0.0; 3], [0.0; 3], 0.0);
-                for (j, &dy) in wy.iter().enumerate() {
-                    for (i, &dx) in wx.iter().enumerate() {
-                        let index = (y0 + j) * w + x0 + i;
-                        if let (Some(q), Some(r), Some(s)) = (filtered.data.get(index), original.data.get(index), share.data.get(index)) {
-                            let weight = dx * dy;
-                            f = std::array::from_fn(|c| f[c] + weight * q[c]);
-                            o = std::array::from_fn(|c| o[c] + weight * r[c]);
-                            a += weight * s[0];
+        Some(original) => {
+            // Reconstruct only rows. Keep the fine residual with a shared, noise-subtracted
+            // Wiener share; a flat noisy patch receives no automatic protection from noisy Y.
+            let mean = gaussian(original, 1.0);
+            let corr = gaussian(&original.map(|p| p.map(|v| v * v)), 1.0);
+            let share = corr.zip_map(&mean, |c, m| {
+                let snr = (1..3).map(|i| ((c[i] - m[i] * m[i]).max(0.0) / noise.var(i, m[0]) - 1.0).max(0.0)).sum::<f32>() * 0.5;
+                [snr / (snr + 8.0); 3]
+            });
+            let share = gaussian(&share, 0.8);
+            // Resize one output row at a time using the raster resampler's exact pixel centres.
+            use lightcraft_raster::resample::weights;
+            let ux = weights(w, img.width, Filter::Bilinear);
+            let uy = weights(h, img.height, Filter::Bilinear);
+            let ow = img.width;
+            for_rows(&mut img.data, ow, |y, row| {
+                let Some((y0, wy)) = uy.get(y) else { return };
+                for (x, p) in row.iter_mut().enumerate() {
+                    let Some((x0, wx)) = ux.get(x) else { continue };
+                    let (mut f, mut o, mut a) = ([0.0; 2], [0.0; 3], 0.0);
+                    for (j, &dy) in wy.iter().enumerate() {
+                        for (i, &dx) in wx.iter().enumerate() {
+                            let index = (y0 + j) * w + x0 + i;
+                            if let (Some(q), Some(r), Some(s)) = (filtered.data.get(index), original.data.get(index), share.data.get(index)) {
+                                let weight = dx * dy;
+                                f = std::array::from_fn(|c| f[c] + weight * q[c]);
+                                o = std::array::from_fn(|c| o[c] + weight * r[c]);
+                                a += weight * s[0];
+                            }
                         }
                     }
+                    let c = yuv(*p);
+                    let q = [f[0] + a * (c[1] - o[1]), f[1] + a * (c[2] - o[2])];
+                    let result = rgb2(c[0], q);
+                    *p = std::array::from_fn(|i| p[i] + strength * (result[i] - p[i]));
                 }
-                let c = yuv(*p);
-                let q = std::array::from_fn(|i| f[i] + a * (c[i] - o[i]));
-                let result = rgb(c[0], q);
-                *p = std::array::from_fn(|i| p[i] + strength * (result[i] - p[i]));
-            }
-        });
+            });
+        }
     }
     if let Some(start) = start {
         eprintln!("    nr joint: {:.1} ms", start.elapsed().as_secs_f64() * 1e3);
@@ -394,6 +433,55 @@ mod tests {
             }
         }
         result
+    }
+
+    /// The optimised filter reproduces the reference implementation (8b89526d) bit for bit: same scales,
+    /// weights, paths and reconstruction, only fewer passes and smaller buffers.
+    #[test]
+    fn joint_matches_the_reference_bit_for_bit() {
+        let mut scene = Rgb32f::new(97, 83);
+        for (i, p) in scene.data.iter_mut().enumerate() {
+            let (x, y) = (i % 97, i / 97);
+            // edges, a thin line, a dark patch and a gradient
+            *p = if x < 30 {
+                [0.08, 0.016, 0.02]
+            } else if x < 32 {
+                [0.01, 0.05, 0.01]
+            } else if y < 40 {
+                [0.0015, 0.004, 0.009]
+            } else {
+                [0.02 + 0.001 * x as f32, 0.03, 0.01 + 0.0005 * y as f32]
+            };
+        }
+        for (w, h) in [(97usize, 83usize), (96, 82), (5, 3), (1, 7)] {
+            let mut clean = Rgb32f::new(w, h);
+            for y in 0..h {
+                for x in 0..w {
+                    clean.data[y * w + x] = scene.data[y * 97 + x];
+                }
+            }
+            for seed in [0x2545_f491_4f6c_dd1d, 0x9e37_79b9_7f4a_7c15] {
+                let input = noisy(&clean, seed, 0.004);
+                for step in [1, 2] {
+                    for (detail, strength, sigma) in [(0.5, 1.0, 12.0), (0.25, 0.6, 4.0), (0.9, 1.0, 27.0)] {
+                        let p = NrcParams { off: 0.003, passes: vec![NrcPass { sigma, step, k: 64.0, pct: 0.2 }] };
+                        let (mut a, mut b) = (input.clone(), input.clone());
+                        denoise_grid(&mut a, &p, step, detail, strength);
+                        crate::nrc_joint_reference::denoise_grid(&mut b, &p, step, detail, strength);
+                        for (i, (x, y)) in a.data.iter().zip(&b.data).enumerate() {
+                            for c in 0..3 {
+                                assert!(
+                                    x[c].to_bits() == y[c].to_bits(),
+                                    "{w}x{h} step {step} sigma {sigma}: pixel {i} channel {c}: {} vs {}",
+                                    x[c],
+                                    y[c]
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
