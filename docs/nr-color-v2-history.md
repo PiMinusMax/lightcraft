@@ -68,8 +68,8 @@ background load from other jobs made single timings useless (compare in one proc
 ### Known limits
 
 - **No outlier brake yet.** Isolated, strongly coloured single pixels in dark areas (a red, a blue speck) are
-  treated as real detail by the edge-aware weights and stay: at Color 100 such a speck keeps ΔC ≈ 14 against its
-  surroundings (≈ 17 unfiltered), while V1's blind blur brings it down to ≈ 5. Planned: before the diffusion,
+  treated as real detail by the edge-aware weights and stay visible at Color 100, while V1's blind blur largely
+  removes them (seen on screenshots at different zoom levels; to be measured on full-size renders). Planned: before the diffusion,
   replace a pixel's chroma by its neighbours' median only if it stands out in colour from all neighbours but not
   in luminance (real small colour detail almost always has a luminance step or continues along an edge). Not
   implemented or measured yet.
