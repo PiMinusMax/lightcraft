@@ -67,13 +67,6 @@ retained alongside the guard.
 
 ## Remaining work
 
-Native CPU execution and memory consumption are substantial: several full-resolution
-working planes and many spatial passes. This is why the method remains opt-in. Optimized
-GPU kernels, broader camera/ISO validation, noise covariance calibration, and a consistent
-whole-frame calibration for all preview/deep-render cases remain work to do. A small set
-of synthetic edge tests cannot guarantee the absence of colour bleeding in arbitrary
-photographs. High-ISO noise removal must be assessed together with real colour detail.
-
-The local comparison renders, JSON measurements and review notes are in
-`../testmedien/issue820/nrc-joint/` relative to this worktree. Nothing has been pushed or
-packaged as a release.
+See [`nr-color-v2-history.md`](nr-color-v2-history.md) for everything tried, measured and dropped, the speed
+numbers and the known limits (no outlier brake for isolated colour specks yet; flat dark areas smoothed a bit
+less than the root-based V2; little slider effect above 25; prototype switches instead of a process version).
