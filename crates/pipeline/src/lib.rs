@@ -33,6 +33,7 @@ pub mod local;
 pub mod local_tone;
 pub mod lut;
 pub mod masks;
+mod nrc_joint;
 pub mod optics;
 pub mod output;
 pub mod profiles;
@@ -405,7 +406,20 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
                 fixed_air = Some(local::frame_airlight(src, info, s, &frame, pw, ph));
             }
             // (spots grow the rendered window; only 8-bit renders are cut back to the request)
-            let work = if req.depth == OutputDepth::U8 { spots::window_for_reads(s, &frame, full_w, full_h, px_per_long, win) } else { win };
+            let mut work = if req.depth == OutputDepth::U8 { spots::window_for_reads(s, &frame, full_w, full_h, px_per_long, win) } else { win };
+            if req.depth == OutputDepth::U8
+                && local::nrc_joint_enabled()
+                && let Some(params) = local::nrc_params(s, src.width.max(src.height), frame.output_long(full_w, full_h))
+            {
+                // The joint diffusion reads a chain of neighbours across its scales. Keep
+                // those reads outside the requested zoom window, just as spot reads are.
+                let halo = params.passes.last().map_or(0, |p| (6.0 * p.sigma).ceil() as usize).saturating_add(4);
+                let x = work.x.saturating_sub(halo);
+                let y = work.y.saturating_sub(halo);
+                let right = work.x.saturating_add(work.w).saturating_add(halo).min(full_w);
+                let bottom = work.y.saturating_add(work.h).saturating_add(halo).min(full_h);
+                work = PixelWindow { x, y, w: right.saturating_sub(x), h: bottom.saturating_sub(y) }.clamped(full_w, full_h);
+            }
             if work != win {
                 keep = Some(PixelWindow { x: win.x - work.x, y: win.y - work.y, ..win });
             }

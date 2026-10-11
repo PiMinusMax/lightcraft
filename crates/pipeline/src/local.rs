@@ -366,6 +366,11 @@ pub fn nrc_linear() -> bool {
     knob("NRV2_LINEAR", 1.0) > 0.5
 }
 
+/// Experimental joint guide; kept opt-in while native-resolution CPU cost is evaluated.
+pub(crate) fn nrc_joint_enabled() -> bool {
+    nr_v2_enabled() && nrc_linear() && knob("NRV2_JOINT", 0.0) > 0.5
+}
+
 /// Chroma of a pixel: linear differences `c − Y` (see [`nrc_linear`]), else differences of square roots
 /// (`√(c + off) − √(Y + off)`).
 #[inline]
@@ -432,7 +437,24 @@ fn nrc_coeffs(lo: &Rgb32f, ylo: &Rgb32f, pass: &NrcPass) -> (Rgb32f, Rgb32f, Rgb
             }
             a.map(|s| s.map(|s| s / (s + pass.k)))
         } else {
-            var.zip_map(&ym, |v, y| [0, 1, 2].map(|i| v[i] / (v[i] + pass.k * model.var(i, y[0]))))
+            // per channel; with `NRV2_LUMGUIDE > 0` luminance structure (in units of its own noise) raises every
+            // channel's share, so colour on textured or edged luminance (leaves, fur) is kept
+            let lg = knob("NRV2_LUMGUIDE", 0.0);
+            if lg > 0.0 {
+                let m2 = gaussian(&ylo.map(|c| [c[0] * c[0], 0.0, 0.0]), sg);
+                let vy = m2.zip_map(&ym, |m2, m| {
+                    let v = (m2[0] - m[0] * m[0]).max(0.0);
+                    [v, v, v]
+                });
+                let ly = nrc_noise_model(&vy, &ym, pass.pct);
+                let s = var.zip_map(&ym, |v, y| [0, 1, 2].map(|i| v[i] / model.var(i, y[0])));
+                // only luminance variance well above its noise counts as structure (flat noisy areas stay smoothed)
+                let off = knob("NRV2_LUMG_OFF", 3.0);
+                let g = vy.zip_map(&ym, |v, y| [lg * (v[0] / ly.var(0, y[0]) - off).max(0.0); 3]);
+                s.zip_map(&g, |s, g| [0, 1, 2].map(|i| (s[i] + g[i]) / (s[i] + g[i] + pass.k)))
+            } else {
+                var.zip_map(&ym, |v, y| [0, 1, 2].map(|i| v[i] / (v[i] + pass.k * model.var(i, y[0]))))
+            }
         }
     } else {
         let stride = nrc_sample_stride(var.data.len());
@@ -574,6 +596,10 @@ fn nrc_row(src: &[[f32; 3]], y: usize, ups: &[NrcUp], off: f32, s: &mut NrcScrat
 pub fn color_nr_v2(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long: usize) {
     use lightcraft_raster::resample::{Filter, weights};
     let Some(p) = nrc_params(s, src_long, out_long) else { return };
+    if nrc_joint_enabled() {
+        crate::nrc_joint::denoise(img, &p, (s.detail.nr_color_detail / 100.0) as f32, (s.detail.nr_color / 100.0) as f32);
+        return;
+    }
     let _t = crate::profiling().then(std::time::Instant::now);
     let (w, h) = (img.width, img.height);
     let mut ups: Vec<NrcUp> = Vec::with_capacity(p.passes.len());
@@ -818,7 +844,7 @@ pub fn airlight_of(mut v: Vec<f32>) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    /// PROBE (prints, never fails): how far colour NR v2 moves the float mean of a flat, noisy, dark patch.
+    /// Float mean of a flat, noisy dark patch over three noise realisations; linear modes assert drift bounds.
     #[test]
     #[ignore]
     fn probe_nrc_mean_drift() {
@@ -875,7 +901,8 @@ mod tests {
         }
         if nrc_linear() {
             println!("worst mean deviation {:.4} %", 100.0 * worst);
-            assert!(worst < 0.01, "linear mode moved a channel's mean by {:.3} %", 100.0 * worst);
+            let limit = if nrc_joint_enabled() { 0.0005 } else { 0.01 };
+            assert!(worst < limit, "linear mode moved a channel's mean by {:.3} %", 100.0 * worst);
         }
     }
 
@@ -897,6 +924,8 @@ mod tests {
         };
         let grey = [0.03f32; 3];
         let blue_dark = [0.001f32, 0.0015, 0.02];
+        // a bright saturated green next to black (a lit leaf against a dark background)
+        let leaf = [0.02f32, 0.12, 0.01];
         let clean = |x: usize, y: usize| -> [f32; 3] {
             if y < 256 {
                 if x < 384 { red } else { green }
@@ -904,8 +933,12 @@ mod tests {
                 if (190..192).contains(&x) { red } else { grey }
             } else if x < 576 {
                 blue_dark
-            } else {
+            } else if y < 384 {
                 grey
+            } else if x < 672 {
+                leaf
+            } else {
+                [0.0005f32; 3]
             }
         };
         let mut seed = 0x2545_f491_4f6c_dd1du64;
@@ -978,18 +1011,29 @@ mod tests {
             // grey: residual chroma noise
             let mut sd = 0.0;
             let mut k = 0.0;
-            for y in 300..480 {
+            for y in 270..370 {
                 for x in 600..760 {
                     sd += dist(chroma(px(x, y)), [0.0; 3]).powi(2);
                     k += 1.0;
                 }
             }
             let mut sd0 = 0.0;
-            for y in 300..480 {
+            for y in 270..370 {
                 for x in 600..760 {
                     sd0 += dist(chroma(img.data[y * w + x]), [0.0; 3]).powi(2);
                 }
             }
+            // leaf next to black: chroma kept in the leaf's 12 px next to the black (mean over rows)
+            let (mut lk, mut ln) = (0.0f32, 0.0f32);
+            for y in 400..500 {
+                for x in 660..672 {
+                    let c = chroma(px(x, y));
+                    let r = chroma(leaf);
+                    lk += (c[0] * r[0] + c[1] * r[1] + c[2] * r[2]) / (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+                    ln += 1.0;
+                }
+            }
+            println!("NR {nr}: leaf next to black keeps {:.0} % of its chroma (12 px next to the black)", 100.0 * lk / ln);
             println!(
                 "NR {nr}: edge error {:.1} % of the step | red line kept {:.0} % | dark blue chroma kept {:.0} % | grey chroma noise {:.5} → {:.5}",
                 100.0 * e / n / step,
