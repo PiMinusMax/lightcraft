@@ -254,15 +254,16 @@ pub fn nrc_params(s: &DevelopSettings, src_long: usize, out_long: usize) -> Opti
     let smooth = 1.0 + (s.detail.nr_color_smoothness / 100.0) as f32;
     let scale = (out_long as f32 / src_long.max(1) as f32).clamp(0.05, 1.0);
     let sigma = (knob("NRV2_S0", 2.0) + knob("NRV2_S1", 10.0) * amount) * smooth * scale;
-    let k = knob("NRV2_K", 16.0) * amount * (1.5 - detail);
+    let k = knob("NRV2_K", if nrc_linear() { 64.0 } else { 16.0 }) * amount * (1.5 - detail);
     let pct = knob("NRV2_PCT", 0.2);
     let coarse = knob("NRV2_COARSE", 3.0);
     // the coefficients vary over about sigma: a grid of sigma / 2 holds them
     let div = knob("NRV2_STEPDIV", 2.0).max(1.0);
-    let pass = |sigma: f32| NrcPass { sigma, step: (sigma / div).floor().clamp(1.0, 16.0) as usize, k, pct };
-    let mut passes = vec![pass(sigma)];
+    let pass = |sigma: f32, k: f32| NrcPass { sigma, step: (sigma / div).floor().clamp(1.0, 16.0) as usize, k, pct };
+    let mut passes = vec![pass(sigma, k)];
     if coarse > 1.0 {
-        passes.push(pass(sigma * coarse));
+        // the coarse pass sees thin colour detail only diluted over its wide window: its own, gentler threshold
+        passes.push(pass(sigma * coarse, k * knob("NRV2_COARSE_K", 1.0)));
     }
     Some(NrcParams { off: knob("NRV2_OFF", 0.003), passes })
 }
@@ -362,7 +363,7 @@ pub fn nrc_eps(samples: &[[f32; 3]], k: f32, pct: f32) -> [f32; 3] {
 /// kept exactly) with a threshold from a noise model `σ²(Y) = α·Y + β`, instead of square-root differences
 /// with one threshold for the whole image.
 pub fn nrc_linear() -> bool {
-    knob("NRV2_LINEAR", 0.0) > 0.5
+    knob("NRV2_LINEAR", 1.0) > 0.5
 }
 
 /// Chroma of a pixel: linear differences `c − Y` (see [`nrc_linear`]), else differences of square roots
@@ -405,7 +406,34 @@ fn nrc_coeffs(lo: &Rgb32f, ylo: &Rgb32f, pass: &NrcPass) -> (Rgb32f, Rgb32f, Rgb
     let a = if nrc_linear() {
         let ym = gaussian(ylo, sg);
         let model = nrc_noise_model(&var, &ym, pass.pct);
-        var.zip_map(&ym, |v, y| [0, 1, 2].map(|i| v[i] / (v[i] + pass.k * model.var(i, y[0]))))
+        if knob("NRV2_SHARED", 0.0) > 0.5 {
+            // one coefficient for all channels: each channel's variance in units of its noise, averaged, so
+            // every channel gets the same transition width at an edge (no hue change across it). With
+            // `NRV2_LUMGUIDE > 0`, luminance structure (in units of its own noise) counts too.
+            let lg = knob("NRV2_LUMGUIDE", 0.0);
+            let lum = (lg > 0.0).then(|| {
+                let m2 = gaussian(&ylo.map(|c| [c[0] * c[0], 0.0, 0.0]), sg);
+                let vy = m2.zip_map(&ym, |m2, m| {
+                    let v = (m2[0] - m[0] * m[0]).max(0.0);
+                    [v, v, v]
+                });
+                let ly = nrc_noise_model(&vy, &ym, pass.pct);
+                (vy, ly)
+            });
+            let mut a = var.zip_map(&ym, |v, y| {
+                let s = (0..3).map(|i| v[i] / model.var(i, y[0])).sum::<f32>() / 3.0;
+                [s; 3]
+            });
+            if let Some((vy, ly)) = &lum {
+                for ((s, v), y) in a.data.iter_mut().zip(&vy.data).zip(&ym.data) {
+                    let add = lg * v[0] / ly.var(0, y[0]);
+                    *s = s.map(|x| x + add);
+                }
+            }
+            a.map(|s| s.map(|s| s / (s + pass.k)))
+        } else {
+            var.zip_map(&ym, |v, y| [0, 1, 2].map(|i| v[i] / (v[i] + pass.k * model.var(i, y[0]))))
+        }
     } else {
         let stride = nrc_sample_stride(var.data.len());
         let samples: Vec<[f32; 3]> = var.data.iter().step_by(stride).copied().collect();
@@ -431,6 +459,9 @@ struct NrcUp {
     a: Rgb32f,
     b: Rgb32f,
     r: Rgb32f,
+    /// For a pass that smooths only the coarse part (`NRV2_COARSE_DETAIL`): its subsampled input. The pass then
+    /// replaces `lo` by `a · lo + b` and keeps `d − lo` (finer detail, such as thin coloured lines) as it is.
+    lo: Option<Rgb32f>,
     ux: Vec<(usize, Vec<f32>)>,
     uy: Vec<(usize, Vec<f32>)>,
 }
@@ -470,6 +501,28 @@ impl NrcUp {
                 }
             }
         }
+        // the subsampled input upsampled to this row (only for a coarse-only pass)
+        let vl: Vec<[f32; 3]> = match &self.lo {
+            None => Vec::new(),
+            Some(lo) => {
+                let mut row = vec![[0.0f32; 3]; lw];
+                if let Some((y0, wy)) = self.uy.get(y) {
+                    for (j, &f) in wy.iter().enumerate() {
+                        if let Some(r) = lo.data.get((y0 + j) * lw..(y0 + j + 1) * lw) {
+                            for x in 0..lw {
+                                row[x] = madd3(row[x], r[x], f);
+                            }
+                        }
+                    }
+                }
+                (0..d.len())
+                    .map(|x| {
+                        let Some((x0, wx)) = self.ux.get(x) else { return [0.0; 3] };
+                        wx.iter().enumerate().fold([0.0; 3], |acc, (k, &f)| row.get(x0 + k).map_or(acc, |v| madd3(acc, *v, f)))
+                    })
+                    .collect()
+            }
+        };
         for (x, (p, rem)) in d.iter_mut().zip(removed.iter_mut()).enumerate() {
             let Some((x0, wx)) = self.ux.get(x) else { continue };
             let (mut ca, mut cb, mut cr) = ([0.0; 3], [0.0; 3], [0.0; 3]);
@@ -480,7 +533,13 @@ impl NrcUp {
                     cr = madd3(cr, *r, f);
                 }
             }
-            *p = [0, 1, 2].map(|i| ca[i] * p[i] + cb[i]);
+            match &self.lo {
+                None => *p = [0, 1, 2].map(|i| ca[i] * p[i] + cb[i]),
+                Some(_) => {
+                    let cl = vl.get(x).copied().unwrap_or([0.0; 3]);
+                    *p = [0, 1, 2].map(|i| p[i] + (ca[i] - 1.0) * cl[i] + cb[i]);
+                }
+            }
             *rem = [0, 1, 2].map(|i| rem[i] + cr[i].max(0.0));
         }
     }
@@ -568,7 +627,9 @@ pub fn color_nr_v2(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_l
             }
         });
         let (a, b, r) = nrc_coeffs(&lo, &ylo, pass);
-        ups.push(NrcUp { a, b, r, ux: weights(lw, w, Filter::Bilinear), uy: weights(lh, h, Filter::Bilinear) });
+        let coarse_only = !ups.is_empty() && nrc_linear() && knob("NRV2_COARSE_DETAIL", 1.0) > 0.5;
+        let lo = coarse_only.then_some(lo);
+        ups.push(NrcUp { a, b, r, lo, ux: weights(lw, w, Filter::Bilinear), uy: weights(lh, h, Filter::Bilinear) });
     }
     let off = p.off;
     for_rows(&mut img.data, w, |y, row| {
@@ -815,6 +876,128 @@ mod tests {
         if nrc_linear() {
             println!("worst mean deviation {:.4} %", 100.0 * worst);
             assert!(worst < 0.01, "linear mode moved a channel's mean by {:.3} %", 100.0 * worst);
+        }
+    }
+
+    /// PROBE (prints, never fails): what colour NR v2 keeps of real colour. A clean synthetic scene (an
+    /// equal-luminance red/green edge, a 2 px red line on grey, a saturated blue patch near black, a flat grey
+    /// patch) plus noise; each measure compares the output with the clean scene.
+    #[test]
+    #[ignore]
+    fn probe_nrc_real_colour() {
+        use lightcraft_develop::DevelopSettings;
+        let (w, h) = (768usize, 512usize);
+        let y_of = |c: [f32; 3]| luminance_2020(c);
+        // two colours of the same luminance 0.03
+        let red = [0.08f32, 0.0155, 0.02];
+        let green = {
+            let g = [0.012f32, 0.04, 0.015];
+            let k = y_of(red) / y_of(g);
+            g.map(|v| v * k)
+        };
+        let grey = [0.03f32; 3];
+        let blue_dark = [0.001f32, 0.0015, 0.02];
+        let clean = |x: usize, y: usize| -> [f32; 3] {
+            if y < 256 {
+                if x < 384 { red } else { green }
+            } else if x < 384 {
+                if (190..192).contains(&x) { red } else { grey }
+            } else if x < 576 {
+                blue_dark
+            } else {
+                grey
+            }
+        };
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut gauss = || {
+            (0..4)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed >> 11) as f32 / (1u64 << 53) as f32 - 0.5
+                })
+                .sum::<f32>()
+                * 1.732
+        };
+        let mut img = Rgb32f::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let c = clean(x, y);
+                // shot + read noise per channel
+                img.data[y * w + x] = c.map(|v| v + (0.00002 + 0.004 * v.max(0.0)).sqrt() * 0.6 * gauss());
+            }
+        }
+        let chroma = |c: [f32; 3]| {
+            let y = y_of(c);
+            c.map(|v| v - y)
+        };
+        let dist = |a: [f32; 3], b: [f32; 3]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+        for nr in [25.0, 100.0] {
+            let mut s = DevelopSettings::default();
+            s.detail.nr_color = nr;
+            let mut o = img.clone();
+            color_nr_v2(&mut o, &s, w, w);
+            let px = |x: usize, y: usize| o.data[y * w + x];
+            // edge: chroma error 1..8 px either side, relative to the step between the two colours
+            let step = dist(chroma(red), chroma(green));
+            let mut e = 0.0;
+            let mut n = 0.0;
+            for y in 40..216 {
+                for d in 1..=8 {
+                    for x in [384 - d, 383 + d] {
+                        e += dist(chroma(px(x, y)), chroma(clean(x, y)));
+                        n += 1.0;
+                    }
+                }
+            }
+            // line: share of the line's chroma kept (mean over its rows)
+            let (mut kept, mut m) = (0.0, 0.0);
+            for y in 300..480 {
+                for x in 190..192 {
+                    let c = chroma(px(x, y));
+                    let r = chroma(red);
+                    let rg = chroma(grey);
+                    let full = [0, 1, 2].map(|i| r[i] - rg[i]);
+                    let got = [0, 1, 2].map(|i| c[i] - rg[i]);
+                    kept += (got[0] * full[0] + got[1] * full[1] + got[2] * full[2]) / (full[0] * full[0] + full[1] * full[1] + full[2] * full[2]);
+                    m += 1.0;
+                }
+            }
+            // saturated blue near black: chroma of the patch's mean kept
+            let mut acc = [0.0f32; 3];
+            let mut cnt = 0.0;
+            for y in 300..480 {
+                for x in 420..540 {
+                    acc = [0, 1, 2].map(|i| acc[i] + px(x, y)[i]);
+                    cnt += 1.0;
+                }
+            }
+            let mean = acc.map(|v| v / cnt);
+            let sat_kept = dist(chroma(mean), [0.0; 3]) / dist(chroma(blue_dark), [0.0; 3]);
+            // grey: residual chroma noise
+            let mut sd = 0.0;
+            let mut k = 0.0;
+            for y in 300..480 {
+                for x in 600..760 {
+                    sd += dist(chroma(px(x, y)), [0.0; 3]).powi(2);
+                    k += 1.0;
+                }
+            }
+            let mut sd0 = 0.0;
+            for y in 300..480 {
+                for x in 600..760 {
+                    sd0 += dist(chroma(img.data[y * w + x]), [0.0; 3]).powi(2);
+                }
+            }
+            println!(
+                "NR {nr}: edge error {:.1} % of the step | red line kept {:.0} % | dark blue chroma kept {:.0} % | grey chroma noise {:.5} → {:.5}",
+                100.0 * e / n / step,
+                100.0 * kept / m,
+                100.0 * sat_kept,
+                (sd0 / k).sqrt(),
+                (sd / k).sqrt()
+            );
         }
     }
 

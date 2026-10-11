@@ -783,6 +783,12 @@ fn denoise(cx: &mut Cx<'_>, img: Buf, plan: &Plan<'_>) -> Buf {
         map(cx, "nr_lum", n, &[nr.k.to_bits()], [Some(&img), Some(&l), Some(&f)], &out);
         img = out;
     }
+    if col.is_some() && local::nr_v2_enabled() && local::nrc_linear() {
+        // PROTOTYPE: the linear mode has no GPU kernels yet, it runs on the CPU
+        let mut host = cx.read_rgb(&img, w, h);
+        local::color_nr_v2(&mut host, &plan.settings, plan.src_long, plan.frame.output_long(w, h));
+        return cx.gpu.upload(rgb_words(&host));
+    }
     if col.is_some() && local::nr_v2_enabled() {
         if let Some(p) = local::nrc_params(&plan.settings, plan.src_long, plan.frame.output_long(w, h)) {
             return color_nr_v2(cx, &img, w, h, &p);
@@ -864,7 +870,7 @@ fn nrc_coeffs(cx: &mut Cx<'_>, lo: &Buf, lw: usize, lh: usize, pass: &local::Nrc
     let smp = cx.gpu.buffer(count * 3);
     map(cx, "nrc_var_sample", count, &[stride as u32], [Some(&m), Some(&c2), None], &smp);
     let v: Vec<f32> = cx.read(&smp, count * 3);
-    let samples: Vec<[f32; 3]> = v.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+    let samples: Vec<[f32; 3]> = v.as_chunks::<3>().0.to_vec();
     let eps = local::nrc_eps(&samples, pass.k, pass.pct);
     let ca = cx.gpu.buffer(ln * 3);
     map(cx, "nrc_a", ln, &eps.map(f32::to_bits), [Some(&m), Some(&c2), None], &ca);

@@ -56,6 +56,10 @@ impl DevelopSettings {
         // PROTOTYPE: renders with the new colour noise reduction are cached apart from older ones
         if self.detail.nr_color > 0.0 && std::env::var("LIGHTCRAFT_NR_V2").map_or(true, |v| v != "0") {
             h ^= 0x6e72_5f76_325f_6332;
+            // PROTOTYPE: and the linear mode apart from the square-root one
+            if std::env::var("NRV2_LINEAR").map_or(true, |v| v != "0") {
+                h ^= 0x6e72_7633_5f6c_696e;
+            }
         }
         h
     }
