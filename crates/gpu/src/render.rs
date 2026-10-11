@@ -844,6 +844,7 @@ fn color_nr_joint(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, p: &local::Nrc
         return Some(cx.copy(img));
     }
     let n = w * h;
+    let started = profiling().then(std::time::Instant::now);
     // noise samples of the whole image: same pixels as the CPU, fitted by the same code
     let stride = nrc_joint::noise_sample_stride(n);
     let count = n.div_ceil(stride);
@@ -851,6 +852,9 @@ fn color_nr_joint(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, p: &local::Nrc
     nrcj(cx, "nrcj_samples", count, &[count as u32, w as u32, h as u32, stride as u32], img, None, &smp);
     let raw: Vec<f32> = cx.read(&smp, 11 * count);
     drop(smp);
+    if let Some(t) = started {
+        eprintln!("  gpu joint samples + read: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+    }
     let samples: Vec<nrc_joint::NoiseSample> = raw
         .as_chunks::<11>()
         .0
@@ -860,6 +864,9 @@ fn color_nr_joint(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, p: &local::Nrc
         .collect();
     let mut noise = nrc_joint::noise_from_samples(samples);
     noise.tolerance = nrc_joint::tolerance(detail);
+    if let Some(t) = started {
+        eprintln!("  gpu joint noise model: {:.1} ms ({count} samples)", t.elapsed().as_secs_f64() * 1e3);
+    }
     let sigma = p.passes.last().map_or(0.0, |q| q.sigma);
     let plan = nrc_joint::scale_plan(sigma, w, h);
     // Rows a kept pixel depends on: a wrong value at a band edge (treated as an image border) moves
@@ -868,8 +875,8 @@ fn color_nr_joint(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, p: &local::Nrc
     // guide's blur and pilot reach a few rows, the speck brake two more. Hence 2·Σdelta + max delta + 10.
     let halo = plan.iter().map(|d| 2 * d.0).sum::<usize>() + plan.last().map_or(0, |d| d.0) + 10;
     // Memory: the whole output (3 values per pixel) is held besides the input; a band then holds about
-    // 15 values per pixel (guide 3, two chroma buffers 2 + 2, two path/weight buffers 4 + 4; 12 while
-    // the guide is built). The budget for both together is the device memory free right now (where the
+    // 12 values per pixel (guide 3, two chroma buffers 2 + 2, paths 2, weights 2; up to 12 while the
+    // speck brake and the guide run). The budget for both together is the device memory free right now (where the
     // driver can be asked, `crate::vram`) plus our own pooled buffers, which we reuse, less a reserve for
     // the rest of the render and other programs; else a fixed 2 GB. PROTOTYPE: `NRV2_GPU_BAND_MB` overrides it.
     let fixed = std::env::var("NRV2_GPU_BAND_MB").ok().and_then(|v| v.parse::<usize>().ok()).map(|mb| mb << 20);
@@ -892,9 +899,9 @@ fn color_nr_joint(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, p: &local::Nrc
         );
     }
     let out_bytes = 12 * n;
-    let per_row = 60 * w;
-    // no band may exceed the device's largest buffer either (the path/weight buffers are the largest)
-    let limit_rows = (cx.gpu.limit() as usize / (16 * w)).max(1);
+    let per_row = 48 * w;
+    // no band may exceed the device's largest buffer either (3 values per pixel are the largest)
+    let limit_rows = (cx.gpu.limit() as usize / (12 * w)).max(1);
     let rows = (budget.saturating_sub(out_bytes) / per_row).min(limit_rows);
     let core = if rows >= h {
         h
@@ -954,27 +961,32 @@ fn joint_band(
     drop(yuv);
     // dropped buffers only become reusable (and their memory free) once the GPU is done with them
     cx.sync();
-    let mut quads = cx.gpu.buffer(4 * n);
-    nrcj(cx, "nrcj_links1", n, &np, &guide, None, &quads);
-    // the next scale's paths and weights go to the other of two buffers (no new one per scale)
-    let mut spare = cx.gpu.buffer(4 * n);
+    // paths (exp(−path), as on the CPU) and pair weights; the next scale's paths go to the scratch buffer,
+    // free after the diffusion steps, as on the CPU
+    let mut paths = cx.gpu.buffer(2 * n);
+    nrcj(cx, "nrcj_links1", n, &np, &guide, None, &paths);
+    let links = cx.gpu.buffer(2 * n);
+    let mut lp = np.clone();
+    lp.push(1);
+    nrcj(cx, "nrcj_links", n, &lp, &guide, Some(&paths), &links);
     let mut scratch = cx.gpu.buffer(2 * n);
     for (k, &(delta, rate)) in plan.iter().enumerate() {
         let dp = [n as u32, w as u32, bh as u32, delta as u32, rate.to_bits()];
         for _ in 0..2 {
-            nrcj(cx, "nrcj_dh", n, &dp, &filtered, Some(&quads), &scratch);
+            nrcj(cx, "nrcj_dh", n, &dp, &filtered, Some(&links), &scratch);
             std::mem::swap(&mut filtered, &mut scratch);
-            nrcj(cx, "nrcj_dv", n, &dp, &filtered, Some(&quads), &scratch);
+            nrcj(cx, "nrcj_dv", n, &dp, &filtered, Some(&links), &scratch);
             std::mem::swap(&mut filtered, &mut scratch);
         }
         if let Some(&(next, _)) = plan.get(k + 1) {
-            let mut qp = np.clone();
-            qp.extend([delta as u32, next as u32]);
-            nrcj(cx, "nrcj_next", n, &qp, &guide, Some(&quads), &spare);
-            std::mem::swap(&mut quads, &mut spare);
+            nrcj(cx, "nrcj_paths", n, &[n as u32, w as u32, bh as u32, delta as u32], &paths, None, &scratch);
+            std::mem::swap(&mut paths, &mut scratch);
+            let mut lp = np.clone();
+            lp.push(next as u32);
+            nrcj(cx, "nrcj_links", n, &lp, &guide, Some(&paths), &links);
         }
     }
-    drop((scratch, quads, spare, guide));
+    drop((scratch, paths, links, guide));
     cx.sync();
     filtered
 }

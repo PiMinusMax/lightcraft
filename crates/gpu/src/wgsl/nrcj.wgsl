@@ -2,7 +2,7 @@
 // twin there, in the same order of operations; keep them in step.
 //
 // Buffers: `a`, `b` inputs, `dst` output. Images are interleaved: RGB / Y,R−Y,B−Y (3 per pixel),
-// chroma pairs R−Y,B−Y (2 per pixel), or path/weight quads (path h, path v, weight h, weight v).
+// chroma pairs R−Y,B−Y (2 per pixel), path pairs (h, v; exp(−path), see `nrc_joint`) or weight pairs (h, v).
 // Kernels with the noise model: P[0] = n, P[1] = w, P[2] = h, P[3..6] = alpha, P[6..9] = beta,
 // P[9..12] = ymax, P[12] = tolerance.
 
@@ -119,23 +119,87 @@ fn nrcj_samples(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgr
     dst[o + 1u] = max(brightness, 0.0);
 }
 
-// `nrc_joint::median8`: the same 19-comparator network.
-fn med8(v: array<f32, 8>) -> f32 {
-    var s = v;
-    let net = array<vec2<u32>, 19>(
-        vec2<u32>(0u, 2u), vec2<u32>(1u, 3u), vec2<u32>(4u, 6u), vec2<u32>(5u, 7u), vec2<u32>(0u, 4u),
-        vec2<u32>(1u, 5u), vec2<u32>(2u, 6u), vec2<u32>(3u, 7u), vec2<u32>(0u, 1u), vec2<u32>(2u, 3u),
-        vec2<u32>(4u, 5u), vec2<u32>(6u, 7u), vec2<u32>(2u, 4u), vec2<u32>(3u, 5u), vec2<u32>(1u, 4u),
-        vec2<u32>(3u, 6u), vec2<u32>(1u, 2u), vec2<u32>(3u, 4u), vec2<u32>(5u, 6u));
-    for (var k = 0u; k < 19u; k++) {
-        let i = net[k].x;
-        let j = net[k].y;
-        let lo = min(s[i], s[j]);
-        let hi = max(s[i], s[j]);
-        s[i] = lo;
-        s[j] = hi;
-    }
-    return 0.5 * (s[3] + s[4]);
+// `nrc_joint::median8`: the same 19-comparator network, on plain variables (a private array indexed in a
+// loop ends up in slow local memory on some GPUs).
+fn med8(v0: f32, v1: f32, v2: f32, v3: f32, v4: f32, v5: f32, v6: f32, v7: f32) -> f32 {
+    var a = v0;
+    var b = v1;
+    var c = v2;
+    var d = v3;
+    var e = v4;
+    var f = v5;
+    var g = v6;
+    var h = v7;
+    let t0 = min(a, c);
+    c = max(a, c);
+    a = t0;
+    let t1 = min(b, d);
+    d = max(b, d);
+    b = t1;
+    let t2 = min(e, g);
+    g = max(e, g);
+    e = t2;
+    let t3 = min(f, h);
+    h = max(f, h);
+    f = t3;
+    let t4 = min(a, e);
+    e = max(a, e);
+    a = t4;
+    let t5 = min(b, f);
+    f = max(b, f);
+    b = t5;
+    let t6 = min(c, g);
+    g = max(c, g);
+    c = t6;
+    let t7 = min(d, h);
+    h = max(d, h);
+    d = t7;
+    let t8 = min(a, b);
+    b = max(a, b);
+    a = t8;
+    let t9 = min(c, d);
+    d = max(c, d);
+    c = t9;
+    let t10 = min(e, f);
+    f = max(e, f);
+    e = t10;
+    let t11 = min(g, h);
+    h = max(g, h);
+    g = t11;
+    let t12 = min(c, e);
+    e = max(c, e);
+    c = t12;
+    let t13 = min(d, f);
+    f = max(d, f);
+    d = t13;
+    let t14 = min(b, e);
+    e = max(b, e);
+    b = t14;
+    let t15 = min(d, g);
+    g = max(d, g);
+    d = t15;
+    let t16 = min(b, c);
+    c = max(b, c);
+    b = t16;
+    let t17 = min(d, e);
+    e = max(d, e);
+    d = t17;
+    let t18 = min(f, g);
+    g = max(f, g);
+    f = t18;
+    return 0.5 * (d + e);
+}
+
+// The farther of a value's distances to the least and largest of 8 (`speck_share`'s pre-test).
+fn reach8(p: f32, v0: f32, v1: f32, v2: f32, v3: f32, v4: f32, v5: f32, v6: f32, v7: f32) -> f32 {
+    let lo = min(min(min(v0, v1), min(v2, v3)), min(min(v4, v5), min(v6, v7)));
+    let hi = max(max(max(v0, v1), max(v2, v3)), max(max(v4, v5), max(v6, v7)));
+    return max(abs(p - lo), abs(p - hi));
+}
+
+// One border pixel's share of the colour shift (`speck_share`).
+fn sshare(q: vec3<f32>, m: vec3<f32>, du: f32, dv: f32, vu: f32, vv: f32, excess: f32) -> f32 {
+    return ((q.y - m.y) * du / vu + (q.z - m.z) * dv / vv) / excess;
 }
 
 // `nrc_joint::despeck` + `speck_share`: `a` = transformed image, writes it with the chroma of compact
@@ -157,43 +221,54 @@ fn nrcj_speck(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgrou
         let share = pf(14u);
         let up = i - 2u * w;
         let dn = i + 2u * w;
-        // ring: corners and edge centres of the 5 × 5 square (`RING` order on the CPU)
-        let ring = array<vec3<f32>, 8>(ja(up - 2u), ja(up), ja(up + 2u), ja(i - 2u), ja(i + 2u), ja(dn - 2u), ja(dn), ja(dn + 2u));
-        var ry: array<f32, 8>;
-        var ru: array<f32, 8>;
-        var rv: array<f32, 8>;
-        var ysum = 0.0;
-        for (var k = 0u; k < 8u; k++) {
-            ry[k] = ring[k].x;
-            ru[k] = ring[k].y;
-            rv[k] = ring[k].z;
-            ysum += ring[k].x;
-        }
-        let ym = ysum / 8.0;
-        var m = vec3<f32>(0.0, med8(ru), med8(rv));
+        // ring: corners and edge centres of the 5 × 5 square (in the CPU's order)
+        let r0 = ja(up - 2u);
+        let r1 = ja(up);
+        let r2 = ja(up + 2u);
+        let r3 = ja(i - 2u);
+        let r4 = ja(i + 2u);
+        let r5 = ja(dn - 2u);
+        let r6 = ja(dn);
+        let r7 = ja(dn + 2u);
+        let ym = (((((((r0.x + r1.x) + r2.x) + r3.x) + r4.x) + r5.x) + r6.x) + r7.x) / 8.0;
         let vu = nvar(1u, ym);
         let vv = nvar(2u, ym);
-        let du = p.y - m.y;
-        let dv = p.z - m.z;
-        let excess = du * du / vu + dv * dv / vv;
-        if (excess > threshold) {
-            m.x = med8(ry);
-            let dy = p.x - m.x;
-            let luminance = dy * dy / nvar(0u, ym);
-            let alone = clamp((1.5 * excess - luminance) / excess, 0.0, 1.0);
-            if (alone > 0.0) {
-                let rest = array<vec3<f32>, 8>(ja(up - 1u), ja(up + 1u), ja(i - w - 2u), ja(i - w + 2u), ja(i + w - 2u), ja(i + w + 2u), ja(dn - 1u), ja(dn + 1u));
-                var reach = 0.0;
-                for (var k = 0u; k < 8u; k++) {
-                    reach = max(reach, ((ring[k].y - m.y) * du / vu + (ring[k].z - m.z) * dv / vv) / excess);
-                    reach = max(reach, ((rest[k].y - m.y) * du / vu + (rest[k].z - m.z) * dv / vv) / excess);
-                }
-                let compact = clamp((0.6 - reach) / 0.3, 0.0, 1.0);
-                let t = clamp((excess - threshold) / threshold, 0.0, 1.0);
-                let kk = share * t * t * (3.0 - 2.0 * t) * alone * compact;
-                if (kk > 0.0) {
-                    o.y += kk * (m.y - p.y);
-                    o.z += kk * (m.z - p.z);
+        let bu = reach8(p.y, r0.y, r1.y, r2.y, r3.y, r4.y, r5.y, r6.y, r7.y);
+        let bv = reach8(p.z, r0.z, r1.z, r2.z, r3.z, r4.z, r5.z, r6.z, r7.z);
+        if (bu * bu / vu + bv * bv / vv > threshold) {
+            var m = vec3<f32>(0.0, med8(r0.y, r1.y, r2.y, r3.y, r4.y, r5.y, r6.y, r7.y), med8(r0.z, r1.z, r2.z, r3.z, r4.z, r5.z, r6.z, r7.z));
+            let du = p.y - m.y;
+            let dv = p.z - m.z;
+            let excess = du * du / vu + dv * dv / vv;
+            if (excess > threshold) {
+                m.x = med8(r0.x, r1.x, r2.x, r3.x, r4.x, r5.x, r6.x, r7.x);
+                let dy = p.x - m.x;
+                let luminance = dy * dy / nvar(0u, ym);
+                let alone = clamp((1.5 * excess - luminance) / excess, 0.0, 1.0);
+                if (alone > 0.0) {
+                    var reach = max(0.0, sshare(r0, m, du, dv, vu, vv, excess));
+                    reach = max(reach, sshare(r1, m, du, dv, vu, vv, excess));
+                    reach = max(reach, sshare(r2, m, du, dv, vu, vv, excess));
+                    reach = max(reach, sshare(r3, m, du, dv, vu, vv, excess));
+                    reach = max(reach, sshare(r4, m, du, dv, vu, vv, excess));
+                    reach = max(reach, sshare(r5, m, du, dv, vu, vv, excess));
+                    reach = max(reach, sshare(r6, m, du, dv, vu, vv, excess));
+                    reach = max(reach, sshare(r7, m, du, dv, vu, vv, excess));
+                    reach = max(reach, sshare(ja(up - 1u), m, du, dv, vu, vv, excess));
+                    reach = max(reach, sshare(ja(up + 1u), m, du, dv, vu, vv, excess));
+                    reach = max(reach, sshare(ja(i - w - 2u), m, du, dv, vu, vv, excess));
+                    reach = max(reach, sshare(ja(i - w + 2u), m, du, dv, vu, vv, excess));
+                    reach = max(reach, sshare(ja(i + w - 2u), m, du, dv, vu, vv, excess));
+                    reach = max(reach, sshare(ja(i + w + 2u), m, du, dv, vu, vv, excess));
+                    reach = max(reach, sshare(ja(dn - 1u), m, du, dv, vu, vv, excess));
+                    reach = max(reach, sshare(ja(dn + 1u), m, du, dv, vu, vv, excess));
+                    let compact = clamp((0.6 - reach) / 0.3, 0.0, 1.0);
+                    let t = clamp((excess - threshold) / threshold, 0.0, 1.0);
+                    let k = share * t * t * (3.0 - 2.0 * t) * alone * compact;
+                    if (k > 0.0) {
+                        o.y += k * (m.y - p.y);
+                        o.z += k * (m.z - p.z);
+                    }
                 }
             }
         }
@@ -217,28 +292,30 @@ fn nrcj_pilot(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgrou
     var out = jb3(i);
     if (!(x == 0u || y == 0u || x + 1u == w || y + 1u == h)) {
         let p = ja(i);
-        var means: array<vec3<f32>, 2>;
-        var variances = array<f32, 2>(0.0, 0.0);
-        for (var axis = 0u; axis < 2u; axis++) {
-            let off = select(1u, w, axis == 1u);
-            let qa = ja(i - off);
-            let qb = ja(i + off);
-            let m = (qa + p + qb) / 3.0;
-            means[axis] = m;
-            var v = 0.0;
-            for (var c = 0u; c < 3u; c++) {
-                let mc = jvc(m, c);
-                let da = jvc(qa, c) - mc;
-                let dp = jvc(p, c) - mc;
-                let db = jvc(qb, c) - mc;
-                v += (da * da + dp * dp + db * db) / (9.0 * nvar(c, p.x));
-            }
-            variances[axis] = v;
-        }
-        if (variances[0] > max(4.0, 4.0 * variances[1])) {
-            out = means[1];
-        } else if (variances[1] > max(4.0, 4.0 * variances[0])) {
-            out = means[0];
+        // 9 · noise variance per component, at the pixel's luminance
+        let nv = 9.0 * vec3<f32>(nvar(0u, p.x), nvar(1u, p.x), nvar(2u, p.x));
+        // axis 0 (left/right) and axis 1 (up/down), written out: private arrays indexed in a loop end up in
+        // slow local memory on some GPUs
+        let qa = ja(i - 1u);
+        let qb = ja(i + 1u);
+        let mh = (qa + p + qb) / 3.0;
+        let ha = qa - mh;
+        let hp = p - mh;
+        let hb = qb - mh;
+        let th = (ha * ha + hp * hp + hb * hb) / nv;
+        let vh = th.x + th.y + th.z;
+        let ua = ja(i - w);
+        let ub = ja(i + w);
+        let mv = (ua + p + ub) / 3.0;
+        let va = ua - mv;
+        let vp = p - mv;
+        let vb = ub - mv;
+        let tv = (va * va + vp * vp + vb * vb) / nv;
+        let vvar = tv.x + tv.y + tv.z;
+        if (vh > max(4.0, 4.0 * vvar)) {
+            out = mv;
+        } else if (vvar > max(4.0, 4.0 * vh)) {
+            out = mh;
         }
     }
     dst[3u * i] = out.x;
@@ -246,7 +323,7 @@ fn nrcj_pilot(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgrou
     dst[3u * i + 2u] = out.z;
 }
 
-// Paths and weights of the direct neighbours: `a` = guide; writes the quads.
+// Paths of the direct neighbours, exp(−distance) (1 where there is no pair): `a` = guide; writes path pairs.
 @compute @workgroup_size(256)
 fn nrcj_links1(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
     let i = lin_index(g, nw);
@@ -258,59 +335,77 @@ fn nrcj_links1(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgro
     let x = i % w;
     let y = i / w;
     let p = ja(i);
-    var q = vec4<f32>(0.0);
+    var q = vec2<f32>(1.0);
     if (x + 1u < w) {
-        q.x = jdist(p, ja(i + 1u));
-        q.z = jweight(q.x, q.x);
+        let d = jdist(p, ja(i + 1u));
+        q.x = jweight(d, d);
     }
     if (y + 1u < h) {
-        q.y = jdist(p, ja(i + w));
-        q.w = jweight(q.y, q.y);
+        let d = jdist(p, ja(i + w));
+        q.y = jweight(d, d);
     }
-    dst[4u * i] = q.x;
-    dst[4u * i + 1u] = q.y;
-    dst[4u * i + 2u] = q.z;
-    dst[4u * i + 3u] = q.w;
+    dst[2u * i] = q.x;
+    dst[2u * i + 1u] = q.y;
 }
 
-// Paths of length 2·delta from those of length delta (`b`) and the next scale's weights (guide `a`):
-// P[13] = delta, P[14] = next.
+// Paths of length 2·delta from those of length delta (`a`, path pairs): their minimum. P[3] = delta.
 @compute @workgroup_size(256)
-fn nrcj_next(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+fn nrcj_paths(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
     let i = lin_index(g, nw);
     if (i >= pu(0u)) {
         return;
     }
     let w = pu(1u);
     let h = pu(2u);
-    let delta = pu(13u);
-    let next = pu(14u);
+    let delta = pu(3u);
     let x = i % w;
     let y = i / w;
-    var ph = b[4u * i];
-    var pv = b[4u * i + 1u];
+    var ph = a[2u * i];
+    var pv = a[2u * i + 1u];
     if (x + delta < w) {
-        ph = max(ph, b[4u * (i + delta)]);
+        ph = min(ph, a[2u * (i + delta)]);
     }
     if (y + delta < h) {
-        pv = max(pv, b[4u * (i + delta * w) + 1u]);
+        pv = min(pv, a[2u * (i + delta * w) + 1u]);
     }
+    dst[2u * i] = ph;
+    dst[2u * i + 1u] = pv;
+}
+
+// `nrc_joint::path_weight`.
+fn jpweight(d: f32, path: f32) -> f32 {
+    return select(min(exp(-d), path), path, d == 0.0);
+}
+
+// The pair weights at distance `next` from the guide (`a`) and the paths (`b`); writes weight pairs.
+// Noise parameters as `nrcj_pilot`; P[13] = next.
+@compute @workgroup_size(256)
+fn nrcj_links(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+    let i = lin_index(g, nw);
+    if (i >= pu(0u)) {
+        return;
+    }
+    let w = pu(1u);
+    let h = pu(2u);
+    let next = pu(13u);
+    let x = i % w;
+    let y = i / w;
     let p = ja(i);
     var lh = 0.0;
     var lv = 0.0;
-    if (x + next < w) {
-        lh = jweight(jdist(p, ja(i + next)), ph);
+    let ph = b[2u * i];
+    let pv = b[2u * i + 1u];
+    if (x + next < w && ph > 0.0) {
+        lh = jpweight(jdist(p, ja(i + next)), ph);
     }
-    if (y + next < h) {
-        lv = jweight(jdist(p, ja(i + next * w)), pv);
+    if (y + next < h && pv > 0.0) {
+        lv = jpweight(jdist(p, ja(i + next * w)), pv);
     }
-    dst[4u * i] = ph;
-    dst[4u * i + 1u] = pv;
-    dst[4u * i + 2u] = lh;
-    dst[4u * i + 3u] = lv;
+    dst[2u * i] = lh;
+    dst[2u * i + 1u] = lv;
 }
 
-// One horizontal diffusion step (`nrc_joint::h_row`): `a` = chroma pairs, `b` = quads.
+// One horizontal diffusion step (`nrc_joint::diffuse_h`): `a` = chroma pairs, `b` = weight pairs.
 // P[0] = n, P[1] = w, P[2] = h, P[3] = delta, P[4] = rate.
 @compute @workgroup_size(256)
 fn nrcj_dh(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
@@ -325,10 +420,10 @@ fn nrcj_dh(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups)
     let p = ja2(i);
     var o = p;
     if (x >= delta) {
-        o += rate * b[4u * (i - delta) + 2u] * (ja2(i - delta) - p);
+        o += rate * b[2u * (i - delta)] * (ja2(i - delta) - p);
     }
     if (x + delta < w) {
-        o += rate * b[4u * i + 2u] * (ja2(i + delta) - p);
+        o += rate * b[2u * i] * (ja2(i + delta) - p);
     }
     dst[2u * i] = o.x;
     dst[2u * i + 1u] = o.y;
@@ -349,10 +444,10 @@ fn nrcj_dv(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups)
     let p = ja2(i);
     var o = p;
     if (y >= delta) {
-        o += rate * b[4u * (i - delta * w) + 3u] * (ja2(i - delta * w) - p);
+        o += rate * b[2u * (i - delta * w) + 1u] * (ja2(i - delta * w) - p);
     }
     if (y + delta < h) {
-        o += rate * b[4u * i + 3u] * (ja2(i + delta * w) - p);
+        o += rate * b[2u * i + 1u] * (ja2(i + delta * w) - p);
     }
     dst[2u * i] = o.x;
     dst[2u * i + 1u] = o.y;

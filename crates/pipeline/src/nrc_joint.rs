@@ -81,17 +81,50 @@ pub fn noise_sample_stride(len: usize) -> usize {
 pub type NoiseSample = (f32, [[f32; 3]; 3]);
 
 /// The fitted noise model from the samples, in pixel order (see `noise_model`).
-pub fn noise_from_samples(mut samples: Vec<NoiseSample>) -> JointNoise {
-    samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+pub fn noise_from_samples(samples: Vec<NoiseSample>) -> JointNoise {
+    // Moving a slider re-renders the same image: the last fit is reused for identical samples (64-bit
+    // hash of their bits and count; the samples alone determine the fit).
+    static LAST: std::sync::Mutex<Option<(u64, JointNoise)>> = std::sync::Mutex::new(None);
+    let mut hash = 0xcbf2_9ce4_8422_2325u64 ^ samples.len() as u64;
+    for s in &samples {
+        for v in std::iter::once(s.0).chain(s.1.iter().flatten().copied()) {
+            hash = (hash ^ u64::from(v.to_bits())).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(5);
+        }
+    }
+    if let Some((h, noise)) = *LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        && h == hash
+    {
+        return noise;
+    }
+    let noise = fit_noise(samples);
+    *LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((hash, noise));
+    noise
+}
+
+fn fit_noise(samples: Vec<NoiseSample>) -> JointNoise {
+    // brightness order, ties in pixel order (as a stable sort): sort compact keys (the bits `total_cmp`
+    // compares by, then the index), then gather
+    let mut keys: Vec<(i32, u32)> = samples
+        .iter()
+        .enumerate()
+        .map(|(k, s)| {
+            let bits = s.0.to_bits() as i32;
+            (bits ^ (((bits >> 31) as u32) >> 1) as i32, k as u32)
+        })
+        .collect();
+    keys.sort_unstable();
+    let samples: Vec<NoiseSample> = keys.iter().filter_map(|&(_, k)| samples.get(k as usize).copied()).collect();
     const BANDS: usize = 16;
     let per = samples.len().div_ceil(BANDS).max(32);
     let mut pts: [Vec<(f64, f64, f64)>; 3] = std::array::from_fn(|_| Vec::new());
+    let mut r: Vec<f32> = Vec::with_capacity(per);
     for band in samples.chunks(per).filter(|b| b.len() >= 32) {
         let y = band.iter().map(|p| p.0 as f64).sum::<f64>() / band.len() as f64;
         for (i, pts) in pts.iter_mut().enumerate() {
             let mut variance = 1e-14f64;
             for scale in 0..3 {
-                let mut r: Vec<f32> = band.iter().map(|p| p.1[scale][i]).collect();
+                r.clear();
+                r.extend(band.iter().map(|p| p.1[scale][i]));
                 let middle = r.len() / 2;
                 let (_, median, _) = r.select_nth_unstable_by(middle, f32::total_cmp);
                 // Each kernel has norm squared 1.25. Larger spacings recover noise
@@ -807,6 +840,36 @@ mod tests {
         new.sort_by(f64::total_cmp);
         old.sort_by(f64::total_cmp);
         println!("joint 24 MP: optimised {:.2} s, reference {:.2} s (medians of {new:.2?} / {old:.2?})", new[1], old[1]);
+    }
+
+    /// BENCH (ignored, prints): fitting the noise model to 130 000 samples (a 33 MP image's), median of 5.
+    #[test]
+    #[ignore]
+    fn bench_noise_fit() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f32 / (1u64 << 53) as f32
+        };
+        let samples: Vec<NoiseSample> = (0..130_000)
+            .map(|_| {
+                let y = rnd() * 0.3;
+                (y, std::array::from_fn(|_| std::array::from_fn(|_| (1e-5 + 1e-4 * y) * rnd() * 2.0)))
+            })
+            .collect();
+        let mut times: Vec<f64> = (0..5)
+            .map(|_| {
+                let s = samples.clone();
+                let t = std::time::Instant::now();
+                let model = fit_noise(s);
+                assert!(model.model.beta[0] > 0.0);
+                t.elapsed().as_secs_f64() * 1e3
+            })
+            .collect();
+        times.sort_by(f64::total_cmp);
+        println!("noise fit, 130 000 samples: {:.1} ms (of {times:.1?})", times[2]);
     }
 
     /// BENCH (ignored, prints): the speck brake alone against the whole joint filter on one 24 MP image,

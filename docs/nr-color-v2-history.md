@@ -145,6 +145,30 @@ Measured (white balance + noise reduction stage on the GPU, median of 3; CPU: co
 V1 on the same Radeon: 0.08–0.12 s. A Windows test build made with MinGW was ~3× slower than Linux in the
 camera-colour step (not in the noise reduction); the official MSVC release still has to be compared.
 
+### Second round (after the speck brake; 33 MP candle at Color 100, median of 3–6, interleaved)
+
+| Change | Result |
+|---|---|
+| guide as three planes, distances one row at a time without branches (the compiler vectorises the three divisions) | CPU next-scale weights ~360 → ~190 ms per scale; bit for bit (test `distance_run_matches_distance`) |
+| paths stored as exp(−path): longer paths take minima, a new distance of 0 needs no `exp` (exp is monotonic, so bit for bit) | alone no measurable gain on the CPU (distance, not `exp`, was the cost); kept, it halves the GPU path buffers |
+| pilot straight into the planes; speck brake in place (it changes < 1 % of pixels) with a min/max pre-test before the medians | brake 492 → 252 ms; pilot + planes 713 → 568 ms |
+| vertical diffusion in one loop, horizontal interior split from the borders | **no gain** (3.59 vs 3.54 s): the diffusion is memory-bound (~24 bytes per pixel and pass); dropped |
+| skipping the `exp` also where the new distance is below the path's | counted: only 2–24 % of pairs beyond the 40–67 % with distance 0, ~15 ms per scale for one more buffer; not done |
+| GPU: separate path and weight pairs (2 + 2 instead of two 4-value quads), next paths into the free scratch buffer | 60 → 48 bytes per pixel planned; 33 MP fits in one piece in 2 GB (before: two bands with 328-row halos) |
+| GPU: medians and pilot without private arrays indexed in loops (those go to slow local memory) | speck brake on the Quadro 0.33 → 0.05 s; pilot ~2 % |
+| GPU: dropping the `sync` calls | Quadro: out of device memory (4032 of 4096 MiB), CPU fallback; kept |
+| noise model: fit cached for identical samples (moving a slider); compact key sort | fit 13–37 ms (noisy); helps repeated previews only |
+
+Totals, white balance + NR stage (GPU) / colour NR (CPU), before → after this round:
+
+| | full 33 MP | preview 2560 px |
+|---|---|---|
+| Quadro M2200 | 2.15 → 1.47 s | 323 → 248 ms |
+| Intel HD 630 | 5.66 → 4.26 s | 818 → 776 ms |
+| CPU i7-7820HQ | 5.17 → 3.54 s | |
+
+CPU output is bit for bit the same as before; GPU output agrees with the previous GPU build to 1/255.
+
 ## 5. Not part of this work
 
 - White dots near black in #820 came from the camera look's hue/saturation table, fixed by #858.
