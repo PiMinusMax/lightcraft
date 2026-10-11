@@ -211,8 +211,20 @@ pub fn nr_v2_enabled() -> bool {
     std::env::var("LIGHTCRAFT_NR_V2").map_or(true, |v| v != "0")
 }
 
-fn knob(name: &str, default: f32) -> f32 {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+/// A prototype tuning knob from the environment, read once per process (they are read in per-pixel code).
+fn knob(name: &'static str, default: f32) -> f32 {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock, PoisonError};
+    static READ: OnceLock<Mutex<HashMap<&'static str, Option<f32>>>> = OnceLock::new();
+    let map = READ.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut m = map.lock().unwrap_or_else(PoisonError::into_inner);
+    m.entry(name).or_insert_with(|| std::env::var(name).ok().and_then(|v| v.parse().ok())).unwrap_or(default)
+}
+
+/// [`nrc_linear`], read once (it is asked per pixel).
+fn nrc_linear_cached() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| knob("NRV2_LINEAR", 1.0) > 0.5)
 }
 
 /// Most samples the noise level of the new colour noise reduction is measured from. The CPU and
@@ -363,7 +375,7 @@ pub fn nrc_eps(samples: &[[f32; 3]], k: f32, pct: f32) -> [f32; 3] {
 /// kept exactly) with a threshold from a noise model `σ²(Y) = α·Y + β`, instead of square-root differences
 /// with one threshold for the whole image.
 pub fn nrc_linear() -> bool {
-    knob("NRV2_LINEAR", 1.0) > 0.5
+    nrc_linear_cached()
 }
 
 /// Experimental joint guide; kept opt-in while native-resolution CPU cost is evaluated.

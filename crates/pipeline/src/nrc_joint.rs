@@ -231,9 +231,19 @@ fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, 
             *p = p.map(|v| v / count.max(1.0));
         }
     });
+    let lap = |what: &str, t: &mut Option<std::time::Instant>| {
+        if let Some(t0) = t {
+            eprintln!("      joint {what}: {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+            *t = Some(std::time::Instant::now());
+        }
+    };
+    let mut tt = start;
+    lap("transform", &mut tt);
     let mut noise = noise_model(&original);
+    lap("noise model", &mut tt);
     noise.tolerance = (1.5 - detail).clamp(0.5, 1.5);
     let guide = pilot(&original, &noise);
+    lap("pilot", &mut tt);
     if std::env::var_os("NRV2_DEBUG").is_some() {
         eprintln!("    nr joint: {w}x{h}, Y/R-Y/B-Y alpha {:?} beta {:?}, supported Y {:?}", noise.model.alpha, noise.model.beta, noise.ymax);
     }
@@ -305,6 +315,7 @@ fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, 
             }
         });
         std::mem::swap(&mut paths, &mut scratch);
+        lap(&format!("scale {delta}"), &mut tt);
         delta = delta.saturating_mul(2);
     }
     drop(scratch);
