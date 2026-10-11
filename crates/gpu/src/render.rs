@@ -857,13 +857,28 @@ fn color_nr_joint(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, p: &local::Nrc
     noise.tolerance = nrc_joint::tolerance(detail);
     let sigma = p.passes.last().map_or(0.0, |q| q.sigma);
     let plan = nrc_joint::scale_plan(sigma, w, h);
-    // rows a kept pixel depends on: the diffusion reaches 2·delta per scale, the paths and weights of a
-    // scale up to 2·delta more, the guide's blur and pilot a few
-    let halo = plan.iter().map(|d| 4 * d.0).sum::<usize>() + 8;
-    // about 15 values per pixel are held while a band is filtered
+    // Rows a kept pixel depends on: a wrong value at a band edge (treated as an image border) moves
+    // inwards by delta per vertical sweep, two sweeps per scale; at the farthest row it reaches, a
+    // scale's weight and path still read up to delta rows further (at most the largest delta); the
+    // guide's blur and pilot reach a few rows. Hence 2·Σdelta + max delta + 8.
+    let halo = plan.iter().map(|d| 2 * d.0).sum::<usize>() + plan.last().map_or(0, |d| d.0) + 8;
+    // Memory: the whole output (3 values per pixel) is held besides the input; a band then holds about
+    // 15 values per pixel (guide 3, two chroma buffers 2 + 2, two path/weight buffers 4 + 4; 12 while
+    // the guide is built). PROTOTYPE: `NRV2_GPU_BAND_MB` sets the budget (MB) for both together.
     let budget = std::env::var("NRV2_GPU_BAND_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2048) << 20;
-    let rows = (budget / (60 * w)).max(1);
-    let core = if rows >= h { h } else { rows.saturating_sub(2 * halo).max(64) };
+    let out_bytes = 12 * n;
+    let per_row = 60 * w;
+    // no band may exceed the device's largest buffer either (the path/weight buffers are the largest)
+    let limit_rows = (cx.gpu.limit() as usize / (16 * w)).max(1);
+    let rows = (budget.saturating_sub(out_bytes) / per_row).min(limit_rows);
+    let core = if rows >= h {
+        h
+    } else if rows > 2 * halo {
+        rows - 2 * halo
+    } else {
+        // not even one band with its halo fits: this stage runs on the CPU (the rest of the render stays here)
+        return None;
+    };
     let out = cx.gpu.buffer(3 * n);
     let mut y0 = 0;
     while y0 < h {
