@@ -132,6 +132,8 @@ pub fn noise_from_samples(mut samples: Vec<NoiseSample>) -> JointNoise {
 /// Squared distance beyond the expected noise in a difference of two guide samples. A small
 /// relative luminance allowance lets a smooth surface exchange colour without crossing a
 /// significant luminance or isoluminant colour boundary. The guide is fixed across all scales.
+/// (The filter runs `distance_run`, the same operations over planes; this per-pair form is its test reference.)
+#[cfg(test)]
 fn distance(a: [f32; 3], b: [f32; 3], noise: &JointNoise) -> f32 {
     let y = 0.5 * (a[0] + b[0]);
     let allowance = (0.025 * y.max(0.0)).powi(2);
@@ -146,6 +148,40 @@ fn distance(a: [f32; 3], b: [f32; 3], noise: &JointNoise) -> f32 {
     terms.into_iter().sum::<f32>()
 }
 
+/// The guide as three planes (Y, R−Y, B−Y): `distance_run` over them vectorises.
+struct Planes {
+    c: [Vec<f32>; 3],
+    w: usize,
+}
+
+impl Planes {
+    /// `len` pixels of row `y` from column `from`.
+    fn run(&self, y: usize, from: usize, len: usize) -> Option<[&[f32]; 3]> {
+        let start = y.checked_mul(self.w)?.checked_add(from)?;
+        let end = start.checked_add(len)?;
+        let [a, b, c] = &self.c;
+        Some([a.get(start..end)?, b.get(start..end)?, c.get(start..end)?])
+    }
+}
+
+/// `distance` of each pair of guide pixels `(a[k], b[k])` into `out[k]`, the same operations in the same
+/// order (bit for bit), without branches so the compiler can work on several pixels at once.
+fn distance_run(a: [&[f32]; 3], b: [&[f32]; 3], noise: &JointNoise, out: &mut [f32]) {
+    let ([ay, au, av], [by, bu, bv]) = (a, b);
+    let (alpha, beta, ymax, tolerance) = (noise.model.alpha, noise.model.beta, noise.ymax, noise.tolerance);
+    for ((((((o, &ay), &au), &av), &by), &bu), &bv) in out.iter_mut().zip(ay).zip(au).zip(av).zip(by).zip(bu).zip(bv) {
+        let y = 0.5 * (ay + by);
+        let allowance = (0.025 * y.max(0.0)).powi(2);
+        // `JointNoise::var`; an excess of 0 divides to exactly 0, as the branch in `distance` gives
+        let term = |i: usize, d: f32| {
+            let v = (alpha[i] * y.min(ymax[i]).max(0.0) + beta[i]).max(1e-14);
+            let excess = (d.powi(2) - v).max(0.0);
+            excess / (3.0 * tolerance * v + allowance)
+        };
+        *o = term(0, ay - by) + term(1, au - bu) + term(2, av - bv);
+    }
+}
+
 /// The exchange weight `exp(−max(distance, path))`; exactly 1 when both are 0 (no `exp` needed).
 #[inline]
 fn weight(distance: f32, path: f32) -> f32 {
@@ -153,39 +189,58 @@ fn weight(distance: f32, path: f32) -> f32 {
     if m == 0.0 { 1.0 } else { (-m).exp() }
 }
 
+/// `weight(distance, path)` with the path given as exp(−path): min(exp(−distance), that), and no `exp`
+/// for a distance of 0.
+#[inline]
+fn path_weight(distance: f32, path: f32) -> f32 {
+    if distance == 0.0 { path } else { (-distance).exp().min(path) }
+}
+
 /// Denoise the pilot along a clearly smoother axis at strong edges. An isotropic blur
 /// dilutes a two-pixel isoluminant line before the edge decision even sees it. Weak or
 /// ambiguous structure uses the isotropic pilot, so noise alone does not protect itself.
-fn pilot(original: &Rgb32f, noise: &JointNoise) -> Rgb32f {
-    let mut guide = gaussian(original, 0.8);
+/// Written straight into planes (see `Planes`), one row at a time without branches per pixel.
+fn pilot(original: &Rgb32f, noise: &JointNoise) -> Planes {
+    use rayon::prelude::*;
+    let blurred = gaussian(original, 0.8);
     let (w, h) = (original.width, original.height);
-    for_rows(&mut guide.data, w, |y, row| {
-        for (x, out) in row.iter_mut().enumerate() {
-            if x == 0 || y == 0 || x + 1 == w || y + 1 == h {
-                continue;
+    let mut planes = Planes { c: std::array::from_fn(|_| vec![0.0; original.len()]), w };
+    let [py, pu, pv] = &mut planes.c;
+    py.par_chunks_mut(w.max(1)).zip(pu.par_chunks_mut(w.max(1))).zip(pv.par_chunks_mut(w.max(1))).enumerate().for_each_init(
+        Vec::new,
+        |out: &mut Vec<[f32; 3]>, (y, ((ry, ru), rv))| {
+            let Some(blur) = blurred.data.get(y * w..(y + 1) * w) else { return };
+            out.clear();
+            out.extend_from_slice(blur);
+            if y > 0
+                && y + 1 < h
+                && let (Some(up), Some(mid), Some(down)) =
+                    (original.data.get((y - 1) * w..y * w), original.data.get(y * w..(y + 1) * w), original.data.get((y + 1) * w..(y + 2) * w))
+            {
+                // columns 1 .. w − 1: the pixel, its left/right (axis 0) and upper/lower (axis 1) neighbours
+                for (((o, win), &u), &d) in out.iter_mut().skip(1).zip(mid.windows(3)).zip(up.iter().skip(1)).zip(down.iter().skip(1)) {
+                    let &[l, p, r] = win else { continue };
+                    let var: [f32; 3] = std::array::from_fn(|i| 9.0 * noise.var(i, p[0]));
+                    let axis = |a: [f32; 3], b: [f32; 3]| {
+                        let m: [f32; 3] = std::array::from_fn(|i| (a[i] + p[i] + b[i]) / 3.0);
+                        let t = |i: usize| ((a[i] - m[i]).powi(2) + (p[i] - m[i]).powi(2) + (b[i] - m[i]).powi(2)) / var[i];
+                        (m, t(0) + t(1) + t(2))
+                    };
+                    let (mh, vh) = axis(l, r);
+                    let (mv, vvar) = axis(u, d);
+                    if vh > 4.0f32.max(4.0 * vvar) {
+                        *o = mv;
+                    } else if vvar > 4.0f32.max(4.0 * vh) {
+                        *o = mh;
+                    }
+                }
             }
-            let index = y * w + x;
-            let Some(&p) = original.data.get(index) else { continue };
-            let mut means = [[0.0f32; 3]; 2];
-            let mut variances = [0.0; 2];
-            for (axis, offset) in [1, w].into_iter().enumerate() {
-                let (Some(&a), Some(&b)) = (original.data.get(index - offset), original.data.get(index + offset)) else { continue };
-                means[axis] = std::array::from_fn(|i| (a[i] + p[i] + b[i]) / 3.0);
-                variances[axis] = (0..3)
-                    .map(|i| {
-                        let m = means[axis][i];
-                        ((a[i] - m).powi(2) + (p[i] - m).powi(2) + (b[i] - m).powi(2)) / (9.0 * noise.var(i, p[0]))
-                    })
-                    .sum::<f32>();
+            for (((c, y), u), v) in out.iter().zip(ry.iter_mut()).zip(ru.iter_mut()).zip(rv.iter_mut()) {
+                (*y, *u, *v) = (c[0], c[1], c[2]);
             }
-            if variances[0] > 4.0f32.max(4.0 * variances[1]) {
-                *out = means[1];
-            } else if variances[1] > 4.0f32.max(4.0 * variances[0]) {
-                *out = means[0];
-            }
-        }
-    });
-    guide
+        },
+    );
+    planes
 }
 
 /// The two chroma components `R − Y`, `B − Y`, or a pair of per-axis values (horizontal, vertical).
@@ -344,8 +399,18 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
 /// is only needed for the few pixels past the threshold).
 fn speck_share(p: [f32; 3], ring: &[[f32; 3]; 8], rest: impl Iterator<Item = [f32; 3]>, noise: &JointNoise, brake: SpeckBrake) -> (f32, [f32; 3]) {
     let y = ring.iter().map(|q| q[0]).sum::<f32>() / 8.0;
-    let m = [0.0, median8(ring.map(|q| q[1])), median8(ring.map(|q| q[2]))];
     let (vu, vv) = (noise.var(1, y), noise.var(2, y));
+    // The medians lie between the ring's least and largest value, so the farther of the two bounds the
+    // excess from above (rounding keeps that order): most pixels are decided without the medians.
+    let reach = |c: usize| {
+        let (lo, hi) = ring.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), q| (lo.min(q[c]), hi.max(q[c])));
+        (p[c] - lo).abs().max((p[c] - hi).abs())
+    };
+    let (bu, bv) = (reach(1), reach(2));
+    if bu * bu / vu + bv * bv / vv <= brake.threshold {
+        return (0.0, [0.0; 3]);
+    }
+    let m = [0.0, median8(ring.map(|q| q[1])), median8(ring.map(|q| q[2]))];
     let (du, dv) = (p[1] - m[1], p[2] - m[2]);
     let excess = du * du / vu + dv * dv / vv;
     if excess <= brake.threshold {
@@ -368,38 +433,45 @@ fn speck_share(p: [f32; 3], ring: &[[f32; 3]; 8], rest: impl Iterator<Item = [f3
 /// Replace the chroma of compact colour specks by that of their surroundings (see `speck_share`), in the
 /// transformed image (Y, R−Y, B−Y); luminance is never touched. Runs before the guide is built, so a speck
 /// is neither kept by the edge-aware weights nor spread by them.
-fn despeck(img: &Rgb32f, noise: &JointNoise, brake: SpeckBrake) -> Rgb32f {
-    let mut out = img.clone();
+fn despeck(img: &mut Rgb32f, noise: &JointNoise, brake: SpeckBrake) {
+    use rayon::prelude::*;
     if brake.share <= 0.0 || img.width < 5 || img.height < 5 {
-        return out;
+        return;
     }
     let (w, h) = (img.width, img.height);
-    for_rows(&mut out.data, w, |y, row| {
-        if y < 2 || y + 2 >= h {
-            return;
-        }
-        let rows: [Option<&[[f32; 3]]>; 5] = std::array::from_fn(|k| img.data.get((y + k - 2) * w..(y + k - 1) * w));
-        let [Some(r0), Some(r1), Some(r2), Some(r3), Some(r4)] = rows else { return };
-        for (((((o, w0), w1), w2), w3), w4) in
-            row.iter_mut().skip(2).zip(r0.windows(5)).zip(r1.windows(5)).zip(r2.windows(5)).zip(r3.windows(5)).zip(r4.windows(5))
-        {
-            let (&[a0, a1, a2, a3, a4], &[b0, _, _, _, b4], &[c0, _, p, _, c4], &[d0, _, _, _, d4], &[e0, e1, e2, e3, e4]) = (w0, w1, w2, w3, w4)
-            else {
-                continue;
-            };
-            // the ring: corners and edge centres of the 5 × 5 square, far enough that a speck spread over
-            // its direct neighbours by demosaicing does not reach them; the rest of the border: with the
-            // ring, every thin line or edge through the pixel crosses at least one of the 16 at any angle
-            let ring = [a0, a2, a4, c0, c4, e0, e2, e4];
-            let rest = [a1, a3, b0, b4, d0, d4, e1, e3];
-            let (k, m) = speck_share(p, &ring, rest.into_iter(), noise, brake);
-            if k > 0.0 {
-                o[1] += k * (m[1] - p[1]);
-                o[2] += k * (m[2] - p[2]);
+    let source = &*img;
+    // few pixels change: collect their new chroma per row from the unchanged image, then write them
+    let changes: Vec<Vec<(usize, [f32; 2])>> = (2..h - 2)
+        .into_par_iter()
+        .map(|y| {
+            let mut changed = Vec::new();
+            let rows: [Option<&[[f32; 3]]>; 5] = std::array::from_fn(|k| source.data.get((y + k - 2) * w..(y + k - 1) * w));
+            let [Some(r0), Some(r1), Some(r2), Some(r3), Some(r4)] = rows else { return changed };
+            for (x, ((((w0, w1), w2), w3), w4)) in
+                r0.windows(5).zip(r1.windows(5)).zip(r2.windows(5)).zip(r3.windows(5)).zip(r4.windows(5)).enumerate()
+            {
+                let (&[a0, a1, a2, a3, a4], &[b0, _, _, _, b4], &[c0, _, p, _, c4], &[d0, _, _, _, d4], &[e0, e1, e2, e3, e4]) = (w0, w1, w2, w3, w4)
+                else {
+                    continue;
+                };
+                // the ring: corners and edge centres of the 5 × 5 square, far enough that a speck spread over
+                // its direct neighbours by demosaicing does not reach them; the rest of the border: with the
+                // ring, every thin line or edge through the pixel crosses at least one of the 16 at any angle
+                let ring = [a0, a2, a4, c0, c4, e0, e2, e4];
+                let rest = [a1, a3, b0, b4, d0, d4, e1, e3];
+                let (k, m) = speck_share(p, &ring, rest.into_iter(), noise, brake);
+                if k > 0.0 {
+                    changed.push((y * w + x + 2, [p[1] + k * (m[1] - p[1]), p[2] + k * (m[2] - p[2])]));
+                }
             }
+            changed
+        })
+        .collect();
+    for (index, uv) in changes.into_iter().flatten() {
+        if let Some(o) = img.data.get_mut(index) {
+            (o[1], o[2]) = (uv[0], uv[1]);
         }
-    });
-    out
+    }
 }
 
 pub(crate) fn denoise(img: &mut Rgb32f, params: &NrcParams, detail: f32, amount: f32) {
@@ -471,9 +543,9 @@ fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, 
         let _ = std::fs::write(&path, bytes);
         eprintln!("    nr joint dump: alpha {:?} beta {:?} ymax {:?}", noise.model.alpha, noise.model.beta, noise.ymax);
     }
-    let original = if brake.share > 0.0 { despeck(&original, &noise, brake) } else { original };
+    despeck(&mut original, &noise, brake);
     lap("speck brake", &mut tt);
-    let guide = pilot(&original, &noise);
+    let planes = pilot(&original, &noise);
     lap("pilot", &mut tt);
     if std::env::var_os("NRV2_DEBUG").is_some() {
         eprintln!("    nr joint: {w}x{h}, Y/R-Y/B-Y alpha {:?} beta {:?}, supported Y {:?}", noise.model.alpha, noise.model.beta, noise.ymax);
@@ -486,27 +558,43 @@ fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, 
     let mut paths = PairImage::new(w, h);
     let mut links = PairImage::new(w, h);
     // Direct neighbours: the path over one step is the pair's own distance, and its weight is exp(−distance).
+    // `paths` holds exp(−path), the largest distance along a path, exponentiated: exp(−max(a, b)) is
+    // min(exp(−a), exp(−b)) bit for bit (exp is monotonic), so longer paths take minima and a weight with
+    // a new distance of 0 needs no `exp`; a path of 0 (no pair, at the border) is 1.
+    // the distances of row `y` to the pixels `offset` to the right and `offset` rows down
+    let row_distances = |y: usize, offset: usize, dh: &mut Vec<f32>, dv: &mut Vec<f32>| {
+        let n = w.saturating_sub(offset);
+        dh.resize(w, 0.0);
+        dv.resize(w, 0.0);
+        if let (Some(a), Some(b), Some(out)) = (planes.run(y, 0, n), planes.run(y, offset, n), dh.get_mut(..n)) {
+            distance_run(a, b, &noise, out);
+        }
+        if y + offset < h
+            && let (Some(a), Some(b)) = (planes.run(y, 0, w), planes.run(y + offset, 0, w))
+        {
+            distance_run(a, b, &noise, dv);
+        }
+    };
     {
         use rayon::prelude::*;
-        paths.data.par_chunks_mut(w).zip(links.data.par_chunks_mut(w)).enumerate().for_each(|(y, (prow, lrow))| {
-            for (x, (out, link)) in prow.iter_mut().zip(lrow.iter_mut()).enumerate() {
-                let index = y * w + x;
-                let Some(&g) = guide.data.get(index) else { continue };
-                *link = [0.0; 2];
-                if x + 1 < w
-                    && let Some(&b) = guide.data.get(index + 1)
-                {
-                    out[0] = distance(g, b, &noise);
-                    link[0] = weight(out[0], out[0]);
+        paths.data.par_chunks_mut(w).zip(links.data.par_chunks_mut(w)).enumerate().for_each_init(
+            || (Vec::new(), Vec::new()),
+            |(dh, dv), (y, (prow, lrow))| {
+                row_distances(y, 1, dh, dv);
+                for (x, (((out, link), &d0), &d1)) in prow.iter_mut().zip(lrow.iter_mut()).zip(dh.iter()).zip(dv.iter()).enumerate() {
+                    *link = [0.0; 2];
+                    *out = [1.0; 2];
+                    if x + 1 < w {
+                        link[0] = weight(d0, d0);
+                        out[0] = link[0];
+                    }
+                    if y + 1 < h {
+                        link[1] = weight(d1, d1);
+                        out[1] = link[1];
+                    }
                 }
-                if y + 1 < h
-                    && let Some(&b) = guide.data.get(index + w)
-                {
-                    out[1] = distance(g, b, &noise);
-                    link[1] = weight(out[1], out[1]);
-                }
-            }
-        });
+            },
+        );
     }
     lap("links 1", &mut tt);
     // Scale is independent of the edge decision. K has no role in deciding whether a leaf
@@ -522,35 +610,39 @@ fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, 
         }
         lap(&format!("scale {delta}"), &mut tt);
         let Some(&(next, _)) = plan.get(k + 1) else { break };
-        // In one pass: maxima over paths of length 2·delta (from the two adjacent delta-length paths,
-        // read from `paths`, written to `scratch`) and the next scale's pair weights from them.
+        // In one pass: paths of length 2·delta (from the two adjacent delta-length paths, read from
+        // `paths`, written to `scratch`) and the next scale's pair weights from them.
         {
             use rayon::prelude::*;
             let old = &paths;
-            scratch.data.par_chunks_mut(w).zip(links.data.par_chunks_mut(w)).enumerate().for_each(|(y, (prow, lrow))| {
-                for (x, (out, link)) in prow.iter_mut().zip(lrow.iter_mut()).enumerate() {
-                    let index = y * w + x;
-                    let Some(&p) = old.data.get(index) else { continue };
-                    *out = p;
-                    if x + delta < w
-                        && let Some(q) = old.data.get(index + delta)
-                    {
-                        out[0] = out[0].max(q[0]);
-                    }
-                    if y + delta < h
-                        && let Some(q) = old.data.get(index + delta * w)
-                    {
-                        out[1] = out[1].max(q[1]);
-                    }
-                    *link = [0.0; 2];
-                    let Some(&g) = guide.data.get(index) else { continue };
-                    for (axis, offset, valid) in [(0, next, x + next < w), (1, next * w, y + next < h)] {
-                        if valid && let Some(&other) = guide.data.get(index + offset) {
-                            link[axis] = weight(distance(g, other, &noise), out[axis]);
+            scratch.data.par_chunks_mut(w).zip(links.data.par_chunks_mut(w)).enumerate().for_each_init(
+                || (Vec::new(), Vec::new()),
+                |(dh, dv), (y, (prow, lrow))| {
+                    row_distances(y, next, dh, dv);
+                    let (Some(here), below) = (old.data.get(y * w..(y + 1) * w), old.data.get((y + delta) * w..(y + delta + 1) * w)) else { return };
+                    for (x, (((out, link), &d0), &d1)) in prow.iter_mut().zip(lrow.iter_mut()).zip(dh.iter()).zip(dv.iter()).enumerate() {
+                        let Some(&p) = here.get(x) else { continue };
+                        *out = p;
+                        if x + delta < w
+                            && let Some(q) = here.get(x + delta)
+                        {
+                            out[0] = out[0].min(q[0]);
+                        }
+                        if y + delta < h
+                            && let Some(q) = below.and_then(|b| b.get(x))
+                        {
+                            out[1] = out[1].min(q[1]);
+                        }
+                        *link = [0.0; 2];
+                        if x + next < w {
+                            link[0] = path_weight(d0, out[0]);
+                        }
+                        if y + next < h {
+                            link[1] = path_weight(d1, out[1]);
                         }
                     }
-                }
-            });
+                },
+            );
         }
         std::mem::swap(&mut paths, &mut scratch);
     }
@@ -730,10 +822,10 @@ mod tests {
         let noise = noise_model(&transformed);
         let (mut brake, mut joint) = (Vec::new(), Vec::new());
         for _ in 0..3 {
+            let mut out = transformed.clone();
             let t = std::time::Instant::now();
-            let out = despeck(&transformed, &noise, speck_brake(1.0));
+            despeck(&mut out, &noise, speck_brake(1.0));
             brake.push(t.elapsed().as_secs_f64());
-            assert_eq!(out.len(), transformed.len());
             let mut a = input.clone();
             let t = std::time::Instant::now();
             denoise_grid(&mut a, &p, 1, 0.5, 1.0, SpeckBrake::OFF);
@@ -900,5 +992,20 @@ mod tests {
         assert!(weak < 0.8 * off && strong < 0.2, "speck kept: off {off}, at 25 {weak}, at 100 {strong}");
         assert!(strong < weak, "the brake is stronger at 100 ({strong}) than at 25 ({weak})");
         assert!((star_strong - star_off).abs() < 0.02, "star colour {star_off} -> {star_strong}");
+    }
+
+    /// `distance_run` (planes, no branches) gives `distance` bit for bit.
+    #[test]
+    fn distance_run_matches_distance() {
+        let clean = Rgb32f::from_fn(64, 3, |x, _| [0.002 * x as f32, 0.01, 0.03 - 0.0004 * x as f32]);
+        let img = noisy(&clean, 0x9e37_79b9_7f4a_7c15, 0.01).map(yuv);
+        let mut noise = noise_model(&noisy(&Rgb32f::filled(64, 64, [0.02; 3]), 7, 0.004).map(yuv));
+        noise.tolerance = 0.7;
+        let planes = Planes { c: std::array::from_fn(|i| img.data.iter().map(|p| p[i]).collect()), w: 64 };
+        let mut out = vec![0.0; 64];
+        distance_run(planes.run(0, 0, 64).unwrap(), planes.run(2, 0, 64).unwrap(), &noise, &mut out);
+        for (x, d) in out.iter().enumerate() {
+            assert_eq!(d.to_bits(), distance(img.get(x, 0), img.get(x, 2), &noise).to_bits(), "pixel {x}");
+        }
     }
 }
