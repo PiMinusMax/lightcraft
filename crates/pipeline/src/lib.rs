@@ -419,7 +419,7 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
             // (spots grow the rendered window; only 8-bit renders are cut back to the request)
             let mut work = if req.depth == OutputDepth::U8 { spots::window_for_reads(s, &frame, full_w, full_h, px_per_long, win) } else { win };
             if req.depth == OutputDepth::U8
-                && local::nrc_joint_enabled()
+                && local::joint_colour_nr(s)
                 && let Some(params) = local::nrc_params(s, src.width.max(src.height), frame.output_long(full_w, full_h))
             {
                 // The joint diffusion reads a chain of neighbours across its scales. Keep

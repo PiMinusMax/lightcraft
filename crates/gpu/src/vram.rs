@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 /// How long an answer is reused.
 const TTL: Duration = Duration::from_secs(3);
 /// How long `nvidia-smi` may take before it is given up on.
-#[cfg(not(target_arch = "wasm32"))]
 const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 const NVIDIA: u32 = 0x10de;
@@ -31,11 +30,6 @@ pub fn free_bytes(info: &wgpu::AdapterInfo) -> Option<u64> {
     let free = query(info.vendor, info.device);
     *cache = Some((Instant::now(), info.vendor, info.device, free));
     free
-}
-
-#[cfg(target_arch = "wasm32")]
-fn query(_vendor: u32, _device: u32) -> Option<u64> {
-    None
 }
 
 #[cfg(not(target_arch = "wasm32"))]
