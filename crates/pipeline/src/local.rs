@@ -163,7 +163,9 @@ pub fn nr_params(s: &DevelopSettings, src_long: usize, out_long: usize) -> (Opti
 pub fn denoise(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long: usize) {
     let (lum, col) = nr_params(s, src_long, out_long);
     let w = img.width;
-    if let Some(nr) = lum {
+    // PROTOTYPE (#1129): the wavelet luminance NR runs after the colour NR, which leaves Y unchanged.
+    let new_lum = lum.is_some() && crate::nrl::enabled();
+    if let Some(nr) = lum.filter(|_| !new_lum) {
         let _t = crate::profiling().then(std::time::Instant::now);
         let l = img.map(log_lum);
         let f = guided(&l, nr.sigma, nr.eps);
@@ -181,9 +183,7 @@ pub fn denoise(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long:
     }
     if col.is_some() && nr_v2_enabled() {
         color_nr_v2(img, s, src_long, out_long);
-        return;
-    }
-    if let Some(nr) = col {
+    } else if let Some(nr) = col {
         let _t = crate::profiling().then(std::time::Instant::now);
         let chroma = img.map(|c| {
             let y = luminance_2020(c).max(1e-6);
@@ -202,6 +202,15 @@ pub fn denoise(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long:
         if let Some(t) = _t {
             eprintln!("    nr colour: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
         }
+    }
+    if new_lum {
+        let d = &s.detail;
+        let p = crate::nrl::Params {
+            amount: (d.nr_luminance / 100.0) as f32,
+            detail: (d.nr_detail / 100.0) as f32,
+            contrast: (d.nr_contrast / 100.0) as f32,
+        };
+        crate::nrl::denoise(img, &p);
     }
 }
 

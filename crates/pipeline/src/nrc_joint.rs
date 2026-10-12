@@ -25,7 +25,7 @@ impl JointNoise {
     }
 }
 
-fn yuv(c: [f32; 3]) -> [f32; 3] {
+pub(crate) fn yuv(c: [f32; 3]) -> [f32; 3] {
     let y = luminance_2020(c);
     [y, c[0] - y, c[2] - y]
 }
@@ -35,6 +35,12 @@ fn yuv(c: [f32; 3]) -> [f32; 3] {
 /// Luminance bands with predominantly texture may only lower their weight in the fit: they
 /// cannot force a shadow scene's extrapolated highlight noise arbitrarily high.
 fn noise_model(img: &Rgb32f) -> JointNoise {
+    noise_model_of(img, |c| c)
+}
+
+/// [`noise_model`] of the guide `transform(rgb)` of each pixel (e.g. [`yuv`] of linear RGB), without
+/// building the transformed image.
+pub(crate) fn noise_model_of(img: &Rgb32f, transform: impl Fn([f32; 3]) -> [f32; 3]) -> JointNoise {
     let mut samples = Vec::new();
     let stride = noise_sample_stride(img.len());
     if img.width < 3 || img.height < 3 {
@@ -45,7 +51,7 @@ fn noise_model(img: &Rgb32f) -> JointNoise {
         if x == 0 || y == 0 || x + 1 == img.width || y + 1 == img.height {
             continue;
         }
-        let Some(c) = img.data.get(index) else { continue };
+        let Some(c) = img.data.get(index).map(|&c| transform(c)) else { continue };
         let mut residual = [[0.0f32; 3]; 3];
         let mut brightness = 0.0;
         let mut valid = true;
@@ -56,7 +62,7 @@ fn noise_model(img: &Rgb32f) -> JointNoise {
             let neighbours = [index - delta, index + delta, index - delta * img.width, index + delta * img.width];
             let mut m = [0.0f32; 3];
             for n in neighbours {
-                if let Some(p) = img.data.get(n) {
+                if let Some(p) = img.data.get(n).map(|&p| transform(p)) {
                     m = std::array::from_fn(|i| m[i] + 0.25 * p[i]);
                 }
             }
