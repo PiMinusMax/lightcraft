@@ -671,6 +671,12 @@ impl crate::Session {
     }
 }
 
+/// EXPERIMENT (#1129): keep negative values until after the noise reduction (`LIGHTCRAFT_LATE_CLAMP=1`).
+pub fn late_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LIGHTCRAFT_LATE_CLAMP").is_ok_and(|v| v == "1"))
+}
+
 #[cfg(test)]
 mod tests {
     /// Keywords from a file keep their hierarchy: the paths of `lr:hierarchicalSubject`, not the
@@ -1623,10 +1629,4 @@ mod tests {
         assert_eq!(s.quick_view_job(id, 1600, true).unwrap().run().quick, Some(QuickSource::Small));
         let _ = std::fs::remove_dir_all(&dir);
     }
-}
-
-/// EXPERIMENT (#1129): keep negative values until after the noise reduction (`LIGHTCRAFT_LATE_CLAMP=1`).
-pub fn late_clamp() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("LIGHTCRAFT_LATE_CLAMP").is_ok_and(|v| v == "1"))
 }

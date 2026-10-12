@@ -1,8 +1,8 @@
 //! Luminance noise reduction (prototype for #1129). An à trous wavelet of linear Y; each detail level
 //! is shrunk against the brightness-dependent noise model of the colour NR (the same samples and fit,
 //! channel Y), and the change of Y is added to R, G and B alike. Adding instead of scaling keeps the
-//! chroma and lets black or negative pixels move; a wide blur of the removed part puts back the
-//! local mean that shrinking skewed noise tails would move.
+//! chroma and lets black or negative pixels move. The shrinking is odd in each coefficient, so
+//! symmetric noise keeps its mean; nothing of the removed part is put back.
 //!
 //! Amount sets the threshold (in noise sigmas of the level), Detail lowers it on the two fine levels,
 //! Contrast on the three coarse ones.
@@ -19,8 +19,6 @@ use crate::{
 pub const LEVELS: usize = 5;
 /// Levels with a robust (median) local energy; coarser levels average.
 const ROBUST_LEVELS: usize = 2;
-/// Blur of the removed part whose mean is put back (px).
-const BIAS_SIGMA: f32 = 12.0;
 
 /// The sliders, 0–1.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -40,13 +38,13 @@ fn energy_sigma(j: usize) -> f32 {
     (2.0 * (1u32 << j) as f32 + 1.0) / 12f32.sqrt()
 }
 
-/// How far an output pixel reads its neighbours (px): the coarsest detail level, its energy window
-/// and the bias blur. A window rendered on its own needs this much context around it.
+/// How far an output pixel reads its neighbours (px): the coarsest detail level and its energy
+/// window. A window rendered on its own needs this much context around it.
 pub fn halo() -> usize {
     let reach = |sigma: f32| lightcraft_raster::blur::box_radii(sigma).iter().sum::<usize>();
     // the à trous steps: 2 · 2^j on each side
     let wavelet: usize = (0..LEVELS).map(|j| 2usize << j).sum();
-    wavelet + reach(energy_sigma(LEVELS - 1)) + reach(BIAS_SIGMA) + 4
+    wavelet + reach(energy_sigma(LEVELS - 1)) + 4
 }
 
 /// Threshold of level `j` in noise sigmas of that level.
@@ -107,47 +105,17 @@ fn smooth(src: &Plane, j: usize) -> Plane {
     out
 }
 
-/// Median of nine (Devillard's 19-exchange network).
-#[inline]
-fn med9(mut p: [f32; 9]) -> f32 {
-    let mut s = |a: usize, b: usize| {
-        let (lo, hi) = (p[a].min(p[b]), p[a].max(p[b]));
-        p[a] = lo;
-        p[b] = hi;
-    };
-    for (a, b) in [
-        (1, 2),
-        (4, 5),
-        (7, 8),
-        (0, 1),
-        (3, 4),
-        (6, 7),
-        (1, 2),
-        (4, 5),
-        (7, 8),
-        (0, 3),
-        (5, 8),
-        (4, 7),
-        (3, 6),
-        (1, 4),
-        (2, 5),
-        (4, 7),
-        (4, 2),
-        (6, 4),
-        (4, 2),
-    ] {
-        s(a, b);
-    }
-    p[4]
-}
+/// `E[max(min(a, b))²]` over the four directions for independent unit Gaussian samples (simulated).
+const DIRECTIONAL_MEAN_SQUARE: f32 = 0.932;
 
-/// Local energy of the detail plane `d` (level `j`) as an estimate of its mean square: on the fine levels the
-/// median of `d²` over 9 samples `2^(j+1)` px apart (an isolated outlier does not protect itself), scaled by
-/// the median of χ²(1); on the coarse levels a Gaussian mean.
+/// Local energy of the detail plane `d` (level `j`) as an estimate of its mean square. On the fine levels:
+/// along each of four directions (horizontal, vertical, both diagonals) the smaller `|d|` of the two
+/// samples `2^(j+1)` px to either side, the largest of the four, squared and scaled to the mean
+/// square of Gaussian noise. A line or edge is supported along its own direction; the pixel itself
+/// does not count, so an isolated outlier does not protect itself. On the coarse levels a Gaussian mean.
 fn energy(d: &Plane, j: usize) -> Plane {
     let (w, h) = (d.width, d.height);
     if j < ROBUST_LEVELS {
-        // median(d²) = median(|d|)²
         let s = 2usize << j;
         let mut e = Plane::new(w, h);
         for_rows(&mut e.data, w, |y, row| {
@@ -157,10 +125,13 @@ fn energy(d: &Plane, j: usize) -> Plane {
                 pad_row(&d.data[r * w..(r + 1) * w], s, pad);
                 pad.iter_mut().for_each(|v| *v = v.abs());
             }
-            let t: [&[f32]; 9] = std::array::from_fn(|k| &pads[k / 3][(k % 3) * s..(k % 3) * s + w]);
+            // pads[row][x + dx] for dx in 0, s, 2s: left, centre, right
+            let at = |r: usize, k: usize| &pads[r][k * s..k * s + w];
+            let (up, down) = ((at(0, 0), at(0, 1), at(0, 2)), (at(2, 0), at(2, 1), at(2, 2)));
+            let (left, right) = (at(1, 0), at(1, 2));
             for (x, o) in row.iter_mut().enumerate() {
-                let m = med9([t[0][x], t[1][x], t[2][x], t[3][x], t[4][x], t[5][x], t[6][x], t[7][x], t[8][x]]);
-                *o = m * m / 0.454_936_4;
+                let m = left[x].min(right[x]).max(up.1[x].min(down.1[x])).max(up.0[x].min(down.2[x])).max(up.2[x].min(down.0[x]));
+                *o = m * m / DIRECTIONAL_MEAN_SQUARE;
             }
         });
         e
@@ -254,6 +225,43 @@ pub fn stats(tiles: &[Rgb32f]) -> Stats {
     Stats { noise, gains }
 }
 
+/// `c` with its luminance changed by `dy`, the same in each channel as far as no channel goes below
+/// `min(v, 0)` (no new negative values: the undershoot next to edges would reach the later stages'
+/// floors). What a floored channel cannot take is moved to the others, so the luminance change stays
+/// whole as long as any channel can take it; only then do the channels' differences change.
+fn add_luminance(c: [f32; 3], dy: f32) -> [f32; 3] {
+    let floor = c.map(|v| v.min(0.0));
+    if (0..3).all(|k| c[k] + dy >= floor[k]) {
+        return c.map(|v| v + dy);
+    }
+    let weight = lightcraft_color::LUMA_2020;
+    let mut out = c;
+    let mut left = dy;
+    let mut free = [true; 3];
+    for _ in 0..3 {
+        let w: f32 = (0..3).filter(|&k| free[k]).map(|k| weight[k]).sum();
+        if left >= 0.0 || w <= 0.0 {
+            break;
+        }
+        // the same change in every free channel: `left / w` each
+        let step = left / w;
+        let mut taken = 0.0;
+        for k in 0..3 {
+            if free[k] {
+                let v = (out[k] + step).max(floor[k]);
+                taken += (v - out[k]) * weight[k];
+                free[k] = v > floor[k];
+                out[k] = v;
+            }
+        }
+        left -= taken;
+        if left.abs() <= 1e-12 {
+            break;
+        }
+    }
+    out
+}
+
 /// Luminance noise reduction of linear RGB in place, with `stats` of the whole frame (`None`:
 /// measured on `img`).
 pub fn denoise(img: &mut Rgb32f, p: &Params, stats: Option<&Stats>) {
@@ -281,8 +289,9 @@ pub fn denoise(img: &mut Rgb32f, p: &Params, stats: Option<&Stats>) {
     let (y, c1, c2) = levels_of(img);
     let var = c2.map(|v| noise.var(0, v));
     lap("y, c1, c2, var", &mut tt);
-    let mut out = Plane::new(w, h);
-    let mut levels: Vec<Plane> = vec![y.clone(), c1, c2];
+    // the change of Y: minus the part of each level the shrinking removes
+    let mut change = Plane::new(w, h);
+    let mut levels: Vec<Plane> = vec![y, c1, c2];
     for (j, gain) in gains.iter().enumerate() {
         if levels.len() < j + 2 {
             let next = smooth(&levels[j], j);
@@ -290,41 +299,30 @@ pub fn denoise(img: &mut Rgb32f, p: &Params, stats: Option<&Stats>) {
         }
         lap("smooth", &mut tt);
         let d = levels[j].zip_map(&levels[j + 1], |a, b| a - b);
+        // the finer approximation is no longer needed
+        levels[j] = Plane::new(0, 0);
         lap("detail", &mut tt);
         let e = energy(&d, j);
         lap("energy", &mut tt);
         let t = threshold(p, j);
         let k = t * t * gain;
-        for_rows(&mut out.data, w, |row, o| {
+        for_rows(&mut change.data, w, |row, o| {
             let i0 = row * w;
             for (x, o) in o.iter_mut().enumerate() {
                 let i = i0 + x;
-                let g = (1.0 - k * var.data[i] / e.data[i].max(1e-30)).max(0.0);
-                *o += d.data[i] * g;
+                let keep = (1.0 - k * var.data[i] / e.data[i].max(1e-30)).max(0.0);
+                *o -= d.data[i] * (1.0 - keep);
             }
         });
-        // the finer approximation is no longer needed (y is kept for the bias correction)
-        if j > 0 {
-            levels[j] = Plane::new(0, 0);
-        }
-    }
-    let coarse = levels.pop().unwrap_or_else(|| Plane::new(w, h));
-    for (o, c) in out.data.iter_mut().zip(&coarse.data) {
-        *o += c;
     }
     lap("shrink", &mut tt);
-    let removed = y.zip_map(&out, |a, b| a - b);
-    let back = gaussian(&removed, BIAS_SIGMA);
     for_rows(&mut img.data, w, |row, px| {
         let i0 = row * w;
         for (x, c) in px.iter_mut().enumerate() {
-            let i = i0 + x;
-            let dy = out.data[i] + back.data[i] - y.data[i];
-            // no new negative values: the undershoot next to edges would reach the later stages' floors
-            *c = c.map(|v| (v + dy).max(v.min(0.0)));
+            *c = add_luminance(*c, change.data[i0 + x]);
         }
     });
-    lap("bias + apply", &mut tt);
+    lap("apply", &mut tt);
     if let Some(t) = start {
         eprintln!(
             "    nr luminance (wavelet): {:.0} ms, Y noise alpha {:.3e} beta {:.3e}, level gains {:?}",
@@ -420,10 +418,198 @@ mod tests {
         }
     }
 
+    /// Gaussian noise of `sigma` added to Y alike in all channels, fixed seed.
+    fn add_noise(img: &mut Rgb32f, sigma: f32, seed: u32) {
+        let mut seed = seed | 1;
+        let mut u = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed as f64 + 0.5) / (u32::MAX as f64 + 1.0)
+        };
+        for p in &mut img.data {
+            let n = ((-2.0 * u().ln()).sqrt() * (std::f64::consts::TAU * u()).cos()) as f32 * sigma;
+            *p = p.map(|v| v + n);
+        }
+    }
+
+    fn y_of(img: &Rgb32f) -> Vec<f64> {
+        img.data.iter().map(|&c| luminance_2020(c) as f64).collect()
+    }
+
+    /// RMS of `a − b` after a box average of `r × r` px (non-overlapping blocks).
+    fn rms_at(a: &[f64], b: &[f64], w: usize, h: usize, r: usize) -> f64 {
+        let (mut s, mut n) = (0.0, 0.0);
+        for by in (0..h - r + 1).step_by(r) {
+            for bx in (0..w - r + 1).step_by(r) {
+                let mut m = 0.0;
+                for y in by..by + r {
+                    for x in bx..bx + r {
+                        m += a[y * w + x] - b[y * w + x];
+                    }
+                }
+                m /= (r * r) as f64;
+                s += m * m;
+                n += 1.0;
+            }
+        }
+        (s / n).sqrt()
+    }
+
+    const SIGMA: f32 = 0.003;
+
+    fn run(img: &Rgb32f, amount: f32, stats: Option<&Stats>) -> Rgb32f {
+        let mut out = img.clone();
+        denoise(&mut out, &Params { amount, detail: 0.5, contrast: 0.0 }, stats);
+        out
+    }
+
+    /// A one pixel wide line ten noise sigmas above its flat surround keeps nearly all of its contrast at
+    /// Amount 100 (the median of a 3 × 3 neighbourhood took it for noise and kept 64 %).
     #[test]
-    fn med9_is_the_median() {
-        let v = [9.0, 1.0, 8.0, 2.0, 7.0, 3.0, 6.0, 4.0, 5.0];
-        assert_eq!(med9(v), 5.0);
+    fn thin_lines_are_kept() {
+        let (w, h) = (256, 256);
+        let clean = Rgb32f::from_fn(w, h, |x, _| [0.05 + if x == 128 { 10.0 * SIGMA } else { 0.0 }; 3]);
+        let mut img = clean.clone();
+        add_noise(&mut img, SIGMA, 11);
+        let out = y_of(&run(&img, 1.0, None));
+        let contrast = (32..224).map(|r| out[r * w + 128] - 0.5 * (out[r * w + 108] + out[r * w + 148])).sum::<f64>() / 192.0;
+        assert!(contrast > 0.85 * 10.0 * SIGMA as f64, "line contrast {contrast} of {}", 10.0 * SIGMA);
+    }
+
+    /// Isolated specks eight noise sigmas off do not protect themselves.
+    #[test]
+    fn isolated_specks_are_removed() {
+        let (w, h) = (256, 256);
+        let mut img = Rgb32f::filled(w, h, [0.05; 3]);
+        add_noise(&mut img, SIGMA, 7);
+        let specks: Vec<(usize, f32)> =
+            (0..40).map(|k| ((20 + (k % 8) * 28) + (20 + (k / 8) * 45) * w, if k % 2 == 0 { 8.0 } else { -8.0 } * SIGMA)).collect();
+        for &(i, d) in &specks {
+            img.data[i] = img.data[i].map(|v| v + d);
+        }
+        let o = y_of(&run(&img, 1.0, None));
+        let left = specks.iter().map(|&(i, d)| ((o[i] - 0.05) / d as f64).abs()).sum::<f64>() / specks.len() as f64;
+        assert!(left < 0.15, "{:.0} % of the specks left", 100.0 * left);
+    }
+
+    /// The luminance change is whole as long as some channel can take it, no channel goes below
+    /// `min(v, 0)`, and without a floor all channels change alike.
+    #[test]
+    fn add_luminance_keeps_the_change_and_the_floor() {
+        let y = |c: [f32; 3]| luminance_2020(c);
+        let c = [0.2, 0.3, 0.1];
+        assert_eq!(add_luminance(c, -0.05), c.map(|v| v - 0.05));
+        assert_eq!(add_luminance(c, 0.05), c.map(|v| v + 0.05));
+        for (c, dy) in [([0.001, 0.02, 0.04], -0.004), ([0.0, 0.01, -0.002], -0.003), ([0.005, 0.001, 0.03], -0.02)] {
+            let out = add_luminance(c, dy);
+            for k in 0..3 {
+                assert!(out[k] >= c[k].min(0.0) - 1e-7, "{c:?} {dy} -> {out:?}");
+            }
+            let room: f32 = (0..3).map(|k| (c[k] - c[k].min(0.0)) * lightcraft_color::LUMA_2020[k]).sum();
+            let want = dy.max(-room);
+            assert!((y(out) - y(c) - want).abs() < 1e-6, "{c:?} {dy} -> {out:?}: {} instead of {want}", y(out) - y(c));
+        }
+    }
+
+    /// Quality figures of the filter on synthetic scenes (noise σ 0.003 on Y 0.05 or 0.1):
+    /// `cargo test -p lightcraft-pipeline --release --lib nrl::tests::quality_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn quality_probe() {
+        let (w, h) = (256usize, 256usize);
+        let flat_clean = Rgb32f::filled(w, h, [0.05; 3]);
+        let mut flat = flat_clean.clone();
+        add_noise(&mut flat, SIGMA, 7);
+        let flat_stats = super::stats(std::slice::from_ref(&flat));
+        let amounts = [0.25f32, 0.5, 1.0];
+        // A: noise left at 1, 4 and 16 px
+        for a in amounts {
+            let out = run(&flat, a, None);
+            let (c, i, o) = (y_of(&flat_clean), y_of(&flat), y_of(&out));
+            let f: Vec<String> =
+                [1, 4, 16].iter().map(|&r| format!("{r}px {:5.1}%", 100.0 * rms_at(&o, &c, w, h, r) / rms_at(&i, &c, w, h, r))).collect();
+            eprintln!("A flat noise left, amount {a}: {}", f.join("  "));
+        }
+        // B: vertical lines (kept contrast: line mean minus the mean 20 px to either side)
+        for width in [1usize, 2, 4] {
+            for amp in [5.0f32, 10.0] {
+                let clean = Rgb32f::from_fn(w, h, |x, _| [0.05 + if (128..128 + width).contains(&x) { amp * SIGMA } else { 0.0 }; 3]);
+                let mut img = clean.clone();
+                add_noise(&mut img, SIGMA, 11);
+                let contrast = |im: &Rgb32f| {
+                    let y = y_of(im);
+                    let (mut l, mut b) = (0.0, 0.0);
+                    for r in 32..224 {
+                        for x in 128..128 + width {
+                            l += y[r * w + x];
+                        }
+                        b += 0.5 * (y[r * w + 108] + y[r * w + 128 + width + 20]) * width as f64;
+                    }
+                    (l - b) / (192 * width) as f64
+                };
+                let base = contrast(&clean);
+                let f: Vec<String> = amounts.iter().map(|&a| format!("{a}: {:5.1}%", 100.0 * contrast(&run(&img, a, None)) / base)).collect();
+                eprintln!("B line {width} px, {amp}σ, contrast kept: {}", f.join("  "));
+            }
+        }
+        // C: texture (product of sines, amplitude 0.01) with noise, own statistics and those of a flat noisy image
+        for period in [8.0f32, 16.0] {
+            let tex =
+                |x: usize, y: usize| 0.01 * (x as f32 * std::f32::consts::TAU / period).sin() * (y as f32 * std::f32::consts::TAU / period).sin();
+            let clean = Rgb32f::from_fn(w, h, |x, y| [0.1 + tex(x, y); 3]);
+            let mut img = clean.clone();
+            add_noise(&mut img, SIGMA, 13);
+            let t: Vec<f64> = (0..w * h).map(|i| tex(i % w, i / w) as f64).collect();
+            let tt: f64 = t.iter().map(|v| v * v).sum();
+            for (name, st) in [("own stats", None), ("flat stats", Some(&flat_stats))] {
+                let f: Vec<String> = amounts
+                    .iter()
+                    .map(|&a| {
+                        let o = y_of(&run(&img, a, st));
+                        let k = o.iter().zip(&t).map(|(o, t)| (o - 0.1) * t).sum::<f64>() / tt;
+                        let res = (o.iter().zip(&t).map(|(o, t)| (o - 0.1 - k * t).powi(2)).sum::<f64>() / o.len() as f64).sqrt();
+                        format!("{a}: texture {:5.1}% noise {:5.1}%", 100.0 * k, 100.0 * res / SIGMA as f64)
+                    })
+                    .collect();
+                eprintln!("C texture period {period}, {name}: {}", f.join("  "));
+            }
+        }
+        // D: isolated specks ±8σ on the flat noisy image
+        let specks: Vec<(usize, f32)> =
+            (0..40).map(|k| ((20 + (k % 8) * 28) + (20 + (k / 8) * 45) * w, if k % 2 == 0 { 8.0 } else { -8.0 } * SIGMA)).collect();
+        let mut sp = flat.clone();
+        for &(i, d) in &specks {
+            sp.data[i] = sp.data[i].map(|v| v + d);
+        }
+        let f: Vec<String> = amounts
+            .iter()
+            .map(|&a| {
+                let o = y_of(&run(&sp, a, Some(&flat_stats)));
+                let left = specks.iter().map(|&(i, d)| ((o[i] - 0.05) / d as f64).abs()).sum::<f64>() / specks.len() as f64;
+                format!("{a}: {:5.1}%", 100.0 * left)
+            })
+            .collect();
+        eprintln!("D specks ±8σ left: {}", f.join("  "));
+        // E: dark colour: chroma differences kept
+        for base in [[0.001f32, 0.02, 0.04], [0.0005, 0.004, 0.01]] {
+            let mut img = Rgb32f::filled(w, h, base);
+            add_noise(&mut img, SIGMA, 17);
+            let f: Vec<String> = amounts
+                .iter()
+                .map(|&a| {
+                    let out = run(&img, a, Some(&flat_stats));
+                    let dc = img
+                        .data
+                        .iter()
+                        .zip(&out.data)
+                        .map(|(a, b)| ((b[0] - b[1]) - (a[0] - a[1])).abs().max(((b[2] - b[1]) - (a[2] - a[1])).abs()))
+                        .fold(0f32, f32::max);
+                    let mean = |im: &Rgb32f| y_of(im).iter().sum::<f64>() / (w * h) as f64;
+                    format!("{a}: chroma Δ max {dc:.5}, Y mean {:+.2}%", 100.0 * (mean(&out) / mean(&img) - 1.0))
+                })
+                .collect();
+            eprintln!("E dark colour {base:?}: {}", f.join("  "));
+        }
     }
 }
-
