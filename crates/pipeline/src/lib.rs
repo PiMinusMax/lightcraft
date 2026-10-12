@@ -614,13 +614,14 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
         None => {
             // the image before the luminance NR: kept, so moving Luminance, Detail or Contrast does not
             // redo the colour NR
-            let pre = match cached.as_ref().and_then(|e| e.pre_lum.clone()).filter(|(k, _)| *k == plan.pre_key) {
-                Some((_, img)) => img,
+            // (with its luminance when the colour NR just made it)
+            let (pre, y) = match cached.as_ref().and_then(|e| e.pre_lum.clone()).filter(|(k, _)| *k == plan.pre_key) {
+                Some((_, img)) => (img, None),
                 None => {
                     let mut img = (*sampled).clone();
                     lin_cpu(&mut img, info, &plan);
-                    local::denoise_colour(&mut img, s, src_long, out_long);
-                    Arc::new(img)
+                    let y = local::denoise_colour(&mut img, s, src_long, out_long);
+                    (Arc::new(img), y)
                 }
             };
             let lin = if !local::wavelet_luminance_nr(s, src_long, out_long) && !local::late_clamp() {
@@ -631,7 +632,7 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
                     None => lum_stats(src_img, info, &plan),
                 };
                 let mut img = (*pre).clone();
-                local::denoise_luminance(&mut img, s, src_long, out_long, stats.as_ref());
+                local::denoise_luminance(&mut img, s, src_long, out_long, stats.as_ref(), y);
                 kept_stats = stats.map(|st| (plan.pre_key, st));
                 Arc::new(img)
             };

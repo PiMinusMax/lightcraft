@@ -4,7 +4,7 @@
 //! at its boundaries; no nonnegative clamp or square-root bias correction is involved.
 
 use lightcraft_color::luminance_2020;
-use lightcraft_raster::{Rgb32f, blur::gaussian, resample::Filter};
+use lightcraft_raster::{Plane, Rgb32f, blur::gaussian, resample::Filter};
 
 use crate::{
     for_rows,
@@ -528,16 +528,39 @@ fn despeck(img: &mut Rgb32f, noise: &JointNoise, brake: SpeckBrake) {
     }
 }
 
-pub(crate) fn denoise(img: &mut Rgb32f, params: &NrcParams, detail: f32, amount: f32) {
+/// Joint colour NR of `img` in place; with `want_y`, also the luminance (`luminance_2020`) of the result,
+/// computed row by row as each row is written (the luminance NR's input, without another pass).
+/// `None` when nothing was done or `want_y` is false.
+pub(crate) fn denoise(img: &mut Rgb32f, params: &NrcParams, detail: f32, amount: f32, want_y: bool) -> Option<Plane> {
     let step = std::env::var("NRV2_JOINT_STEP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1).clamp(1, 2);
     // Continuous ramp from zero; from the ordinary default Color=25 onward the spatial
     // scale controls the extra smoothing. Noise calibration and edge decisions stay fixed.
-    denoise_grid(img, params, step, detail, strength(amount), speck_brake(amount));
+    denoise_grid_y(img, params, step, detail, strength(amount), speck_brake(amount), want_y)
 }
 
+#[cfg(test)]
 fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, strength: f32, brake: SpeckBrake) {
+    denoise_grid_y(img, params, step, detail, strength, brake, false);
+}
+
+/// Each row of `img` through `f`, and with `y` the row's luminance after it.
+fn rows_with_y(img: &mut Rgb32f, y: Option<&mut Plane>, f: impl Fn(usize, &mut [[f32; 3]]) + Sync + Send) {
+    use rayon::prelude::*;
+    let w = img.width;
+    match y {
+        Some(y) => img.data.par_chunks_mut(w).zip(y.data.par_chunks_mut(w)).enumerate().for_each(|(r, (row, yrow))| {
+            f(r, row);
+            for (o, p) in yrow.iter_mut().zip(row.iter()) {
+                *o = luminance_2020(*p);
+            }
+        }),
+        None => for_rows(&mut img.data, w, f),
+    }
+}
+
+fn denoise_grid_y(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, strength: f32, brake: SpeckBrake, want_y: bool) -> Option<Plane> {
     if img.is_empty() || strength <= 0.0 {
-        return;
+        return None;
     }
     let start = crate::profiling().then(std::time::Instant::now);
     // A maximum 2x grid keeps colour boundaries visible even at high strength. The old grid
@@ -703,10 +726,10 @@ fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, 
     drop(scratch);
     drop(paths);
     drop(links);
+    let mut y_out = want_y.then(|| Plane::new(img.width, img.height));
     match &original {
         None => {
-            let fw = img.width;
-            for_rows(&mut img.data, fw, |y, row| {
+            rows_with_y(img, y_out.as_mut(), |y, row| {
                 for (x, p) in row.iter_mut().enumerate() {
                     let Some(&q) = filtered.data.get(y * w + x) else { continue };
                     let result = rgb2(luminance_2020(*p), q);
@@ -728,8 +751,7 @@ fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, 
             use lightcraft_raster::resample::weights;
             let ux = weights(w, img.width, Filter::Bilinear);
             let uy = weights(h, img.height, Filter::Bilinear);
-            let ow = img.width;
-            for_rows(&mut img.data, ow, |y, row| {
+            rows_with_y(img, y_out.as_mut(), |y, row| {
                 let Some((y0, wy)) = uy.get(y) else { return };
                 for (x, p) in row.iter_mut().enumerate() {
                     let Some((x0, wx)) = ux.get(x) else { continue };
@@ -756,6 +778,7 @@ fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, 
     if let Some(start) = start {
         eprintln!("    nr joint: {:.1} ms", start.elapsed().as_secs_f64() * 1e3);
     }
+    y_out
 }
 
 #[cfg(test)]
@@ -1079,6 +1102,22 @@ mod tests {
     }
 
     /// `distance_run` (planes, no branches) gives `distance` bit for bit.
+    /// The luminance the joint NR hands to the luminance NR is that of its result, bit for bit, on the
+    /// full grid and on the 2× grid (the two reconstructions).
+    #[test]
+    fn handed_luminance_is_the_results() {
+        let clean = Rgb32f::from_fn(96, 64, |x, y| [0.02 + 0.001 * x as f32, 0.03, 0.01 + 0.002 * y as f32]);
+        for step in [1usize, 2] {
+            let mut img = noisy(&clean, 0x2545_f491_4f6c_dd1d, 0.006);
+            let mut plain = img.clone();
+            let y = denoise_grid_y(&mut img, &params(step), step, 0.5, 1.0, speck_brake(1.0), true);
+            denoise_grid(&mut plain, &params(step), step, 0.5, 1.0, speck_brake(1.0));
+            assert!(img.data == plain.data, "step {step}: the image changed");
+            let y = y.expect("luminance");
+            assert!(y.data.iter().zip(&img.data).all(|(a, p)| a.to_bits() == luminance_2020(*p).to_bits()), "step {step}");
+        }
+    }
+
     #[test]
     fn distance_run_matches_distance() {
         let clean = Rgb32f::from_fn(64, 3, |x, _| [0.002 * x as f32, 0.01, 0.03 - 0.0004 * x as f32]);

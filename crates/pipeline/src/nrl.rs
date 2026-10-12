@@ -302,10 +302,15 @@ pub fn tiles(full_w: usize, full_h: usize) -> Vec<crate::PixelWindow> {
     (0..GRID * GRID).map(|k| crate::PixelWindow { x: at(full_w, k % GRID), y: at(full_h, k / GRID), w: TILE, h: TILE }).collect()
 }
 
+/// Y of linear RGB (in parallel).
+fn luminance_of(img: &Rgb32f) -> Plane {
+    img.map(luminance_2020)
+}
+
 /// Brightness for the noise level: the second smoothing (a few px), so each side of an edge keeps
 /// its own level.
 fn levels_of(img: &Rgb32f) -> (Plane, Plane, Plane) {
-    let y = Plane { width: img.width, height: img.height, data: img.data.iter().map(|&c| luminance_2020(c)).collect() };
+    let y = luminance_of(img);
     let c1 = smooth(&y, 0);
     let c2 = smooth(&c1, 1);
     (y, c1, c2)
@@ -487,6 +492,12 @@ fn add_luminance(c: [f32; 3], dy: f32) -> [f32; 3] {
 /// Luminance noise reduction of linear RGB in place, with `stats` of the whole frame (`None`:
 /// measured on `img`).
 pub fn denoise(img: &mut Rgb32f, p: &Params, stats: Option<&Stats>) {
+    denoise_y(img, p, stats, None);
+}
+
+/// [`denoise`] with the luminance `y` of `img` when the caller has it (the colour NR makes it as it
+/// writes; the same values as computed here).
+pub fn denoise_y(img: &mut Rgb32f, p: &Params, stats: Option<&Stats>, y: Option<Plane>) {
     if img.width < 8 || img.height < 8 || p.amount <= 0.0 {
         return;
     }
@@ -508,7 +519,9 @@ pub fn denoise(img: &mut Rgb32f, p: &Params, stats: Option<&Stats>) {
     };
     lap("stats", &mut tt);
     let (w, h) = (img.width, img.height);
-    let (y, c1, c2) = levels_of(img);
+    let y = y.filter(|y| (y.width, y.height) == (w, h)).unwrap_or_else(|| luminance_of(img));
+    let c1 = smooth(&y, 0);
+    let c2 = smooth(&c1, 1);
     let var = c2.map(|v| noise.var(0, v));
     lap("y, c1, c2, var", &mut tt);
     // the change of Y: minus the part of each level the shrinking removes

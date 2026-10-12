@@ -162,8 +162,8 @@ pub fn nr_params(s: &DevelopSettings, src_long: usize, out_long: usize) -> (Opti
 /// Radii scale with how much the source was downsampled (preview noise is already averaged out).
 /// `lum_stats`: the statistics of the wavelet luminance NR from the whole frame (`None`: from `img`).
 pub fn denoise(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long: usize, lum_stats: Option<&crate::nrl::Stats>) {
-    denoise_colour(img, s, src_long, out_long);
-    denoise_luminance(img, s, src_long, out_long, lum_stats);
+    let y = denoise_colour(img, s, src_long, out_long);
+    denoise_luminance(img, s, src_long, out_long, lum_stats, y);
 }
 
 /// Whether the luminance NR runs as the wavelet filter after the colour NR ([`denoise_luminance`])
@@ -174,8 +174,9 @@ pub fn wavelet_luminance_nr(s: &DevelopSettings, src_long: usize, out_long: usiz
 
 /// The first part of [`denoise`]: everything but the wavelet luminance NR. Its result does not depend
 /// on Luminance, Detail and Contrast when [`wavelet_luminance_nr`] holds, so a render can keep it while
-/// those sliders move.
-pub fn denoise_colour(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long: usize) {
+/// those sliders move. When the joint colour NR ran and the wavelet luminance NR follows, the luminance
+/// of the result (that NR's input, made as the colour NR writes each row).
+pub fn denoise_colour(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long: usize) -> Option<Plane> {
     let (lum, col) = nr_params(s, src_long, out_long);
     let w = img.width;
     // PROTOTYPE (#1129): the wavelet luminance NR runs after the colour NR, which leaves Y unchanged.
@@ -197,7 +198,7 @@ pub fn denoise_colour(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, ou
         }
     }
     if col.is_some() && nr_v2_enabled() {
-        color_nr_v2(img, s, src_long, out_long);
+        return color_nr_v2_y(img, s, src_long, out_long, new_lum);
     } else if let Some(nr) = col {
         let _t = crate::profiling().then(std::time::Instant::now);
         let chroma = img.map(|c| {
@@ -218,10 +219,19 @@ pub fn denoise_colour(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, ou
             eprintln!("    nr colour: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
         }
     }
+    None
 }
 
 /// The second part of [`denoise`]: the wavelet luminance NR (when [`wavelet_luminance_nr`]).
-pub fn denoise_luminance(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long: usize, lum_stats: Option<&crate::nrl::Stats>) {
+/// `y`: the luminance of `img` when the caller has it ([`denoise_colour`]'s result), else it is computed.
+pub fn denoise_luminance(
+    img: &mut Rgb32f,
+    s: &DevelopSettings,
+    src_long: usize,
+    out_long: usize,
+    lum_stats: Option<&crate::nrl::Stats>,
+    y: Option<Plane>,
+) {
     if wavelet_luminance_nr(s, src_long, out_long) {
         let d = &s.detail;
         let p = crate::nrl::Params {
@@ -229,7 +239,7 @@ pub fn denoise_luminance(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize,
             detail: (d.nr_detail / 100.0) as f32,
             contrast: (d.nr_contrast / 100.0) as f32,
         };
-        crate::nrl::denoise(img, &p, lum_stats);
+        crate::nrl::denoise_y(img, &p, lum_stats, y);
     }
     if late_clamp() {
         img.data.iter_mut().for_each(|c| *c = c.map(|v| v.max(0.0)));
@@ -643,11 +653,16 @@ fn nrc_row(src: &[[f32; 3]], y: usize, ups: &[NrcUp], off: f32, s: &mut NrcScrat
 /// the image (its chroma after the earlier passes, recomputed per row), and the last step applies
 /// every pass and recombines a row at a time.
 pub fn color_nr_v2(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long: usize) {
+    color_nr_v2_y(img, s, src_long, out_long, false);
+}
+
+/// [`color_nr_v2`], with `want_y` also the luminance of the result when the joint NR made it (see
+/// `nrc_joint::denoise`).
+pub fn color_nr_v2_y(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long: usize, want_y: bool) -> Option<Plane> {
     use lightcraft_raster::resample::{Filter, weights};
-    let Some(p) = nrc_params(s, src_long, out_long) else { return };
+    let p = nrc_params(s, src_long, out_long)?;
     if nrc_joint_enabled() {
-        crate::nrc_joint::denoise(img, &p, (s.detail.nr_color_detail / 100.0) as f32, (s.detail.nr_color / 100.0) as f32);
-        return;
+        return crate::nrc_joint::denoise(img, &p, (s.detail.nr_color_detail / 100.0) as f32, (s.detail.nr_color / 100.0) as f32, want_y);
     }
     let _t = crate::profiling().then(std::time::Instant::now);
     let (w, h) = (img.width, img.height);
@@ -717,6 +732,7 @@ pub fn color_nr_v2(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_l
     if let Some(t) = _t {
         eprintln!("    nr colour v2: {:.1} ms ({:?})", t.elapsed().as_secs_f64() * 1e3, p.passes.iter().map(|q| q.sigma).collect::<Vec<_>>());
     }
+    None
 }
 
 pub fn log_lum(c: [f32; 3]) -> f32 {
