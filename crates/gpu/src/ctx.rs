@@ -79,6 +79,11 @@ const MODULES: &[Module] = &[
         ],
     },
     Module {
+        src: include_str!("wgsl/nrl.wgsl"),
+        bindings: &[("a", false, "f32"), ("b", false, "f32"), ("c", false, "f32"), ("dst", true, "f32")],
+        entries: &["nrl_y", "nrl_smooth_h", "nrl_smooth_v", "nrl_var", "nrl_detail", "nrl_fine", "nrl_sq", "nrl_coarse", "nrl_apply"],
+    },
+    Module {
         src: include_str!("wgsl/mask.wgsl"),
         bindings: &[("img", false, "f32"), ("log_l", false, "f32"), ("aux", false, "f32"), ("c", true, "f32"), ("alpha", true, "f32")],
         entries: &["shape", "combine", "finalize"],

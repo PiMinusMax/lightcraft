@@ -215,6 +215,17 @@ fn cases() -> Vec<(&'static str, Edit)> {
             s.detail.nr_color = 60.0;
             s.detail.nr_color_smoothness = 50.0;
         }),
+        // the wavelet luminance NR at its extremes (Detail 0 smooths the fine levels most, Contrast 100 keeps
+        // the coarse ones)
+        ("luminance NR 100, detail 0", |s| {
+            s.detail.nr_luminance = 100.0;
+            s.detail.nr_detail = 0.0;
+        }),
+        ("luminance NR 100, contrast 100", |s| {
+            s.detail.nr_luminance = 100.0;
+            s.detail.nr_detail = 100.0;
+            s.detail.nr_contrast = 100.0;
+        }),
         ("crop + straighten + flip", |s| {
             s.crop.geometry.rect = Rect::new(0.1, 0.05, 0.85, 0.9);
             s.crop.geometry.angle = 7.5;

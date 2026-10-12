@@ -16,7 +16,7 @@ use crate::{for_rows, nrc_joint::JointNoise};
 /// Detail levels (holes 1, 2, 4, 8, 16 px).
 pub const LEVELS: usize = 5;
 /// Levels with a robust (median) local energy; coarser levels average.
-const ROBUST_LEVELS: usize = 2;
+pub const ROBUST_LEVELS: usize = 2;
 
 /// The sliders, 0–1.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -32,7 +32,7 @@ pub fn enabled() -> bool {
 }
 
 /// Gaussian window of the local energy of coarse level `j` (px).
-fn energy_sigma(j: usize) -> f32 {
+pub fn energy_sigma(j: usize) -> f32 {
     (2.0 * (1u32 << j) as f32 + 1.0) / 12f32.sqrt()
 }
 
@@ -110,7 +110,7 @@ fn smooth(src: &Plane, j: usize) -> Plane {
 
 /// `E[max(min(|a|, |b|))²] / E[d²]` over the eight directions for the noise of the two fine levels
 /// (white noise through the wavelet; test `directional_energy_is_calibrated`).
-const DIRECTIONAL_MEAN_SQUARE: f32 = 1.977;
+pub const DIRECTIONAL_MEAN_SQUARE: f32 = 1.977;
 
 /// The directions of the fine-level energy as steps in half the level's reach: horizontal, vertical,
 /// both diagonals and the four angles between (a line one pixel aside every two rows).
@@ -314,6 +314,12 @@ fn levels_of(img: &Rgb32f) -> (Plane, Plane, Plane) {
 /// `E[d_j²] / σ²` of white noise on level `j`: the energy of the level's impulse response.
 const WHITE_GAINS: [f32; LEVELS] = [0.793_518, 0.040_266, 0.007_311_5, 0.001_698_9, 0.000_417_18];
 
+/// The most a level's noise energy, relative to white noise, exceeds the next finer level's (see
+/// `stats`). Measured on full-size raws (cat ISO 25600, candle ISO 3200): 1.1–2.1 from level to level,
+/// 2.5–3 to the coarsest, where content may already count; on a 1920 px preview of the cat 12–36, which is
+/// content only.
+const MAX_LEVEL_STEP: f32 = 2.0;
+
 /// Side of the blocks level `j`'s energy is measured in (px): enough samples of the level's grain.
 fn block(j: usize) -> usize {
     16 << j.saturating_sub(1)
@@ -344,8 +350,9 @@ fn floor_of(v: &mut [f32]) -> Option<f32> {
 /// blocks (`floor_of`); each level's gain is the floor of its blocks' energy over the model.
 /// Texture and edges only raise a block, so the estimate follows the flattest blocks wherever
 /// they are. Noise that is smooth (demosaicing) has relatively more energy on coarser levels than
-/// white noise, never less; a level with relatively more than all coarser ones carries texture
-/// of its scale (an image covered by it has no flat blocks) and is lowered to them.
+/// white noise, never less, but not much more from one level to the next (`MAX_LEVEL_STEP`); a level
+/// with relatively more than all coarser ones carries texture of its scale (an image covered by it
+/// has no flat blocks) and is lowered to them.
 pub fn stats(tiles: &[Rgb32f]) -> Stats {
     let mut blocks: [Vec<(f32, f32)>; LEVELS] = std::array::from_fn(|_| Vec::new());
     for t in tiles.iter().filter(|t| t.width >= 16 && t.height >= 16) {
@@ -385,6 +392,11 @@ pub fn stats(tiles: &[Rgb32f]) -> Stats {
         let mut r: Vec<f32> = blocks[j].iter().map(|&(y, e)| e / noise.var(0, y)).collect();
         let white = if j == 0 { 1.0 } else { gains[0] / WHITE_GAINS[0] };
         gains[j] = floor_of(&mut r).unwrap_or(white * WHITE_GAINS[j]).max(0.0);
+    }
+    // relative to white noise, noise grows by at most MAX_LEVEL_STEP from a level to the next coarser one;
+    // more is content (a small frame has few flat blocks at the coarse scales)
+    for j in 1..LEVELS {
+        gains[j] = gains[j].min(MAX_LEVEL_STEP * gains[j - 1] * WHITE_GAINS[j] / WHITE_GAINS[j - 1]);
     }
     for j in (0..LEVELS - 1).rev() {
         gains[j] = gains[j].min(gains[j + 1] * WHITE_GAINS[j] / WHITE_GAINS[j + 1]);
@@ -797,8 +809,8 @@ mod tests {
     }
 
     /// Texture over the whole frame (no flat area) must not be taken for noise: each level's noise
-    /// energy as on a flat frame with the same noise. (Not yet for texture of the coarsest levels'
-    /// scale everywhere, e.g. period 32 px: no coarser level is free of it.)
+    /// energy as on a flat frame with the same noise. Texture of the coarsest levels' scale everywhere
+    /// (period 32 px) can only be bounded: at most `MAX_LEVEL_STEP` more per level.
     #[test]
     fn texture_is_not_taken_for_noise() {
         let (w, h) = (512usize, 512usize);
@@ -810,14 +822,16 @@ mod tests {
             let white = WHITE_GAINS[j] * SIGMA * SIGMA;
             assert!(energy(&reference, j) > 0.7 * white && energy(&reference, j) < 1.3 * white, "flat level {j}");
         }
-        for period in [8.0f32, 16.0] {
+        for period in [8.0f32, 16.0, 32.0] {
             let f = std::f32::consts::TAU / period;
             let mut img = Rgb32f::from_fn(w, h, |x, y| [0.1 + 0.01 * (x as f32 * f).sin() * (y as f32 * f).sin(); 3]);
             add_noise(&mut img, SIGMA, 13);
             let st = super::stats(std::slice::from_ref(&img));
             for j in 0..LEVELS {
                 let r = energy(&st, j) / energy(&reference, j);
-                assert!(r > 0.8 && r < 1.25, "period {period}, level {j}: {r}");
+                // period 32: no coarser level is free of it, only the growth from level to level is bounded
+                let most = if period < 32.0 { 1.25 } else { 1.25 * MAX_LEVEL_STEP.powi(j as i32) };
+                assert!(r > 0.8 && r < most, "period {period}, level {j}: {r}");
             }
         }
     }

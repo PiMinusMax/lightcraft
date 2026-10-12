@@ -356,3 +356,26 @@ fn auto_mask_strokes_match_the_whole_render() {
     };
     check_noisy("auto mask", &s, PixelWindow { x: 400, y: 300, w: 300, h: 250 }, 2, 0.1);
 }
+
+/// Sampling many windows at once (the luminance NR's statistics tiles) gives each window's own
+/// sampling bit for bit, with the source oriented and prefiltered (downscaled) once.
+#[test]
+fn sampling_windows_at_once_matches_each_window() {
+    let src = lightcraft_scenes::demo_library()[0].render(1200, 800);
+    for o in [Orientation::Normal, Orientation::Rotate90] {
+        let mut s = DevelopSettings { orientation: o, ..Default::default() };
+        s.crop.geometry.rect = Rect::new(0.05, 0.1, 0.9, 0.95);
+        s.crop.geometry.angle = 3.0;
+        let plan = crate::plan(&src, &SourceInfo::default(), &s, &RenderRequest::fit(500, 500));
+        let (frame, fw, fh) = &plan.full;
+        let wins: Vec<PixelWindow> = [(0, 0, 64, 48), (100, 37, 128, 128), (*fw - 50, *fh - 40, 50, 40), (0, 0, *fw, *fh)]
+            .iter()
+            .map(|&(x, y, w, h)| PixelWindow { x, y, w, h })
+            .collect();
+        let together = frame.sample_windows(&src, *fw, *fh, &wins);
+        for (win, t) in wins.iter().zip(&together) {
+            let f = if (win.w, win.h) == (*fw, *fh) { frame.clone() } else { frame.window(*fw, *fh, *win) };
+            assert!(f.sample(&src, win.w, win.h).data == t.data, "{o:?} {win:?}");
+        }
+    }
+}

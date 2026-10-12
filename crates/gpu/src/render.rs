@@ -8,7 +8,7 @@ use lightcraft_develop::DevelopSettings;
 use lightcraft_geom::Orientation;
 use lightcraft_pipeline::finish::{FinishParams, MASK_TERMS, mask_terms};
 use lightcraft_pipeline::geometry::SampleMode;
-use lightcraft_pipeline::{Plan, RenderRequest, Rendered, SourceInfo, local};
+use lightcraft_pipeline::{Plan, RenderRequest, Rendered, SourceInfo, local, nrl};
 use lightcraft_raster::resample::Filter;
 use lightcraft_raster::{Histogram, Plane, Rgb32f, Rgba8};
 
@@ -32,6 +32,8 @@ struct Entry {
     geo: u64,
     sampled: Arc<Buf>,
     lin: Option<(u64, Arc<Buf>)>,
+    /// The linear image before the wavelet luminance NR (`Plan::pre_key`; see the CPU's stage cache).
+    pre_lum: Option<(u64, Arc<Buf>)>,
     planes: Planes,
 }
 
@@ -96,7 +98,7 @@ impl GpuStages {
         };
         for e in self.lock().iter() {
             add(&e.sampled);
-            if let Some((_, b)) = &e.lin {
+            for (_, b) in e.lin.iter().chain(&e.pre_lum) {
                 add(b);
             }
             let p = &e.planes;
@@ -614,9 +616,28 @@ pub fn render(
     lap("sample", &mut t, &mut cx);
 
     // 2. white balance, defringe, spots, noise reduction
+    let out_long = plan.frame.output_long(w, h);
+    let mut pre_lum = None;
     let lin = match cached.as_ref().and_then(|e| e.lin.clone()).filter(|(k, _)| *k == plan.lin_key) {
         Some((_, b)) => b,
-        None => Arc::new(linear(&mut cx, &sampled, info, &plan, &mut host)),
+        None => {
+            // the image before the luminance NR, kept so its sliders skip the colour NR (as on the CPU)
+            let pre = match cached.as_ref().and_then(|e| e.pre_lum.clone()).filter(|(k, _)| *k == plan.pre_key) {
+                Some((_, b)) => b,
+                None => Arc::new(linear(&mut cx, &sampled, info, &plan, &mut host)),
+            };
+            let wavelet = local::wavelet_luminance_nr(s, plan.src_long, out_long);
+            let lin = if wavelet || local::late_clamp() {
+                let stats = if wavelet { lightcraft_pipeline::lum_stats(src, info, &plan) } else { None };
+                Arc::new(luminance_nr(&mut cx, &pre, w, h, s, stats.as_ref()))
+            } else {
+                pre.clone()
+            };
+            if stages.is_some() && n <= lightcraft_pipeline::PRE_LUM_MAX_PIXELS {
+                pre_lum = Some((plan.pre_key, pre));
+            }
+            lin
+        }
     };
     lap("wb/nr", &mut t, &mut cx);
 
@@ -632,7 +653,7 @@ pub fn render(
     }
     lap("planes", &mut t, &mut cx);
     if let Some(c) = stages {
-        c.put(Entry { src: src.clone(), geo: plan.geo, sampled, lin: Some((plan.lin_key, lin.clone())), planes });
+        c.put(Entry { src: src.clone(), geo: plan.geo, sampled, lin: Some((plan.lin_key, lin.clone())), pre_lum, planes });
     }
 
     // 4. masks
@@ -769,13 +790,14 @@ fn linear(cx: &mut Cx<'_>, sampled: &Buf, info: &SourceInfo, plan: &Plan<'_>, ho
     denoise(cx, img, plan)
 }
 
-/// Noise reduction (`local::denoise`).
+/// Noise reduction up to the wavelet luminance NR (`local::denoise_colour`; that one is [`luminance_nr`]).
 fn denoise(cx: &mut Cx<'_>, img: Buf, plan: &Plan<'_>) -> Buf {
     let (w, h) = (plan.w, plan.h);
     let n = w * h;
     let (lum, col) = local::nr_params(&plan.settings, plan.src_long, plan.frame.output_long(w, h));
     let mut img = img;
-    if let Some(nr) = lum {
+    // PROTOTYPE (#1129): the old luminance filter only without the wavelet one
+    if let Some(nr) = lum.filter(|_| !lightcraft_pipeline::nrl::enabled()) {
         let l = cx.gpu.buffer(n);
         map(cx, "log_lum_k", n, &[], [Some(&img), None, None], &l);
         let f = guided(cx, &l, w, h, nr.sigma, nr.eps);
@@ -814,6 +836,71 @@ fn denoise(cx: &mut Cx<'_>, img: Buf, plan: &Plan<'_>) -> Buf {
         img = out;
     }
     img
+}
+
+/// `nrl::smooth` of a plane: the B3 kernel with holes `2^j`, mirrored at the borders.
+fn nrl_smooth(cx: &mut Cx<'_>, src: &Buf, w: usize, h: usize, j: usize) -> Buf {
+    let p = [w as u32, h as u32, 1u32 << j];
+    let tmp = cx.gpu.buffer(w * h);
+    cx.run("nrl_smooth_h", &p, &[Some(src), None, None, Some(&tmp)], groups2(w, h, [16, 16]));
+    let out = cx.gpu.buffer(w * h);
+    cx.run("nrl_smooth_v", &p, &[Some(&tmp), None, None, Some(&out)], groups2(w, h, [16, 16]));
+    out
+}
+
+/// The wavelet luminance noise reduction (`local::denoise_luminance`, `lightcraft_pipeline::nrl::denoise`)
+/// of `img`, with the whole frame's `stats` (measured on the CPU, `lightcraft_pipeline::lum_stats`). The
+/// same steps as the CPU: Y and its à trous levels, each level's detail formed in place of the finer
+/// approximation and shrunk into the change of Y, which is then added to R, G and B.
+fn luminance_nr(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, s: &DevelopSettings, stats: Option<&nrl::Stats>) -> Buf {
+    let n = w * h;
+    let late = local::late_clamp() as u32;
+    let d = &s.detail;
+    let p = nrl::Params { amount: (d.nr_luminance / 100.0) as f32, detail: (d.nr_detail / 100.0) as f32, contrast: (d.nr_contrast / 100.0) as f32 };
+    let change = cx.zeroed(n);
+    let out = cx.gpu.buffer(n * 3);
+    let Some(stats) = stats.filter(|_| w >= 8 && h >= 8 && p.amount > 0.0) else {
+        // nothing to reduce: only the experiment's clamp
+        map(cx, "nrl_apply", n, &[late], [Some(img), Some(&change), None], &out);
+        return out;
+    };
+    let started = profiling().then(std::time::Instant::now);
+    let y = cx.gpu.buffer(n);
+    map(cx, "nrl_y", n, &[], [Some(img), None, None], &y);
+    let c1 = nrl_smooth(cx, &y, w, h, 0);
+    let c2 = nrl_smooth(cx, &c1, w, h, 1);
+    let var = cx.gpu.buffer(n);
+    let m = &stats.noise.model;
+    map(cx, "nrl_var", n, &[m.alpha[0].to_bits(), m.beta[0].to_bits(), stats.noise.ymax[0].to_bits()], [Some(&c2), None, None], &var);
+    let mut cur = y;
+    let mut ahead = [Some(c1), Some(c2)];
+    for (j, gain) in stats.gains.iter().enumerate() {
+        let next = match ahead.get_mut(j).and_then(Option::take) {
+            Some(b) => b,
+            None => nrl_smooth(cx, &cur, w, h, j),
+        };
+        map(cx, "nrl_detail", n, &[], [Some(&next), None, None], &cur);
+        let t = nrl::threshold(&p, j);
+        let k = t * t * gain;
+        if j < nrl::ROBUST_LEVELS {
+            let q = [w as u32, h as u32, 1u32 << j, k.to_bits(), nrl::DIRECTIONAL_MEAN_SQUARE.to_bits()];
+            cx.run("nrl_fine", &q, &[Some(&cur), Some(&var), None, Some(&change)], groups2(w, h, [16, 16]));
+        } else {
+            let sq = cx.gpu.buffer(n);
+            map(cx, "nrl_sq", n, &[], [Some(&cur), None, None], &sq);
+            let e = gaussian(cx, &sq, w, h, 1, nrl::energy_sigma(j));
+            drop(sq);
+            map(cx, "nrl_coarse", n, &[k.to_bits()], [Some(&cur), Some(&var), Some(&e)], &change);
+        }
+        cur = next;
+    }
+    drop((cur, var));
+    map(cx, "nrl_apply", n, &[late], [Some(img), Some(&change), None], &out);
+    if let Some(t) = started {
+        cx.sync();
+        eprintln!("  gpu nr luminance (wavelet): {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+    }
+    out
 }
 
 /// The new colour noise reduction (`local::color_nr_v2`). The image's chroma is never stored at

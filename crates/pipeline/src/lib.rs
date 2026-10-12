@@ -345,7 +345,7 @@ struct CacheEntry {
 
 /// Largest image whose state before the luminance NR the stage cache keeps (12 bytes a pixel: 8 MP
 /// ≈ 100 MB), so a preview's sliders skip the colour NR while a full-size export does not hold a copy.
-const PRE_LUM_MAX_PIXELS: usize = 8 << 20;
+pub const PRE_LUM_MAX_PIXELS: usize = 8 << 20;
 
 fn hash_of(parts: impl std::hash::Hash) -> u64 {
     use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
@@ -489,11 +489,14 @@ pub fn lum_stats(src: &Rgb32f, info: &SourceInfo, p: &Plan<'_>) -> Option<nrl::S
     }
     let t = profiling().then(std::time::Instant::now);
     let (full, fw, fh) = &p.full;
-    let tiles: Vec<Rgb32f> = nrl::tiles(*fw, *fh)
+    let windows = nrl::tiles(*fw, *fh);
+    // the source oriented and prefiltered once for all tiles
+    let sampled = full.sample_windows(src, *fw, *fh, &windows);
+    let tiles: Vec<Rgb32f> = windows
         .into_iter()
-        .map(|t| {
+        .zip(sampled)
+        .map(|(t, mut img)| {
             let frame = if (t.w, t.h) == (*fw, *fh) { full.clone() } else { full.window(*fw, *fh, t) };
-            let mut img = frame.sample(src, t.w, t.h);
             let tile = Plan {
                 settings: Cow::Borrowed(s),
                 frame,
