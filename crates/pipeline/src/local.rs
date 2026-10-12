@@ -59,7 +59,7 @@ fn wb_gain(img: &mut Rgb32f, info: &SourceInfo, s: &DevelopSettings, gain: f32) 
                     m[2][0] * c[0] + m[2][1] * c[1] + m[2][2] * c[2],
                 ];
             }
-            *p = [(c[0] * gain).max(0.0), (c[1] * gain).max(0.0), (c[2] * gain).max(0.0)];
+            *p = if late_clamp() { c.map(|v| v * gain) } else { [(c[0] * gain).max(0.0), (c[1] * gain).max(0.0), (c[2] * gain).max(0.0)] };
         }
     });
 }
@@ -213,6 +213,15 @@ pub fn denoise(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long:
         };
         crate::nrl::denoise(img, &p, lum_stats);
     }
+    if late_clamp() {
+        img.data.iter_mut().for_each(|c| *c = c.map(|v| v.max(0.0)));
+    }
+}
+
+/// EXPERIMENT (#1129): negative values are kept until after the noise reduction (`LIGHTCRAFT_LATE_CLAMP=1`).
+pub fn late_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LIGHTCRAFT_LATE_CLAMP").is_ok_and(|v| v == "1"))
 }
 
 // PROTOTYPE (tuning knobs via env while the method is worked out)
