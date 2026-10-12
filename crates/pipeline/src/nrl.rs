@@ -1,7 +1,8 @@
 //! Luminance noise reduction (prototype for #1129). An à trous wavelet of linear Y; each detail level
-//! is shrunk against the brightness-dependent noise model of the colour NR (the same samples and fit,
-//! channel Y), and the change of Y is added to R, G and B alike. Adding instead of scaling keeps the
-//! chroma and lets black or negative pixels move. The shrinking is odd in each coefficient, so
+//! is shrunk against a brightness-dependent noise model of Y measured on the frame's flattest blocks
+//! ([`stats`]), and the change of Y is added to R, G and B alike. Adding instead of scaling keeps the
+//! chroma (except where a channel reaches its floor, see `add_luminance`) and lets black or negative
+//! pixels move. The shrinking is odd in each coefficient, so
 //! symmetric noise keeps its mean; nothing of the removed part is put back.
 //!
 //! Amount sets the threshold (in noise sigmas of the level), Detail lowers it on the two fine levels,
@@ -10,10 +11,7 @@
 use lightcraft_color::luminance_2020;
 use lightcraft_raster::{Plane, Rgb32f, blur::gaussian};
 
-use crate::{
-    for_rows,
-    nrc_joint::{JointNoise, noise_from_samples, noise_samples_of, yuv},
-};
+use crate::{for_rows, nrc_joint::JointNoise};
 
 /// Detail levels (holes 1, 2, 4, 8, 16 px).
 pub const LEVELS: usize = 5;
@@ -176,53 +174,123 @@ fn levels_of(img: &Rgb32f) -> (Plane, Plane, Plane) {
     (y, c1, c2)
 }
 
+/// `E[d_j²] / σ²` of white noise on level `j`: the energy of the level's impulse response.
+const WHITE_GAINS: [f32; LEVELS] = [0.793_518, 0.040_266, 0.007_311_5, 0.001_698_9, 0.000_417_18];
+
+/// Side of the blocks level `j`'s energy is measured in (px): enough samples of the level's grain.
+fn block(j: usize) -> usize {
+    16 << j.saturating_sub(1)
+}
+
+/// The location of the noise-only part of `v`, from its low tail: the 25 % quantile plus its distance
+/// to the 10 % quantile scaled as for a normal distribution (texture and edges only raise values, so
+/// a quarter of noise-only samples suffices). Low rather than high where the tail is skewed.
+fn floor_of(v: &mut [f32]) -> Option<f32> {
+    if v.len() < 8 {
+        return None;
+    }
+    v.sort_unstable_by(f32::total_cmp);
+    let q = |p: f32| {
+        let x = p * (v.len() - 1) as f32;
+        let (i, f) = (x.floor() as usize, x.fract());
+        let lo = v.get(i).copied().unwrap_or(0.0);
+        lo + f * (v.get(i + 1).copied().unwrap_or(lo) - lo)
+    };
+    let (q10, q25) = (q(0.10), q(0.25));
+    Some(q25 + 0.6745 * (q25 - q10) / 0.6076)
+}
+
 /// The noise model and level gains of `tiles` (white-balanced linear RGB at output scale).
 ///
-/// Level gain: `d_j² / var(c2)` at the noise samples, median per brightness band (16 bands), the
-/// 30 % quantile of the bands. Texture only raises some bands; the quantile follows the flat ones.
+/// Each level's mean square is measured in blocks (`block`) with their mean Y. The model of Y
+/// (`α·Y + β`) is fitted to level 0 per brightness band, each band at the noise floor of its
+/// blocks (`floor_of`); each level's gain is the floor of its blocks' energy over the model.
+/// Texture and edges only raise a block, so the estimate follows the flattest blocks wherever
+/// they are. Noise that is smooth (demosaicing) has relatively more energy on coarser levels than
+/// white noise, never less; a level with relatively more than all coarser ones carries texture
+/// of its scale (an image covered by it has no flat blocks) and is lowered to them.
 pub fn stats(tiles: &[Rgb32f]) -> Stats {
-    let tiles: Vec<&Rgb32f> = tiles.iter().filter(|t| t.width >= 8 && t.height >= 8).collect();
-    let stride = crate::nrc_joint::noise_sample_stride(tiles.iter().map(|t| t.len()).sum());
-    let samples = tiles.iter().flat_map(|t| noise_samples_of(t, stride, yuv)).collect();
-    let noise = noise_from_samples(samples);
-    // brightness and the detail of each level at every stride-th pixel of each tile
-    let mut bright: Vec<f32> = Vec::new();
-    let mut detail: [Vec<f32>; LEVELS] = std::array::from_fn(|_| Vec::new());
-    for t in &tiles {
+    let mut blocks: [Vec<(f32, f32)>; LEVELS] = std::array::from_fn(|_| Vec::new());
+    for t in tiles.iter().filter(|t| t.width >= 16 && t.height >= 16) {
         let (y, c1, c2) = levels_of(t);
-        let idx: Vec<usize> = (0..t.len()).step_by(stride.max(1)).collect();
-        bright.extend(idx.iter().map(|&i| c2.data[i]));
         let mut levels = vec![y, c1, c2];
-        for (j, d) in detail.iter_mut().enumerate() {
+        for (j, out) in blocks.iter_mut().enumerate() {
             if levels.len() < j + 2 {
                 let next = smooth(&levels[j], j);
                 levels.push(next);
             }
-            d.extend(idx.iter().map(|&i| levels[j].data[i] - levels[j + 1].data[i]));
+            let (a, b) = (&levels[j], &levels[j + 1]);
+            let n = block(j).min(t.width).min(t.height);
+            for by in 0..t.height / n {
+                for bx in 0..t.width / n {
+                    let (mut sy, mut se) = (0.0f64, 0.0f64);
+                    for r in by * n..(by + 1) * n {
+                        let row = r * t.width + bx * n..r * t.width + (bx + 1) * n;
+                        for (&p, &q) in a.data[row.clone()].iter().zip(&b.data[row.clone()]) {
+                            se += f64::from((p - q) * (p - q));
+                        }
+                        sy += levels[0].data[row].iter().map(|&v| f64::from(v)).sum::<f64>();
+                    }
+                    let k = (n * n) as f64;
+                    out.push(((sy / k) as f32, (se / k) as f32));
+                }
+            }
+            if j > 0 {
+                levels[j] = Plane::new(0, 0);
+            }
         }
     }
-    let mut order: Vec<usize> = (0..bright.len()).collect();
-    order.sort_by(|&a, &b| bright[a].total_cmp(&bright[b]).then(a.cmp(&b)));
-    let var: Vec<f32> = order.iter().map(|&i| noise.var(0, bright[i])).collect();
-    const BANDS: usize = 16;
-    let per = order.len().div_ceil(BANDS).max(32);
-    let gains = detail.map(|d| {
-        let mut med: Vec<f32> = Vec::new();
-        let mut r: Vec<f32> = Vec::with_capacity(per);
-        for (band, var) in order.chunks(per).zip(var.chunks(per)) {
-            if band.len() < 32 {
-                continue;
-            }
-            r.clear();
-            r.extend(band.iter().zip(var).map(|(&i, &v)| d[i] * d[i] / v));
-            let m = r.len() / 2;
-            let (_, v, _) = r.select_nth_unstable_by(m, f32::total_cmp);
-            med.push(*v / 0.454_936_4);
-        }
-        med.sort_by(f32::total_cmp);
-        med.get(((med.len().max(1) - 1) as f32 * 0.3).round() as usize).copied().unwrap_or(0.0)
-    });
+    let noise = fit_level0(&mut blocks[0]);
+    // a level with too few blocks (a small frame) takes level 0's ratio to white noise: the least
+    // that smooth noise has, so it lowers rather than raises the finer levels
+    let mut gains = [0.0f32; LEVELS];
+    for j in 0..LEVELS {
+        let mut r: Vec<f32> = blocks[j].iter().map(|&(y, e)| e / noise.var(0, y)).collect();
+        let white = if j == 0 { 1.0 } else { gains[0] / WHITE_GAINS[0] };
+        gains[j] = floor_of(&mut r).unwrap_or(white * WHITE_GAINS[j]).max(0.0);
+    }
+    for j in (0..LEVELS - 1).rev() {
+        gains[j] = gains[j].min(gains[j + 1] * WHITE_GAINS[j] / WHITE_GAINS[j + 1]);
+    }
     Stats { noise, gains }
+}
+
+/// The model of Y from level 0's blocks `(mean Y, mean square)` (see [`stats`]): 16 brightness bands
+/// at their noise floor, a non-negative line seeded from the darker half; bands far above it (texture
+/// at all their blocks) lose their weight.
+fn fit_level0(blocks: &mut [(f32, f32)]) -> JointNoise {
+    use crate::local::{NrcNoise, fit_nonneg_line};
+    blocks.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+    let per = blocks.len().div_ceil(16).max(16);
+    let pts: Vec<(f64, f64, f64)> = blocks
+        .chunks(per)
+        .filter_map(|band| {
+            let mut e: Vec<f32> = band.iter().map(|b| b.1 / WHITE_GAINS[0]).collect();
+            let y = band.iter().map(|b| f64::from(b.0)).sum::<f64>() / band.len() as f64;
+            floor_of(&mut e).map(|v| (y, f64::from(v.max(0.0)), band.len() as f64))
+        })
+        .collect();
+    let mut noise = JointNoise { model: NrcNoise { alpha: [0.0; 3], beta: [1e-14; 3] }, ymax: [0.0; 3], tolerance: 1.0 };
+    if pts.is_empty() {
+        return noise;
+    }
+    let (mut a, mut b) = fit_nonneg_line(&pts[..pts.len().div_ceil(2)]);
+    for _ in 0..4 {
+        let weighted: Vec<_> = pts
+            .iter()
+            .filter_map(|&(y, v, w)| {
+                let excess = v / (a * y + b).max(1e-14);
+                (excess <= 4.0).then_some((y, v, w * (2.0 / excess.max(2.0)).powi(4)))
+            })
+            .collect();
+        if !weighted.is_empty() {
+            (a, b) = fit_nonneg_line(&weighted);
+            noise.ymax[0] = weighted.iter().map(|p| p.0 as f32).fold(0.0, f32::max);
+        }
+    }
+    noise.model.alpha[0] = a as f32;
+    noise.model.beta[0] = (b as f32).max(1e-14);
+    noise
 }
 
 /// `c` with its luminance changed by `dy`, the same in each channel as far as no channel goes below
@@ -512,6 +580,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn white_gains_are_the_levels_impulse_energies() {
+        let n = 257;
+        let mut c = Plane::new(n, n);
+        c.data[128 * n + 128] = 1.0;
+        for (j, &g) in WHITE_GAINS.iter().enumerate() {
+            let next = smooth(&c, j);
+            let e: f32 = c.data.iter().zip(&next.data).map(|(a, b)| (a - b) * (a - b)).sum();
+            assert!((e / g - 1.0).abs() < 1e-3, "level {j}: {e} vs {g}");
+            c = next;
+        }
+    }
+
+    /// Texture over the whole frame (no flat area) must not be taken for noise: each level's noise
+    /// energy as on a flat frame with the same noise. (Not yet for texture of the coarsest levels'
+    /// scale everywhere, e.g. period 32 px: no coarser level is free of it.)
+    #[test]
+    fn texture_is_not_taken_for_noise() {
+        let (w, h) = (512usize, 512usize);
+        let mut flat = Rgb32f::filled(w, h, [0.1; 3]);
+        add_noise(&mut flat, SIGMA, 7);
+        let reference = super::stats(std::slice::from_ref(&flat));
+        let energy = |s: &Stats, j: usize| s.gains[j] * s.noise.var(0, 0.1);
+        for j in 0..LEVELS {
+            let white = WHITE_GAINS[j] * SIGMA * SIGMA;
+            assert!(energy(&reference, j) > 0.7 * white && energy(&reference, j) < 1.3 * white, "flat level {j}");
+        }
+        for period in [8.0f32, 16.0] {
+            let f = std::f32::consts::TAU / period;
+            let mut img = Rgb32f::from_fn(w, h, |x, y| [0.1 + 0.01 * (x as f32 * f).sin() * (y as f32 * f).sin(); 3]);
+            add_noise(&mut img, SIGMA, 13);
+            let st = super::stats(std::slice::from_ref(&img));
+            for j in 0..LEVELS {
+                let r = energy(&st, j) / energy(&reference, j);
+                assert!(r > 0.8 && r < 1.25, "period {period}, level {j}: {r}");
+            }
+        }
+    }
+
     /// Quality figures of the filter on synthetic scenes (noise σ 0.003 on Y 0.05 or 0.1):
     /// `cargo test -p lightcraft-pipeline --release --lib nrl::tests::quality_probe -- --ignored --nocapture`
     #[test]
@@ -554,12 +661,15 @@ mod tests {
             }
         }
         // C: texture (product of sines, amplitude 0.01) with noise, own statistics and those of a flat noisy image
-        for period in [8.0f32, 16.0] {
+        for period in [8.0f32, 16.0, 32.0] {
             let tex =
                 |x: usize, y: usize| 0.01 * (x as f32 * std::f32::consts::TAU / period).sin() * (y as f32 * std::f32::consts::TAU / period).sin();
             let clean = Rgb32f::from_fn(w, h, |x, y| [0.1 + tex(x, y); 3]);
             let mut img = clean.clone();
             add_noise(&mut img, SIGMA, 13);
+            let own = super::stats(std::slice::from_ref(&img));
+            let energies = |st: &Stats| -> Vec<String> { st.gains.iter().map(|g| format!("{:.3e}", g * st.noise.var(0, 0.1))).collect() };
+            eprintln!("C level noise energies period {period}: own {:?}  flat {:?}", energies(&own), energies(&flat_stats));
             let t: Vec<f64> = (0..w * h).map(|i| tex(i % w, i / w) as f64).collect();
             let tt: f64 = t.iter().map(|v| v * v).sum();
             for (name, st) in [("own stats", None), ("flat stats", Some(&flat_stats))] {
