@@ -34,6 +34,8 @@ struct Entry {
     lin: Option<(u64, Arc<Buf>)>,
     /// The linear image before the wavelet luminance NR (`Plan::pre_key`; see the CPU's stage cache).
     pre_lum: Option<(u64, Arc<Buf>)>,
+    /// The luminance NR's statistics (`Plan::pre_key`).
+    lum_stats: Option<(u64, nrl::Stats)>,
     planes: Planes,
 }
 
@@ -256,6 +258,31 @@ pub(crate) fn gaussian(cx: &mut Cx<'_>, src: &Buf, w: usize, h: usize, nc: usize
     }
     let last = (passes.len() - 1) % 2;
     let [a, b] = std::mem::replace(&mut bufs, [cx.gpu.buffer(0), cx.gpu.buffer(0)]);
+    if last == 0 { a } else { b }
+}
+
+/// [`gaussian`] of a buffer the caller no longer needs: it serves as one of the two ping-pong buffers
+/// (one image less on the device; `lightcraft_raster::blur::gaussian_owned`).
+pub(crate) fn gaussian_owned(cx: &mut Cx<'_>, src: Buf, w: usize, h: usize, nc: usize, sigma: f32) -> Buf {
+    if sigma <= 0.3 || w * h == 0 {
+        return src;
+    }
+    let radii = lightcraft_raster::blur::box_radii(sigma);
+    let passes: Vec<(&str, usize)> = radii.iter().map(|r| ("box_h", *r)).chain(radii.iter().map(|r| ("box_v", *r))).filter(|p| p.1 > 0).collect();
+    if passes.is_empty() {
+        return src;
+    }
+    // pass i reads bufs[(i + 1) % 2] and writes bufs[i % 2]: the first reads the source
+    let bufs = [cx.gpu.buffer(w * h * nc), src];
+    for (i, (k, r)) in passes.iter().enumerate() {
+        let chunk = (2 * r + 1).clamp(CHUNK, 128);
+        let groups = if *k == "box_h" { groups2(w.div_ceil(chunk), h, [64, 4]) } else { groups2(w, h.div_ceil(chunk), [64, 4]) };
+        let p = [w as u32, h as u32, nc as u32, *r as u32, chunk as u32];
+        let (out, prev) = (&bufs[i % 2], &bufs[(i + 1) % 2]);
+        cx.run(k, &p, &[Some(prev), Some(out)], groups);
+    }
+    let last = (passes.len() - 1) % 2;
+    let [a, b] = bufs;
     if last == 0 { a } else { b }
 }
 
@@ -617,7 +644,9 @@ pub fn render(
 
     // 2. white balance, defringe, spots, noise reduction
     let out_long = plan.frame.output_long(w, h);
-    let mut pre_lum = None;
+    // kept as they are unless this render makes new ones (moving Exposure must not drop them)
+    let mut pre_lum = cached.as_ref().and_then(|e| e.pre_lum.clone());
+    let mut kept_stats = cached.as_ref().and_then(|e| e.lum_stats.clone());
     let lin = match cached.as_ref().and_then(|e| e.lin.clone()).filter(|(k, _)| *k == plan.lin_key) {
         Some((_, b)) => b,
         None => {
@@ -628,13 +657,21 @@ pub fn render(
             };
             let wavelet = local::wavelet_luminance_nr(s, plan.src_long, out_long);
             let lin = if wavelet || local::late_clamp() {
-                let stats = if wavelet { lightcraft_pipeline::lum_stats(src, info, &plan) } else { None };
-                Arc::new(luminance_nr(&mut cx, &pre, w, h, s, stats.as_ref()))
+                let stats = match cached.as_ref().and_then(|e| e.lum_stats.clone()).filter(|(k, _)| *k == plan.pre_key) {
+                    Some((_, st)) => Some(st),
+                    None if wavelet => lightcraft_pipeline::lum_stats(src, info, &plan),
+                    None => None,
+                };
+                let out = luminance_nr(&mut cx, &pre, w, h, s, stats.as_ref());
+                kept_stats = stats.map(|st| (plan.pre_key, st));
+                Arc::new(out)
             } else {
                 pre.clone()
             };
             if stages.is_some() && n <= lightcraft_pipeline::PRE_LUM_MAX_PIXELS {
                 pre_lum = Some((plan.pre_key, pre));
+            } else {
+                pre_lum = None;
             }
             lin
         }
@@ -653,7 +690,7 @@ pub fn render(
     }
     lap("planes", &mut t, &mut cx);
     if let Some(c) = stages {
-        c.put(Entry { src: src.clone(), geo: plan.geo, sampled, lin: Some((plan.lin_key, lin.clone())), pre_lum, planes });
+        c.put(Entry { src: src.clone(), geo: plan.geo, sampled, lin: Some((plan.lin_key, lin.clone())), pre_lum, lum_stats: kept_stats, planes });
     }
 
     // 4. masks
@@ -858,9 +895,9 @@ fn luminance_nr(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, s: &DevelopSetti
     let d = &s.detail;
     let p = nrl::Params { amount: (d.nr_luminance / 100.0) as f32, detail: (d.nr_detail / 100.0) as f32, contrast: (d.nr_contrast / 100.0) as f32 };
     let change = cx.zeroed(n);
-    let out = cx.gpu.buffer(n * 3);
     let Some(stats) = stats.filter(|_| w >= 8 && h >= 8 && p.amount > 0.0) else {
         // nothing to reduce: only the experiment's clamp
+        let out = cx.gpu.buffer(n * 3);
         map(cx, "nrl_apply", n, &[late], [Some(img), Some(&change), None], &out);
         return out;
     };
@@ -888,13 +925,15 @@ fn luminance_nr(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, s: &DevelopSetti
         } else {
             let sq = cx.gpu.buffer(n);
             map(cx, "nrl_sq", n, &[], [Some(&cur), None, None], &sq);
-            let e = gaussian(cx, &sq, w, h, 1, nrl::energy_sigma(j));
-            drop(sq);
+            let e = gaussian_owned(cx, sq, w, h, 1, nrl::energy_sigma(j));
             map(cx, "nrl_coarse", n, &[k.to_bits()], [Some(&cur), Some(&var), Some(&e)], &change);
         }
         cur = next;
     }
     drop((cur, var));
+    // allocated last: with the levels gone (peak: the input, Y's change, var, two levels and the
+    // coarse energy's two buffers)
+    let out = cx.gpu.buffer(n * 3);
     map(cx, "nrl_apply", n, &[late], [Some(img), Some(&change), None], &out);
     if let Some(t) = started {
         cx.sync();

@@ -196,6 +196,9 @@ fn stage_cache_matches_uncached_render_through_a_slider_session() {
         Box::new(|s| s.detail.nr_contrast = 40.0),
         Box::new(|s| s.detail.nr_luminance = 0.0),
         Box::new(|s| s.detail.nr_luminance = 60.0),
+        // Exposure in between keeps the image before the luminance NR and its statistics
+        Box::new(|s| s.light.exposure = -0.5),
+        Box::new(|s| s.detail.nr_luminance = 45.0),
         Box::new(|s| {
             s.wb.mode = lightcraft_develop::WbMode::Custom;
             s.wb.temp = 4000.0;

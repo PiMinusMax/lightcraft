@@ -340,6 +340,8 @@ struct CacheEntry {
     lin: Option<(u64, Arc<Rgb32f>)>,
     /// The linear image before the wavelet luminance NR (`Plan::pre_key`), up to [`PRE_LUM_MAX_PIXELS`].
     pre_lum: Option<(u64, Arc<Rgb32f>)>,
+    /// The luminance NR's statistics (`Plan::pre_key`: they do not depend on its sliders).
+    lum_stats: Option<(u64, nrl::Stats)>,
     planes: local::Planes,
 }
 
@@ -597,7 +599,9 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
     lap("sample", &mut t);
 
     let out_long = frame.output_long(w, h);
-    let mut pre_lum = None;
+    // kept as they are unless this render makes new ones (moving Exposure must not drop them)
+    let mut pre_lum = cached.as_ref().and_then(|e| e.pre_lum.clone());
+    let mut kept_stats = cached.as_ref().and_then(|e| e.lum_stats.clone());
     let lin = match cached.as_ref().and_then(|e| e.lin.clone()).filter(|(k, _)| *k == lin_key) {
         Some((_, img)) => img,
         None if shared.is_none() => {
@@ -622,12 +626,19 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
             let lin = if !local::wavelet_luminance_nr(s, src_long, out_long) && !local::late_clamp() {
                 pre.clone()
             } else {
+                let stats = match cached.as_ref().and_then(|e| e.lum_stats.clone()).filter(|(k, _)| *k == plan.pre_key) {
+                    Some((_, st)) => Some(st),
+                    None => lum_stats(src_img, info, &plan),
+                };
                 let mut img = (*pre).clone();
-                local::denoise_luminance(&mut img, s, src_long, out_long, lum_stats(src_img, info, &plan).as_ref());
+                local::denoise_luminance(&mut img, s, src_long, out_long, stats.as_ref());
+                kept_stats = stats.map(|st| (plan.pre_key, st));
                 Arc::new(img)
             };
             if w * h <= PRE_LUM_MAX_PIXELS {
                 pre_lum = Some((plan.pre_key, pre));
+            } else {
+                pre_lum = None;
             }
             lin
         }
@@ -643,7 +654,7 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
     }
     lap("prepare", &mut t);
     if let Some((a, c)) = shared {
-        c.put(CacheEntry { src: a.clone(), geo, sampled, lin: Some((lin_key, lin)), pre_lum, planes });
+        c.put(CacheEntry { src: a.clone(), geo, sampled, lin: Some((lin_key, lin)), pre_lum, lum_stats: kept_stats, planes });
     }
     if req.depth != OutputDepth::U8 {
         let deep = finish::finish_deep(&prep, s, frame, info, req.space, req.depth, req.proof);
