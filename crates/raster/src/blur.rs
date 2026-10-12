@@ -73,18 +73,23 @@ fn box_v<T: Pixel>(src: &Image<T>, dst: &mut Image<T>, r: usize) {
 
 /// Blur with Gaussian `sigma` (pixels). `sigma <= 0.3` returns a copy.
 pub fn gaussian<T: Pixel>(img: &Image<T>, sigma: f32) -> Image<T> {
+    gaussian_owned(img.clone(), sigma)
+}
+
+/// [`gaussian`] of an image the caller no longer needs: blurs it in place of a copy.
+pub fn gaussian_owned<T: Pixel>(img: Image<T>, sigma: f32) -> Image<T> {
     if sigma <= 0.3 || img.is_empty() {
-        return img.clone();
+        return img;
     }
     let radii = box_radii(sigma);
-    let mut a = img.clone();
-    par_rows(&mut a.data, img.width, |_, row| {
+    let mut a = img;
+    par_rows(&mut a.data, a.width, |_, row| {
         let mut tmp = Vec::with_capacity(row.len());
         for r in radii {
             box_row(row, &mut tmp, r);
         }
     });
-    let mut b = Image::<T>::new(img.width, img.height);
+    let mut b = Image::<T>::new(a.width, a.height);
     for r in radii {
         if r == 0 {
             continue;

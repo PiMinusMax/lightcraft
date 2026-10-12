@@ -189,6 +189,13 @@ fn stage_cache_matches_uncached_render_through_a_slider_session() {
         Box::new(|s| s.effects.dehaze = 0.0),
         Box::new(|s| s.effects.dehaze = 25.0),
         Box::new(|s| s.detail.nr_luminance = 60.0),
+        // the luminance sliders reuse the image before the luminance NR (with colour NR on)
+        Box::new(|s| s.detail.nr_color = 40.0),
+        Box::new(|s| s.detail.nr_luminance = 30.0),
+        Box::new(|s| s.detail.nr_detail = 80.0),
+        Box::new(|s| s.detail.nr_contrast = 40.0),
+        Box::new(|s| s.detail.nr_luminance = 0.0),
+        Box::new(|s| s.detail.nr_luminance = 60.0),
         Box::new(|s| {
             s.wb.mode = lightcraft_develop::WbMode::Custom;
             s.wb.temp = 4000.0;
@@ -519,5 +526,40 @@ fn stored_process_numbers_render_with_a_known_process() {
                 assert!(out(&with(&s, ProcessVersion(Process::LATEST.version().0 + 7))) == latest, "newer than this build: as the latest");
             }
         }
+    }
+}
+
+/// Moving the luminance NR sliders on a 2.5 MP preview: the colour NR is not redone.
+/// `cargo test --release -p lightcraft-pipeline --lib tests::bench_luminance_slider -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn bench_luminance_slider() {
+    use crate::{StageCache, render_cached};
+    use std::sync::Arc;
+    let (w, h) = (1936usize, 1290usize);
+    let src = Arc::new(Rgb32f::from_fn(w, h, |x, y| {
+        let mut seed = (x as u32).wrapping_mul(0x9e37_79b9) ^ (y as u32).wrapping_mul(0x85eb_ca6b) | 1;
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        let n = (seed as f32 / u32::MAX as f32 - 0.5) * 0.04;
+        let v = 0.05 + 0.1 * ((x / 64 + y / 64) % 3) as f32 + n;
+        [v, v * 0.9 + n, v * 0.8]
+    }));
+    let info = SourceInfo { raw: true, ..Default::default() };
+    let cache = StageCache::default();
+    let req = RenderRequest::fit(w, h);
+    let mut s = DevelopSettings::default();
+    s.detail.nr_color = 25.0;
+    s.detail.nr_luminance = 30.0;
+    let _ = render_cached(&src, &info, &s, &req, &cache);
+    for l in [40.0, 50.0, 60.0] {
+        s.detail.nr_luminance = l;
+        let t = std::time::Instant::now();
+        let _ = render_cached(&src, &info, &s, &req, &cache);
+        let cached = t.elapsed();
+        let t = std::time::Instant::now();
+        let _ = crate::render(&src, &info, &s, &req);
+        eprintln!("luminance {l}: with the stage cache {:.0} ms, without {:.0} ms", cached.as_secs_f64() * 1e3, t.elapsed().as_secs_f64() * 1e3);
     }
 }

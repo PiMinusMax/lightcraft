@@ -9,7 +9,7 @@
 //! Contrast on the three coarse ones.
 
 use lightcraft_color::luminance_2020;
-use lightcraft_raster::{Plane, Rgb32f, blur::gaussian};
+use lightcraft_raster::{Plane, Rgb32f, blur::gaussian_owned};
 
 use crate::{for_rows, nrc_joint::JointNoise};
 
@@ -114,14 +114,17 @@ const DIRECTIONAL_MEAN_SQUARE: f32 = 1.977;
 
 /// The directions of the fine-level energy as steps in half the level's reach: horizontal, vertical,
 /// both diagonals and the four angles between (a line one pixel aside every two rows).
+#[cfg(test)]
 const DIRECTIONS: [(isize, isize); 8] = [(2, 0), (0, 2), (2, 2), (2, -2), (1, 2), (-1, 2), (2, 1), (2, -1)];
 
 /// Local energy of the detail plane `d` (level `j`) as an estimate of its mean square. On the fine levels:
-/// along each of eight directions ([`DIRECTIONS`]) the smaller `|d|` of the two samples `2^(j+1)` px to
+/// along each of eight directions (`DIRECTIONS`) the smaller `|d|` of the two samples `2^(j+1)` px to
 /// either side, each sample the largest within ±1 px across the direction (the diagonals: none), the
 /// largest of the eight, squared and scaled to the mean square of noise. A line or edge of any angle is
 /// supported along its own direction; the pixel itself does not count, so an isolated outlier does not
-/// protect itself. On the coarse levels a Gaussian mean.
+/// protect itself. On the coarse levels a Gaussian mean. (The filter computes it per pixel in
+/// `shrink_fine` and `shrink_coarse`; this plane form is their test reference.)
+#[cfg(test)]
 fn energy(d: &Plane, j: usize) -> Plane {
     let (w, h) = (d.width, d.height);
     if j < ROBUST_LEVELS {
@@ -174,9 +177,103 @@ fn energy(d: &Plane, j: usize) -> Plane {
         });
         e
     } else {
-        let sq = d.map(|v| v * v);
-        gaussian(&sq, energy_sigma(j))
+        gaussian_owned(d.map(|v| v * v), energy_sigma(j))
     }
+}
+
+/// Removes from `change` what the shrinking takes of fine level `j` (detail `d`): the directional
+/// energy of `energy` and `keep = max(0, 1 − k·var / energy)` per pixel in one pass, without an energy
+/// plane. `|d|` is read in place; only its vertical 3-max (the near-horizontal directions) is a plane.
+fn shrink_fine(d: &Plane, j: usize, k: f32, var: &Plane, change: &mut Plane) {
+    let (w, h) = (d.width, d.height);
+    let half = 1usize << j;
+    let s = 2 * half;
+    let dd = &d.data;
+    let mut v = Plane::new(w, h);
+    for_rows(&mut v.data, w, |y, row| {
+        let (a, b, c) = (mirror(y as isize - 1, h) * w, y * w, mirror(y as isize + 1, h) * w);
+        for (x, o) in row.iter_mut().enumerate() {
+            *o = dd[a + x].abs().max(dd[b + x].abs()).max(dd[c + x].abs());
+        }
+    });
+    let vv = &v.data;
+    let (hs, ss) = (half as isize, s as isize);
+    let shrink = |dv: f32, var: f32, m: f32| {
+        let e = m * m / DIRECTIONAL_MEAN_SQUARE;
+        let keep = (1.0 - k * var / e.max(1e-30)).max(0.0);
+        dv * (1.0 - keep)
+    };
+    for_rows(&mut change.data, w, |y, out| {
+        let r = |dy: isize| mirror(y as isize + dy * hs, h) * w;
+        let (rm2, rm1, r0, rp1, rp2) = (r(-2), r(-1), r(0), r(1), r(2));
+        let (dr, vr) = (&dd[r0..r0 + w], &var.data[r0..r0 + w]);
+        // inside: every sample a fixed offset in its row, so whole slices (vectorised)
+        let (lo, hi) = (s + 1, w.saturating_sub(s + 1).max(s + 1));
+        let n = hi - lo;
+        if n > 0 {
+            fn at(src: &[f32], row: usize, dx: isize, lo: usize, n: usize) -> &[f32] {
+                &src[(row as isize + lo as isize + dx) as usize..][..n]
+            }
+            let p = |row: usize, dx: isize| at(dd, row, dx, lo, n);
+            let (a0, a1) = (p(r0, ss), p(r0, -ss));
+            let (b0, b1) = (p(rp2, 0), p(rm2, 0));
+            let (c0, c1) = (p(rp2, ss), p(rm2, -ss));
+            let (e0, e1) = (p(rm2, ss), p(rp2, -ss));
+            let h3 = |row: usize, dx: isize| [p(row, dx - 1), p(row, dx), p(row, dx + 1)];
+            let (f0, f1) = (h3(rp2, hs), h3(rm2, -hs));
+            let (g0, g1) = (h3(rp2, -hs), h3(rm2, hs));
+            let (v0, v1) = (at(vv, rp1, ss, lo, n), at(vv, rm1, -ss, lo, n));
+            let (u0, u1) = (at(vv, rm1, ss, lo, n), at(vv, rp1, -ss, lo, n));
+            let (dr_in, vr_in, out_in) = (&dr[lo..hi], &vr[lo..hi], &mut out[lo..hi]);
+            for i in 0..n {
+                let hx = |t: &[&[f32]; 3]| t[0][i].abs().max(t[1][i].abs()).max(t[2][i].abs());
+                let m = a0[i]
+                    .abs()
+                    .min(a1[i].abs())
+                    .max(b0[i].abs().min(b1[i].abs()))
+                    .max(c0[i].abs().min(c1[i].abs()))
+                    .max(e0[i].abs().min(e1[i].abs()))
+                    .max(hx(&f0).min(hx(&f1)))
+                    .max(hx(&g0).min(hx(&g1)))
+                    .max(v0[i].min(v1[i]))
+                    .max(u0[i].min(u1[i]))
+                    .max(0.0);
+                out_in[i] -= shrink(dr_in[i], vr_in[i], m);
+            }
+        }
+        // the border columns: mirrored samples
+        for x in (0..w).filter(|&x| x < lo || x >= lo + n) {
+            let xi = x as isize;
+            let p = |row: usize, dx: isize| dd[row + mirror(xi + dx, w)].abs();
+            let across_h = |row: usize, dx: isize| p(row, dx - 1).max(p(row, dx)).max(p(row, dx + 1));
+            let across_v = |row: usize, dx: isize| vv[row + mirror(xi + dx, w)];
+            let m = p(r0, ss)
+                .min(p(r0, -ss))
+                .max(p(rp2, 0).min(p(rm2, 0)))
+                .max(p(rp2, ss).min(p(rm2, -ss)))
+                .max(p(rm2, ss).min(p(rp2, -ss)))
+                .max(across_h(rp2, hs).min(across_h(rm2, -hs)))
+                .max(across_h(rp2, -hs).min(across_h(rm2, hs)))
+                .max(across_v(rp1, ss).min(across_v(rm1, -ss)))
+                .max(across_v(rm1, ss).min(across_v(rp1, -ss)))
+                .max(0.0);
+            out[x] -= shrink(dr[x], vr[x], m);
+        }
+    });
+}
+
+/// [`shrink_fine`] for coarse level `j`: the energy is a Gaussian mean of `d²`.
+fn shrink_coarse(d: &Plane, j: usize, k: f32, var: &Plane, change: &mut Plane) {
+    let w = d.width;
+    let e = gaussian_owned(d.map(|v| v * v), energy_sigma(j));
+    for_rows(&mut change.data, w, |row, o| {
+        let i0 = row * w;
+        for (x, o) in o.iter_mut().enumerate() {
+            let i = i0 + x;
+            let keep = (1.0 - k * var.data[i] / e.data[i].max(1e-30)).max(0.0);
+            *o -= d.data[i] * (1.0 - keep);
+        }
+    });
 }
 
 /// What the luminance NR measures before it filters: the noise model of Y and the noise gain of each
@@ -411,24 +508,24 @@ pub fn denoise(img: &mut Rgb32f, p: &Params, stats: Option<&Stats>) {
             levels.push(next);
         }
         lap("smooth", &mut tt);
-        let d = levels[j].zip_map(&levels[j + 1], |a, b| a - b);
-        // the finer approximation is no longer needed
-        levels[j] = Plane::new(0, 0);
-        lap("detail", &mut tt);
-        let e = energy(&d, j);
-        lap("energy", &mut tt);
-        let t = threshold(p, j);
-        let k = t * t * gain;
-        for_rows(&mut change.data, w, |row, o| {
-            let i0 = row * w;
-            for (x, o) in o.iter_mut().enumerate() {
-                let i = i0 + x;
-                let keep = (1.0 - k * var.data[i] / e.data[i].max(1e-30)).max(0.0);
-                *o -= d.data[i] * (1.0 - keep);
+        // the finer approximation becomes the detail
+        let mut d = std::mem::replace(&mut levels[j], Plane::new(0, 0));
+        let next = &levels[j + 1];
+        for_rows(&mut d.data, w, |row, o| {
+            for (o, n) in o.iter_mut().zip(&next.data[row * w..(row + 1) * w]) {
+                *o -= n;
             }
         });
+        lap("detail", &mut tt);
+        let t = threshold(p, j);
+        let k = t * t * gain;
+        if j < ROBUST_LEVELS {
+            shrink_fine(&d, j, k, &var, &mut change);
+        } else {
+            shrink_coarse(&d, j, k, &var, &mut change);
+        }
+        lap("energy + shrink", &mut tt);
     }
-    lap("shrink", &mut tt);
     for_rows(&mut img.data, w, |row, px| {
         let i0 = row * w;
         for (x, c) in px.iter_mut().enumerate() {
@@ -637,6 +734,35 @@ mod tests {
             let room: f32 = (0..3).map(|k| (c[k] - c[k].min(0.0)) * lightcraft_color::LUMA_2020[k]).sum();
             let want = dy.max(-room);
             assert!((y(out) - y(c) - want).abs() < 1e-6, "{c:?} {dy} -> {out:?}: {} instead of {want}", y(out) - y(c));
+        }
+    }
+
+    /// The fused shrinking is the plane form ([`energy`], then `keep`) bit for bit, also at the borders
+    /// and on frames narrower than the reach.
+    #[test]
+    fn fused_shrink_matches_the_energy_planes() {
+        for (w, h) in [(64usize, 48usize), (37, 23), (9, 11)] {
+            let mut img = Rgb32f::from_fn(w, h, |x, y| [0.05 + if x == w / 2 || y == (x / 2) { 0.02 } else { 0.0 }; 3]);
+            add_noise(&mut img, SIGMA, 3);
+            let y = Plane { width: w, height: h, data: img.data.iter().map(|&c| luminance_2020(c)).collect() };
+            let var = y.map(|v| 1e-5 + 1e-4 * v.abs());
+            let mut c = y;
+            for j in 0..LEVELS {
+                let next = smooth(&c, j);
+                let d = c.zip_map(&next, |a, b| a - b);
+                let k = 1.3;
+                let e = energy(&d, j);
+                let reference: Vec<f32> =
+                    (0..w * h).map(|i| 0.5 - d.data[i] * (1.0 - (1.0 - k * var.data[i] / e.data[i].max(1e-30)).max(0.0))).collect();
+                let mut fused = Plane { width: w, height: h, data: vec![0.5; w * h] };
+                if j < ROBUST_LEVELS {
+                    shrink_fine(&d, j, k, &var, &mut fused);
+                } else {
+                    shrink_coarse(&d, j, k, &var, &mut fused);
+                }
+                assert!(fused.data.iter().zip(&reference).all(|(a, b)| a.to_bits() == b.to_bits()), "{w}×{h} level {j}");
+                c = next;
+            }
         }
     }
 

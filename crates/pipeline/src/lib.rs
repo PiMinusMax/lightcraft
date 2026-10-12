@@ -293,7 +293,7 @@ impl StageCache {
         };
         for e in self.lock().iter() {
             add(Arc::as_ptr(&e.sampled) as usize, size(&e.sampled));
-            if let Some((_, l)) = &e.lin {
+            for (_, l) in e.lin.iter().chain(&e.pre_lum) {
                 add(Arc::as_ptr(l) as usize, size(l));
             }
             let pl = &e.planes;
@@ -338,8 +338,14 @@ struct CacheEntry {
     geo: u64,
     sampled: Arc<Rgb32f>,
     lin: Option<(u64, Arc<Rgb32f>)>,
+    /// The linear image before the wavelet luminance NR (`Plan::pre_key`), up to [`PRE_LUM_MAX_PIXELS`].
+    pre_lum: Option<(u64, Arc<Rgb32f>)>,
     planes: local::Planes,
 }
+
+/// Largest image whose state before the luminance NR the stage cache keeps (12 bytes a pixel: 8 MP
+/// ≈ 100 MB), so a preview's sliders skip the colour NR while a full-size export does not hold a copy.
+const PRE_LUM_MAX_PIXELS: usize = 8 << 20;
 
 fn hash_of(parts: impl std::hash::Hash) -> u64 {
     use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
@@ -362,6 +368,9 @@ pub struct Plan<'a> {
     pub geo: u64,
     /// Key of the white-balanced, retouched, denoised image (and of the planes computed from it).
     pub lin_key: u64,
+    /// Key of the linear image before the wavelet luminance NR (`local::denoise_colour`): `lin_key`
+    /// without Luminance, Detail and Contrast when that NR runs last.
+    pub pre_key: u64,
     /// Red eye / pet eye corrections with their detected pupils, in output pixels.
     pub eyes: Vec<redeye::EyeK>,
     /// The whole frame's dehaze airlight, for a windowed render (which can't see the whole frame).
@@ -441,6 +450,19 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
     let (wb_t, wb_tint) = local::effective_wb(info, s);
     let eyes = redeye::resolve(src, &s.red_eye, s.orientation, &frame, w, h, px_per_long);
     let d = &s.detail;
+    // with the wavelet filter the colour part never reads the luminance sliders
+    let lum = [d.nr_luminance, d.nr_detail, d.nr_contrast].map(f64::to_bits);
+    let pre_key = hash_of((
+        geo,
+        [wb_t, wb_tint, info.as_shot_temp, info.as_shot_tint].map(f64::to_bits),
+        format!("{:?}", s.spots),
+        format!("{eyes:?}"),
+        format!("{:?}", s.optics),
+        local_tone::enabled(info, s),
+        if nrl::enabled() { [0; 3] } else { lum },
+        [d.nr_color, d.nr_color_detail, d.nr_color_smoothness].map(f64::to_bits),
+        src_long,
+    ));
     let lin_key = hash_of((
         geo,
         [wb_t, wb_tint, info.as_shot_temp, info.as_shot_tint].map(f64::to_bits),
@@ -453,7 +475,7 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         [d.nr_luminance, d.nr_detail, d.nr_contrast, d.nr_color, d.nr_color_detail, d.nr_color_smoothness].map(f64::to_bits),
         src_long,
     ));
-    Plan { settings, frame, w, h, px_per_long, src_long, geo, lin_key, eyes, fixed_air, keep, mattes: info.mattes.clone(), full }
+    Plan { settings, frame, w, h, px_per_long, src_long, geo, lin_key, pre_key, eyes, fixed_air, keep, mattes: info.mattes.clone(), full }
 }
 
 /// The wavelet luminance NR's statistics, measured on fixed tiles of the whole frame (see
@@ -571,14 +593,40 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
     };
     lap("sample", &mut t);
 
+    let out_long = frame.output_long(w, h);
+    let mut pre_lum = None;
     let lin = match cached.as_ref().and_then(|e| e.lin.clone()).filter(|(k, _)| *k == lin_key) {
         Some((_, img)) => img,
-        None => {
+        None if shared.is_none() => {
             // Without a cache the resampled buffer is ours: work on it in place.
-            let mut img = if shared.is_some() { (*sampled).clone() } else { Arc::unwrap_or_clone(sampled.clone()) };
+            let mut img = Arc::unwrap_or_clone(sampled.clone());
             lin_cpu(&mut img, info, &plan);
-            local::denoise(&mut img, s, src_long, frame.output_long(w, h), lum_stats(src_img, info, &plan).as_ref());
+            local::denoise(&mut img, s, src_long, out_long, lum_stats(src_img, info, &plan).as_ref());
             Arc::new(img)
+        }
+        None => {
+            // the image before the luminance NR: kept, so moving Luminance, Detail or Contrast does not
+            // redo the colour NR
+            let pre = match cached.as_ref().and_then(|e| e.pre_lum.clone()).filter(|(k, _)| *k == plan.pre_key) {
+                Some((_, img)) => img,
+                None => {
+                    let mut img = (*sampled).clone();
+                    lin_cpu(&mut img, info, &plan);
+                    local::denoise_colour(&mut img, s, src_long, out_long);
+                    Arc::new(img)
+                }
+            };
+            let lin = if !local::wavelet_luminance_nr(s, src_long, out_long) && !local::late_clamp() {
+                pre.clone()
+            } else {
+                let mut img = (*pre).clone();
+                local::denoise_luminance(&mut img, s, src_long, out_long, lum_stats(src_img, info, &plan).as_ref());
+                Arc::new(img)
+            };
+            if w * h <= PRE_LUM_MAX_PIXELS {
+                pre_lum = Some((plan.pre_key, pre));
+            }
+            lin
         }
     };
     lap("wb/spots/nr", &mut t);
@@ -592,7 +640,7 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
     }
     lap("prepare", &mut t);
     if let Some((a, c)) = shared {
-        c.put(CacheEntry { src: a.clone(), geo, sampled, lin: Some((lin_key, lin)), planes });
+        c.put(CacheEntry { src: a.clone(), geo, sampled, lin: Some((lin_key, lin)), pre_lum, planes });
     }
     if req.depth != OutputDepth::U8 {
         let deep = finish::finish_deep(&prep, s, frame, info, req.space, req.depth, req.proof);

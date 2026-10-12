@@ -162,10 +162,24 @@ pub fn nr_params(s: &DevelopSettings, src_long: usize, out_long: usize) -> (Opti
 /// Radii scale with how much the source was downsampled (preview noise is already averaged out).
 /// `lum_stats`: the statistics of the wavelet luminance NR from the whole frame (`None`: from `img`).
 pub fn denoise(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long: usize, lum_stats: Option<&crate::nrl::Stats>) {
+    denoise_colour(img, s, src_long, out_long);
+    denoise_luminance(img, s, src_long, out_long, lum_stats);
+}
+
+/// Whether the luminance NR runs as the wavelet filter after the colour NR ([`denoise_luminance`])
+/// rather than as the old filter before it.
+pub fn wavelet_luminance_nr(s: &DevelopSettings, src_long: usize, out_long: usize) -> bool {
+    nr_params(s, src_long, out_long).0.is_some() && crate::nrl::enabled()
+}
+
+/// The first part of [`denoise`]: everything but the wavelet luminance NR. Its result does not depend
+/// on Luminance, Detail and Contrast when [`wavelet_luminance_nr`] holds, so a render can keep it while
+/// those sliders move.
+pub fn denoise_colour(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long: usize) {
     let (lum, col) = nr_params(s, src_long, out_long);
     let w = img.width;
     // PROTOTYPE (#1129): the wavelet luminance NR runs after the colour NR, which leaves Y unchanged.
-    let new_lum = lum.is_some() && crate::nrl::enabled();
+    let new_lum = wavelet_luminance_nr(s, src_long, out_long);
     if let Some(nr) = lum.filter(|_| !new_lum) {
         let _t = crate::profiling().then(std::time::Instant::now);
         let l = img.map(log_lum);
@@ -204,7 +218,11 @@ pub fn denoise(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long:
             eprintln!("    nr colour: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
         }
     }
-    if new_lum {
+}
+
+/// The second part of [`denoise`]: the wavelet luminance NR (when [`wavelet_luminance_nr`]).
+pub fn denoise_luminance(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long: usize, lum_stats: Option<&crate::nrl::Stats>) {
+    if wavelet_luminance_nr(s, src_long, out_long) {
         let d = &s.detail;
         let p = crate::nrl::Params {
             amount: (d.nr_luminance / 100.0) as f32,
