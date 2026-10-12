@@ -63,12 +63,9 @@ impl DevelopSettings {
             h ^= *b as u64;
             h = h.wrapping_mul(0x0100_0000_01b3);
         }
-        // PROTOTYPE: renders with hot pixel suppression or the camera-look guard are cached apart from older ones
+        // PROTOTYPE: renders with the mosaic outlier filter are cached apart from older ones
         if std::env::var("LIGHTCRAFT_HOT_PIXELS").is_ok_and(|v| v == "1") {
             h ^= 0x686f_745f_7078_6c31;
-        }
-        if std::env::var("LIGHTCRAFT_HS_GUARD").map_or(true, |v| v != "0") {
-            h ^= 0x6873_5f67_7561_7264;
         }
         h
     }
