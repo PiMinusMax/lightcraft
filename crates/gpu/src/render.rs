@@ -606,6 +606,10 @@ pub fn render(
         Some(crate::Fault::Limit(bytes)) => Some(crate::ctx::LimitOverride::new(bytes)),
         _ => None,
     };
+    BAND_BUDGET.set(match fault {
+        Some(crate::Fault::BandBudget(bytes)) => Some(bytes as usize),
+        _ => None,
+    });
     if !gpu.fits(n * 3) {
         fail(
             FailKind::Limit,
@@ -894,14 +898,64 @@ fn luminance_nr(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, s: &DevelopSetti
     let late = local::late_clamp() as u32;
     let d = &s.detail;
     let p = nrl::Params { amount: (d.nr_luminance / 100.0) as f32, detail: (d.nr_detail / 100.0) as f32, contrast: (d.nr_contrast / 100.0) as f32 };
-    let change = cx.zeroed(n);
     let Some(stats) = stats.filter(|_| w >= 8 && h >= 8 && p.amount > 0.0) else {
         // nothing to reduce: only the experiment's clamp
+        let change = cx.zeroed(n);
         let out = cx.gpu.buffer(n * 3);
         map(cx, "nrl_apply", n, &[late], [Some(img), Some(&change), None], &out);
         return out;
     };
     let started = profiling().then(std::time::Instant::now);
+    // Bands as in the joint colour NR: a band holds its input rows (3 values per pixel), Y's change, var,
+    // two levels and the coarse energy's two buffers (6) and its output (3); the whole output is held
+    // besides. A band's halo covers the filter's reach (`nrl::halo`, as for a window), so its kept rows
+    // are the whole image's.
+    let halo = nrl::halo();
+    let out = match band_rows(cx, band_budget(cx, "luminance"), w, h, 48, 12 * n, halo) {
+        Some(core) if core >= h => luminance_band(cx, img, w, h, &p, stats, late),
+        Some(core) => {
+            if profiling() {
+                eprintln!("  gpu luminance bands: {} of {core} rows (halo {halo})", h.div_ceil(core));
+            }
+            let out = cx.gpu.buffer(3 * n);
+            let mut y0 = 0;
+            while y0 < h {
+                let y1 = (y0 + core).min(h);
+                let (b0, b1) = (y0.saturating_sub(halo), (y1 + halo).min(h));
+                let input = cx.slice(img, 3 * b0 * w, 3 * (b1 - b0) * w);
+                let band = luminance_band(cx, &input, w, b1 - b0, &p, stats, late);
+                drop(input);
+                let kept = cx.slice(&band, 3 * (y0 - b0) * w, 3 * (y1 - y0) * w);
+                drop(band);
+                cx.copy_into(&kept, &out, 3 * y0 * w);
+                drop(kept);
+                // wait, so the band's buffers are free before the next (see `color_nr_joint`)
+                cx.sync();
+                y0 = y1;
+            }
+            out
+        }
+        None => {
+            // not even one band fits: this step on the CPU
+            let mut host = cx.read_rgb(img, w, h);
+            nrl::denoise(&mut host, &p, Some(stats));
+            if late == 1 {
+                host.data.iter_mut().for_each(|c| *c = c.map(|v| v.max(0.0)));
+            }
+            cx.gpu.upload(rgb_words(&host))
+        }
+    };
+    if let Some(t) = started {
+        cx.sync();
+        eprintln!("  gpu nr luminance (wavelet): {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+    }
+    out
+}
+
+/// [`luminance_nr`] of one band (or the whole image) `img` of `w × h`.
+fn luminance_band(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, p: &nrl::Params, stats: &nrl::Stats, late: u32) -> Buf {
+    let n = w * h;
+    let change = cx.zeroed(n);
     let y = cx.gpu.buffer(n);
     map(cx, "nrl_y", n, &[], [Some(img), None, None], &y);
     let c1 = nrl_smooth(cx, &y, w, h, 0);
@@ -917,7 +971,7 @@ fn luminance_nr(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, s: &DevelopSetti
             None => nrl_smooth(cx, &cur, w, h, j),
         };
         map(cx, "nrl_detail", n, &[], [Some(&next), None, None], &cur);
-        let t = nrl::threshold(&p, j);
+        let t = nrl::threshold(p, j);
         let k = t * t * gain;
         if j < nrl::ROBUST_LEVELS {
             let q = [w as u32, h as u32, 1u32 << j, k.to_bits(), nrl::DIRECTIONAL_MEAN_SQUARE.to_bits()];
@@ -935,10 +989,6 @@ fn luminance_nr(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, s: &DevelopSetti
     // coarse energy's two buffers)
     let out = cx.gpu.buffer(n * 3);
     map(cx, "nrl_apply", n, &[late], [Some(img), Some(&change), None], &out);
-    if let Some(t) = started {
-        cx.sync();
-        eprintln!("  gpu nr luminance (wavelet): {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
-    }
     out
 }
 
@@ -950,9 +1000,54 @@ fn nrcj(cx: &mut Cx<'_>, k: &str, n: usize, p: &[u32], a: &Buf, b: Option<&Buf>,
     cx.run(k, p, &[Some(a), b, Some(out)], groups1(n));
 }
 
-/// Device memory left aside when the joint NR plans its bands from the free memory (the rest of the
-/// render, the display, other programs).
-const VRAM_RESERVE: u64 = 384 << 20;
+/// Device memory left aside when the noise reductions plan their bands from the free memory (the rest
+/// of the render, the display, other programs, and what the driver reports free but cannot give: on a
+/// Quadro M2200 (4 GB, 0.75 GB for the display) a 33 MP export ran out of memory with a 1668 MB band
+/// budget planned with 384 MB, and ran with 1500 MB).
+const VRAM_RESERVE: u64 = 640 << 20;
+
+/// The device memory a noise reduction may plan its bands with (`what` names it in the profile): the
+/// memory free right now (where the driver can be asked, `crate::vram`) plus our own pooled buffers,
+/// which we reuse, less [`VRAM_RESERVE`]; else a fixed 2 GB. PROTOTYPE: `NRV2_GPU_BAND_MB` overrides it.
+fn band_budget(cx: &Cx<'_>, what: &str) -> usize {
+    let fixed = BAND_BUDGET.get().or_else(|| std::env::var("NRV2_GPU_BAND_MB").ok().and_then(|v| v.parse::<usize>().ok()).map(|mb| mb << 20));
+    let measured = crate::vram::free_bytes(&cx.gpu.info).map(|free| {
+        let pooled = crate::ctx::memory().pooled;
+        (free.saturating_add(pooled).saturating_sub(VRAM_RESERVE)) as usize
+    });
+    let budget = fixed.or(measured).unwrap_or(2048 << 20);
+    if profiling() {
+        let source = if fixed.is_some() {
+            "NRV2_GPU_BAND_MB"
+        } else if measured.is_some() {
+            "free device memory"
+        } else {
+            "fixed default"
+        };
+        eprintln!("  gpu {what} budget: {} MB ({source})", budget >> 20);
+    }
+    budget
+}
+
+thread_local! {
+    /// This render's band budget from [`crate::Fault::BandBudget`] (tests).
+    static BAND_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Rows per band (without halo) when each pixel of a band needs `per_pixel` bytes and the whole output
+/// `out_bytes`: `Some(h)` when the whole image fits, `None` when not even one band with its halo does.
+fn band_rows(cx: &Cx<'_>, budget: usize, w: usize, h: usize, per_pixel: usize, out_bytes: usize, halo: usize) -> Option<usize> {
+    // no band may exceed the device's largest buffer either (3 values per pixel are the largest)
+    let limit_rows = (cx.gpu.limit() as usize / (12 * w)).max(1);
+    let rows = (budget.saturating_sub(out_bytes) / (per_pixel * w)).min(limit_rows);
+    if rows >= h {
+        Some(h)
+    } else if rows > 2 * halo {
+        Some(rows - 2 * halo)
+    } else {
+        None
+    }
+}
 
 /// The joint colour noise reduction (`lightcraft_pipeline::nrc_joint`) on the GPU, the same steps as the
 /// CPU: only the noise samples are read back (the noise model is fitted on the CPU, by the same code).
@@ -1002,41 +1097,10 @@ fn color_nr_joint(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, p: &local::Nrc
     let halo = plan.iter().map(|d| 2 * d.0).sum::<usize>() + plan.last().map_or(0, |d| d.0) + 10;
     // Memory: the whole output (3 values per pixel) is held besides the input; a band then holds about
     // 12 values per pixel (guide 3, two chroma buffers 2 + 2, paths 2, weights 2; up to 12 while the
-    // speck brake and the guide run). The budget for both together is the device memory free right now (where the
-    // driver can be asked, `crate::vram`) plus our own pooled buffers, which we reuse, less a reserve for
-    // the rest of the render and other programs; else a fixed 2 GB. PROTOTYPE: `NRV2_GPU_BAND_MB` overrides it.
-    let fixed = std::env::var("NRV2_GPU_BAND_MB").ok().and_then(|v| v.parse::<usize>().ok()).map(|mb| mb << 20);
-    let measured = crate::vram::free_bytes(&cx.gpu.info).map(|free| {
-        let pooled = crate::ctx::memory().pooled;
-        (free.saturating_add(pooled).saturating_sub(VRAM_RESERVE)) as usize
-    });
-    let budget = fixed.or(measured).unwrap_or(2048 << 20);
-    if profiling() {
-        eprintln!(
-            "  gpu joint budget: {} MB ({})",
-            budget >> 20,
-            if fixed.is_some() {
-                "NRV2_GPU_BAND_MB"
-            } else if measured.is_some() {
-                "free device memory"
-            } else {
-                "fixed default"
-            }
-        );
-    }
-    let out_bytes = 12 * n;
-    let per_row = 48 * w;
-    // no band may exceed the device's largest buffer either (3 values per pixel are the largest)
-    let limit_rows = (cx.gpu.limit() as usize / (12 * w)).max(1);
-    let rows = (budget.saturating_sub(out_bytes) / per_row).min(limit_rows);
-    let core = if rows >= h {
-        h
-    } else if rows > 2 * halo {
-        rows - 2 * halo
-    } else {
-        // not even one band with its halo fits: this stage runs on the CPU (the rest of the render stays here)
-        return None;
-    };
+    // speck brake and the guide run), planned within `band_budget`.
+    let budget = band_budget(cx, "joint");
+    // not even one band with its halo fits: this stage runs on the CPU (the rest of the render stays here)
+    let core = band_rows(cx, budget, w, h, 48, 12 * n, halo)?;
     let out = cx.gpu.buffer(3 * n);
     let mut y0 = 0;
     while y0 < h {
