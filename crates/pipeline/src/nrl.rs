@@ -12,7 +12,7 @@ use lightcraft_raster::{Plane, Rgb32f, blur::gaussian};
 
 use crate::{
     for_rows,
-    nrc_joint::{JointNoise, noise_model_of, yuv},
+    nrc_joint::{JointNoise, noise_from_samples, noise_samples_of, yuv},
 };
 
 /// Detail levels (holes 1, 2, 4, 8, 16 px).
@@ -33,6 +33,20 @@ pub struct Params {
 /// The new luminance noise reduction is on unless `LIGHTCRAFT_NRL=0` (prototype switch).
 pub fn enabled() -> bool {
     std::env::var("LIGHTCRAFT_NRL").map_or(true, |v| v != "0")
+}
+
+/// Gaussian window of the local energy of coarse level `j` (px).
+fn energy_sigma(j: usize) -> f32 {
+    (2.0 * (1u32 << j) as f32 + 1.0) / 12f32.sqrt()
+}
+
+/// How far an output pixel reads its neighbours (px): the coarsest detail level, its energy window
+/// and the bias blur. A window rendered on its own needs this much context around it.
+pub fn halo() -> usize {
+    let reach = |sigma: f32| lightcraft_raster::blur::box_radii(sigma).iter().sum::<usize>();
+    // the à trous steps: 2 · 2^j on each side
+    let wavelet: usize = (0..LEVELS).map(|j| 2usize << j).sum();
+    wavelet + reach(energy_sigma(LEVELS - 1)) + reach(BIAS_SIGMA) + 4
 }
 
 /// Threshold of level `j` in noise sigmas of that level.
@@ -152,53 +166,97 @@ fn energy(d: &Plane, j: usize) -> Plane {
         e
     } else {
         let sq = d.map(|v| v * v);
-        gaussian(&sq, (2.0 * (1u32 << j) as f32 + 1.0) / 12f32.sqrt())
+        gaussian(&sq, energy_sigma(j))
     }
 }
 
-/// Noise gain of each level: `d_j² / var(y)` at the noise samples, median per brightness band
-/// (16 bands of the local brightness `bright`), the 30 % quantile of the bands. Texture only
-/// raises some bands; the quantile follows the flat ones.
-struct Bands {
-    /// sample indices in brightness order
-    idx: Vec<usize>,
-    var: Vec<f32>,
+/// What the luminance NR measures before it filters: the noise model of Y and the noise gain of each
+/// level. A windowed render sees only part of the frame, so both come from fixed tiles of the whole
+/// frame ([`tiles`]), the same for every window.
+#[derive(Clone, Debug)]
+pub struct Stats {
+    pub noise: JointNoise,
+    /// `E[d_j²] / var(Y)` of the noise on level `j`.
+    pub gains: [f32; LEVELS],
 }
 
-impl Bands {
-    fn new(bright: &Plane, noise: &JointNoise) -> Bands {
-        let stride = crate::nrc_joint::noise_sample_stride(bright.len());
-        let mut idx: Vec<usize> = (0..bright.len()).step_by(stride).collect();
-        idx.sort_by(|&a, &b| bright.data[a].total_cmp(&bright.data[b]).then(a.cmp(&b)));
-        let var = idx.iter().map(|&i| noise.var(0, bright.data[i])).collect();
-        Bands { idx, var }
-    }
+/// Side of the tiles the statistics are measured on (px).
+const TILE: usize = 128;
+/// Tiles per row and column: many small tiles follow a mostly dark frame's few bright parts better
+/// than a few large ones.
+const GRID: usize = 12;
 
-    fn gain(&self, d: &Plane) -> f32 {
-        const BANDS: usize = 16;
-        let per = self.idx.len().div_ceil(BANDS).max(32);
+/// The windows of a `full_w × full_h` frame the statistics are measured on: the whole frame up to the
+/// area of `GRID²` tiles, else `GRID × GRID` tiles spread evenly over it.
+pub fn tiles(full_w: usize, full_h: usize) -> Vec<crate::PixelWindow> {
+    if full_w * full_h <= GRID * GRID * TILE * TILE || full_w < 2 * TILE || full_h < 2 * TILE {
+        return vec![crate::PixelWindow { x: 0, y: 0, w: full_w, h: full_h }];
+    }
+    let at = |n: usize, k: usize| ((n - TILE) as f64 * (k as f64 + 0.5) / GRID as f64).round() as usize;
+    (0..GRID * GRID).map(|k| crate::PixelWindow { x: at(full_w, k % GRID), y: at(full_h, k / GRID), w: TILE, h: TILE }).collect()
+}
+
+/// Brightness for the noise level: the second smoothing (a few px), so each side of an edge keeps
+/// its own level.
+fn levels_of(img: &Rgb32f) -> (Plane, Plane, Plane) {
+    let y = Plane { width: img.width, height: img.height, data: img.data.iter().map(|&c| luminance_2020(c)).collect() };
+    let c1 = smooth(&y, 0);
+    let c2 = smooth(&c1, 1);
+    (y, c1, c2)
+}
+
+/// The noise model and level gains of `tiles` (white-balanced linear RGB at output scale).
+///
+/// Level gain: `d_j² / var(c2)` at the noise samples, median per brightness band (16 bands), the
+/// 30 % quantile of the bands. Texture only raises some bands; the quantile follows the flat ones.
+pub fn stats(tiles: &[Rgb32f]) -> Stats {
+    let tiles: Vec<&Rgb32f> = tiles.iter().filter(|t| t.width >= 8 && t.height >= 8).collect();
+    let stride = crate::nrc_joint::noise_sample_stride(tiles.iter().map(|t| t.len()).sum());
+    let samples = tiles.iter().flat_map(|t| noise_samples_of(t, stride, yuv)).collect();
+    let noise = noise_from_samples(samples);
+    // brightness and the detail of each level at every stride-th pixel of each tile
+    let mut bright: Vec<f32> = Vec::new();
+    let mut detail: [Vec<f32>; LEVELS] = std::array::from_fn(|_| Vec::new());
+    for t in &tiles {
+        let (y, c1, c2) = levels_of(t);
+        let idx: Vec<usize> = (0..t.len()).step_by(stride.max(1)).collect();
+        bright.extend(idx.iter().map(|&i| c2.data[i]));
+        let mut levels = vec![y, c1, c2];
+        for (j, d) in detail.iter_mut().enumerate() {
+            if levels.len() < j + 2 {
+                let next = smooth(&levels[j], j);
+                levels.push(next);
+            }
+            d.extend(idx.iter().map(|&i| levels[j].data[i] - levels[j + 1].data[i]));
+        }
+    }
+    let mut order: Vec<usize> = (0..bright.len()).collect();
+    order.sort_by(|&a, &b| bright[a].total_cmp(&bright[b]).then(a.cmp(&b)));
+    let var: Vec<f32> = order.iter().map(|&i| noise.var(0, bright[i])).collect();
+    const BANDS: usize = 16;
+    let per = order.len().div_ceil(BANDS).max(32);
+    let gains = detail.map(|d| {
         let mut med: Vec<f32> = Vec::new();
         let mut r: Vec<f32> = Vec::with_capacity(per);
-        for (band, var) in self.idx.chunks(per).zip(self.var.chunks(per)) {
+        for (band, var) in order.chunks(per).zip(var.chunks(per)) {
             if band.len() < 32 {
                 continue;
             }
             r.clear();
-            r.extend(band.iter().zip(var).map(|(&i, &v)| d.data[i] * d.data[i] / v));
+            r.extend(band.iter().zip(var).map(|(&i, &v)| d[i] * d[i] / v));
             let m = r.len() / 2;
             let (_, v, _) = r.select_nth_unstable_by(m, f32::total_cmp);
             med.push(*v / 0.454_936_4);
         }
-        if med.is_empty() {
-            return 0.0;
-        }
         med.sort_by(f32::total_cmp);
-        med[((med.len() - 1) as f32 * 0.3).round() as usize]
-    }
+        med.get(((med.len().max(1) - 1) as f32 * 0.3).round() as usize).copied().unwrap_or(0.0)
+    });
+    Stats { noise, gains }
 }
 
-/// Luminance noise reduction of linear RGB in place.
-pub fn denoise(img: &mut Rgb32f, p: &Params) {
+/// Luminance noise reduction of linear RGB in place, with `stats` of the whole frame (`None`:
+/// measured on `img`).
+pub fn denoise(img: &mut Rgb32f, p: &Params, stats: Option<&Stats>) {
     if img.width < 8 || img.height < 8 || p.amount <= 0.0 {
         return;
     }
@@ -210,32 +268,33 @@ pub fn denoise(img: &mut Rgb32f, p: &Params) {
             *t = Some(std::time::Instant::now());
         }
     };
+    let own;
+    let Stats { noise, gains } = match stats {
+        Some(s) => s,
+        None => {
+            own = self::stats(std::slice::from_ref(&*img));
+            &own
+        }
+    };
+    lap("stats", &mut tt);
     let (w, h) = (img.width, img.height);
-    let noise = noise_model_of(img, yuv);
-    lap("noise model", &mut tt);
-    let y = Plane { width: w, height: h, data: img.data.iter().map(|&c| luminance_2020(c)).collect() };
-    let c1 = smooth(&y, 0);
-    let c2 = smooth(&c1, 1);
-    // brightness for the noise level: a few px, so each side of an edge keeps its own level
-    let bands = Bands::new(&c2, &noise);
+    let (y, c1, c2) = levels_of(img);
     let var = c2.map(|v| noise.var(0, v));
-    lap("y, c1, c2, bands, var", &mut tt);
+    lap("y, c1, c2, var", &mut tt);
     let mut out = Plane::new(w, h);
-    let mut gains = [0.0f32; LEVELS];
     let mut levels: Vec<Plane> = vec![y.clone(), c1, c2];
-    for (j, gain) in gains.iter_mut().enumerate() {
+    for (j, gain) in gains.iter().enumerate() {
         if levels.len() < j + 2 {
             let next = smooth(&levels[j], j);
             levels.push(next);
         }
         lap("smooth", &mut tt);
         let d = levels[j].zip_map(&levels[j + 1], |a, b| a - b);
-        *gain = bands.gain(&d);
-        lap("detail + gain", &mut tt);
+        lap("detail", &mut tt);
         let e = energy(&d, j);
         lap("energy", &mut tt);
         let t = threshold(p, j);
-        let k = t * t * *gain;
+        let k = t * t * gain;
         for_rows(&mut out.data, w, |row, o| {
             let i0 = row * w;
             for (x, o) in o.iter_mut().enumerate() {
@@ -261,7 +320,8 @@ pub fn denoise(img: &mut Rgb32f, p: &Params) {
         for (x, c) in px.iter_mut().enumerate() {
             let i = i0 + x;
             let dy = out.data[i] + back.data[i] - y.data[i];
-            *c = c.map(|v| v + dy);
+            // no new negative values: the undershoot next to edges would reach the later stages' floors
+            *c = c.map(|v| (v + dy).max(v.min(0.0)));
         }
     });
     lap("bias + apply", &mut tt);
@@ -312,7 +372,7 @@ mod tests {
     fn reduces_noise_in_shadows_and_keeps_the_mean() {
         let (_, mut img) = noisy(256, 128, |x, _| if x < 128 { 0.004 } else { 0.2 }, |y| (0.002 * y + 4e-6).sqrt());
         let before = [stats(&img, 16..112, 16..112), stats(&img, 144..240, 16..112)];
-        denoise(&mut img, &Params { amount: 0.5, detail: 0.5, contrast: 0.0 });
+        denoise(&mut img, &Params { amount: 0.5, detail: 0.5, contrast: 0.0 }, None);
         let after = [stats(&img, 16..112, 16..112), stats(&img, 144..240, 16..112)];
         for (b, a) in before.iter().zip(&after) {
             assert!(a.1 < 0.5 * b.1, "noise {} -> {}", b.1, a.1);
@@ -325,7 +385,7 @@ mod tests {
     fn black_pixels_are_not_kept_black() {
         let (_, mut img) = noisy(64, 64, |_, _| 0.05, |y| (0.002 * y + 4e-6).sqrt());
         img.data[32 * 64 + 32] = [0.0; 3];
-        denoise(&mut img, &Params { amount: 1.0, detail: 0.5, contrast: 0.0 });
+        denoise(&mut img, &Params { amount: 1.0, detail: 0.5, contrast: 0.0 }, None);
         assert!(luminance_2020(img.data[32 * 64 + 32]) > 0.01);
     }
 
@@ -335,12 +395,29 @@ mod tests {
         let (_, img) = noisy(128, 128, |x, y| 0.1 + 0.02 * ((x / 16 + y / 16) % 2) as f32, |y| (0.002 * y + 4e-6).sqrt());
         let run = |detail, contrast| {
             let mut a = img.clone();
-            denoise(&mut a, &Params { amount: 0.5, detail, contrast });
+            denoise(&mut a, &Params { amount: 0.5, detail, contrast }, None);
             a
         };
         let base = run(0.5, 0.0);
         assert_ne!(base.data, run(0.5, 1.0).data);
         assert_ne!(base.data, run(1.0, 0.0).data);
+    }
+
+    /// Scaling the input scales the output (exposure is applied after the filter).
+    #[test]
+    fn scaling_the_input_scales_the_output() {
+        let src = lightcraft_scenes::demo_library()[0].render(200, 133);
+        let g = 2f32.powf(1.3);
+        let p = Params { amount: 0.3, detail: 0.5, contrast: 0.0 };
+        let mut a = src.clone();
+        denoise(&mut a, &p, None);
+        let mut b = src.map(|c| c.map(|v| v * g));
+        denoise(&mut b, &p, None);
+        for (x, y) in a.data.iter().zip(&b.data) {
+            for k in 0..3 {
+                assert!((x[k] - y[k] / g).abs() <= 1e-3 * x[k].abs().max(1e-3), "{x:?} vs {:?}", y.map(|v| v / g));
+            }
+        }
     }
 
     #[test]
@@ -349,3 +426,4 @@ mod tests {
         assert_eq!(med9(v), 5.0);
     }
 }
+

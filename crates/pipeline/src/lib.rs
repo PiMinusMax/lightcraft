@@ -372,6 +372,8 @@ pub struct Plan<'a> {
     pub keep: Option<PixelWindow>,
     /// The source's segmentation mattes ([`SourceInfo::mattes`]).
     pub mattes: Option<Arc<masks::Mattes>>,
+    /// The whole output frame and its size (`frame` is a window's part of it).
+    pub full: (geometry::Frame, usize, usize),
 }
 
 /// Long edge of the small render a windowed render estimates the whole frame's airlight from.
@@ -400,6 +402,7 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
     let px_per_long = frame.px_per_long(full_w);
     let mut fixed_air = None;
     let mut keep = None;
+    let full = (frame.clone(), full_w, full_h);
     let (frame, w, h) = match req.window {
         Some(win) => {
             let win = win.clamped(full_w, full_h);
@@ -410,13 +413,16 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
             }
             // (spots grow the rendered window; only 8-bit renders are cut back to the request)
             let mut work = if req.depth == OutputDepth::U8 { spots::window_for_reads(s, &frame, full_w, full_h, px_per_long, win) } else { win };
-            if req.depth == OutputDepth::U8
-                && local::nrc_joint_enabled()
-                && let Some(params) = local::nrc_params(s, src.width.max(src.height), frame.output_long(full_w, full_h))
-            {
-                // The joint diffusion reads a chain of neighbours across its scales. Keep
-                // those reads outside the requested zoom window, just as spot reads are.
-                let halo = params.passes.last().map_or(0, |p| (6.0 * p.sigma).ceil() as usize).saturating_add(4);
+            // The joint diffusion reads a chain of neighbours across its scales, the luminance
+            // wavelet its coarsest level. Keep those reads outside the requested zoom window, just
+            // as spot reads are.
+            let joint = local::nrc_joint_enabled()
+                .then(|| local::nrc_params(s, src.width.max(src.height), frame.output_long(full_w, full_h)))
+                .flatten()
+                .map_or(0, |params| params.passes.last().map_or(0, |p| (6.0 * p.sigma).ceil() as usize).saturating_add(4));
+            let lum = if s.detail.nr_luminance > 0.0 && nrl::enabled() { nrl::halo() } else { 0 };
+            let halo = joint.max(lum);
+            if req.depth == OutputDepth::U8 && halo > 0 {
                 let x = work.x.saturating_sub(halo);
                 let y = work.y.saturating_sub(halo);
                 let right = work.x.saturating_add(work.w).saturating_add(halo).min(full_w);
@@ -447,7 +453,47 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         [d.nr_luminance, d.nr_detail, d.nr_contrast, d.nr_color, d.nr_color_detail, d.nr_color_smoothness].map(f64::to_bits),
         src_long,
     ));
-    Plan { settings, frame, w, h, px_per_long, src_long, geo, lin_key, eyes, fixed_air, keep, mattes: info.mattes.clone() }
+    Plan { settings, frame, w, h, px_per_long, src_long, geo, lin_key, eyes, fixed_air, keep, mattes: info.mattes.clone(), full }
+}
+
+/// The wavelet luminance NR's statistics, measured on fixed tiles of the whole frame (see
+/// [`nrl::tiles`]) so that every window of it is filtered alike. The tiles are resampled,
+/// tone-mapped and white-balanced like the frame; the retouching and the colour NR, which leaves Y
+/// alone, are left out. `None` when the luminance NR is off.
+pub fn lum_stats(src: &Rgb32f, info: &SourceInfo, p: &Plan<'_>) -> Option<nrl::Stats> {
+    let s = &*p.settings;
+    if s.detail.nr_luminance <= 0.0 || !nrl::enabled() {
+        return None;
+    }
+    let t = profiling().then(std::time::Instant::now);
+    let (full, fw, fh) = &p.full;
+    let tiles: Vec<Rgb32f> = nrl::tiles(*fw, *fh)
+        .into_iter()
+        .map(|t| {
+            let frame = if (t.w, t.h) == (*fw, *fh) { full.clone() } else { full.window(*fw, *fh, t) };
+            let mut img = frame.sample(src, t.w, t.h);
+            let tile = Plan {
+                settings: Cow::Borrowed(s),
+                frame,
+                w: t.w,
+                h: t.h,
+                eyes: Vec::new(),
+                fixed_air: None,
+                keep: None,
+                mattes: None,
+                full: p.full.clone(),
+                ..*p
+            };
+            local_tone::apply(&mut img, info, &tile);
+            local::white_balance(&mut img, info, s);
+            img
+        })
+        .collect();
+    let stats = nrl::stats(&tiles);
+    if let Some(t) = t {
+        eprintln!("    nr luminance statistics ({} tiles): {:.0} ms", tiles.len(), t.elapsed().as_secs_f64() * 1e3);
+    }
+    Some(stats)
 }
 
 /// Whether the scene-linear stage needs work only the CPU does (defringe, spot removal).
@@ -531,7 +577,7 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
             // Without a cache the resampled buffer is ours: work on it in place.
             let mut img = if shared.is_some() { (*sampled).clone() } else { Arc::unwrap_or_clone(sampled.clone()) };
             lin_cpu(&mut img, info, &plan);
-            local::denoise(&mut img, s, src_long, frame.output_long(w, h));
+            local::denoise(&mut img, s, src_long, frame.output_long(w, h), lum_stats(src_img, info, &plan).as_ref());
             Arc::new(img)
         }
     };

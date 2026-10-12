@@ -187,6 +187,21 @@ fn noise_reduction_does_not_depend_on_the_window() {
     }
 }
 
+// Given luminance noise reduction on a frame larger than its statistics tiles, a zoomed window is
+// filtered like the same pixels of the whole render
+#[test]
+fn luminance_nr_at_depth_matches_the_whole_render() {
+    let mut s = DevelopSettings::default();
+    controls::set(&mut s, "detail.nrLuminance", 80.0);
+    let src = noisy_scene();
+    let (fw, fh) = (2400, 1600);
+    let f = render(&src, &SourceInfo::default(), &s, &RenderRequest::fit(fw, fh)).image;
+    let win = PixelWindow { x: 1100, y: 500, w: 512, h: 384 };
+    let w = render(&src, &SourceInfo::default(), &s, &RenderRequest { window: Some(win), ..RenderRequest::fit(fw, fh) }).image;
+    let (max, mean) = compare(&f, &w, win);
+    assert!(max <= 3 && mean <= 0.15, "max {max} (≤ 3), mean {mean:.3} (≤ 0.15)");
+}
+
 // Given a mask with Refine Edges, the refinement width follows the whole frame's size
 #[test]
 fn mask_edge_refinement_does_not_depend_on_the_window() {

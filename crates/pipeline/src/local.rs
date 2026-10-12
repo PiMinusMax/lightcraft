@@ -160,7 +160,8 @@ pub fn nr_params(s: &DevelopSettings, src_long: usize, out_long: usize) -> (Opti
 /// Noise reduction at output resolution: luminance via an edge-aware self-guided filter on
 /// log-luminance, colour by blurring chromaticity (rgb / Y) and re-applying the original luminance.
 /// Radii scale with how much the source was downsampled (preview noise is already averaged out).
-pub fn denoise(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long: usize) {
+/// `lum_stats`: the statistics of the wavelet luminance NR from the whole frame (`None`: from `img`).
+pub fn denoise(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long: usize, lum_stats: Option<&crate::nrl::Stats>) {
     let (lum, col) = nr_params(s, src_long, out_long);
     let w = img.width;
     // PROTOTYPE (#1129): the wavelet luminance NR runs after the colour NR, which leaves Y unchanged.
@@ -210,7 +211,7 @@ pub fn denoise(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long:
             detail: (d.nr_detail / 100.0) as f32,
             contrast: (d.nr_contrast / 100.0) as f32,
         };
-        crate::nrl::denoise(img, &p);
+        crate::nrl::denoise(img, &p, lum_stats);
     }
 }
 
@@ -1149,7 +1150,7 @@ mod nr_tests {
         let (v0, m0) = var(&img);
         let mut s = DevelopSettings::default();
         s.detail.nr_luminance = 80.0;
-        denoise(&mut img, &s, 64, 64);
+        denoise(&mut img, &s, 64, 64, None);
         let (v1, m1) = var(&img);
         assert!(v1 < v0 * 0.5, "{v0} -> {v1}");
         assert!((m1 - m0).abs() < 0.01);

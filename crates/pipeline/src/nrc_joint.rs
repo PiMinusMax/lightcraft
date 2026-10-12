@@ -41,12 +41,20 @@ fn noise_model(img: &Rgb32f) -> JointNoise {
 /// [`noise_model`] of the guide `transform(rgb)` of each pixel (e.g. [`yuv`] of linear RGB), without
 /// building the transformed image.
 pub(crate) fn noise_model_of(img: &Rgb32f, transform: impl Fn([f32; 3]) -> [f32; 3]) -> JointNoise {
-    let mut samples = Vec::new();
-    let stride = noise_sample_stride(img.len());
     if img.width < 3 || img.height < 3 {
         return JointNoise { model: NrcNoise { alpha: [0.0; 3], beta: [1e-14; 3] }, ymax: [0.0; 3], tolerance: 1.0 };
     }
-    for index in (0..img.len()).step_by(stride) {
+    noise_from_samples(noise_samples_of(img, noise_sample_stride(img.len()), transform))
+}
+
+/// The noise samples of [`noise_model_of`] at every `stride`-th pixel of `img` (none for images
+/// smaller than 3 × 3).
+pub(crate) fn noise_samples_of(img: &Rgb32f, stride: usize, transform: impl Fn([f32; 3]) -> [f32; 3]) -> Vec<NoiseSample> {
+    let mut samples = Vec::new();
+    if img.width < 3 || img.height < 3 {
+        return samples;
+    }
+    for index in (0..img.len()).step_by(stride.max(1)) {
         let (x, y) = (index % img.width, index / img.width);
         if x == 0 || y == 0 || x + 1 == img.width || y + 1 == img.height {
             continue;
@@ -74,7 +82,7 @@ pub(crate) fn noise_model_of(img: &Rgb32f, transform: impl Fn([f32; 3]) -> [f32;
             samples.push((brightness.max(0.0), residual));
         }
     }
-    noise_from_samples(samples)
+    samples
 }
 
 /// Distance between the noise samples of a `len`-pixel plane (CPU and GPU take the same pixels).
