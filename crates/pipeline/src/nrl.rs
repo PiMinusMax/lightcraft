@@ -45,9 +45,14 @@ pub fn halo() -> usize {
     wavelet + reach(energy_sigma(LEVELS - 1)) + 4
 }
 
-/// Threshold of level `j` in noise sigmas of that level.
+/// Threshold of level `j` in noise sigmas of that level. Amount: the noise left on a flat area falls
+/// about evenly in log steps (quality probe H: 1 px RMS 78, 53, 30, 19, 13 % at 10, 25, 50, 75, 100) and
+/// flattens towards 100, which would otherwise take fine texture. Detail lowers the threshold on the
+/// fine levels (Amount 50: 16–51 % noise left), Contrast on the coarse ones (coarse noise and faint coarse
+/// texture kept from about half to most).
 pub fn threshold(p: &Params, j: usize) -> f32 {
-    let t = (2.0 * p.amount.clamp(0.0, 1.0)).sqrt();
+    let a = p.amount.clamp(0.0, 1.0);
+    let t = (2.0 * a * (1.0 - 0.25 * a)).sqrt();
     let f = if j < ROBUST_LEVELS { 1.25 - 0.5 * p.detail.clamp(0.0, 1.0) } else { 1.0 - 0.8 * p.contrast.clamp(0.0, 1.0) };
     t * f
 }
@@ -331,7 +336,12 @@ fn fit_level0(blocks: &mut [(f32, f32)]) -> JointNoise {
 /// `c` with its luminance changed by `dy`, the same in each channel as far as no channel goes below
 /// `min(v, 0)` (no new negative values: the undershoot next to edges would reach the later stages'
 /// floors). What a floored channel cannot take is moved to the others, so the luminance change stays
-/// whole as long as any channel can take it; only then do the channels' differences change.
+/// whole as long as any channel can take it; only then do the channels' differences change: a channel
+/// near its floor, also in a bright saturated colour, so the limit is per channel, not per brightness.
+/// Measured on noisy saturated colours (quality probe G, Amount 100): the mean of R−G, B−G moves by
+/// ≤ 0.3 % at full brightness, 1–4 % at a tenth, up to 14 % (less saturated) at a fiftieth, where the
+/// noise is as large as the colour; next to an edge no more than inside. Keeping these differences
+/// instead would leave the darkening undone and brighten the shadows.
 fn add_luminance(c: [f32; 3], dy: f32) -> [f32; 3] {
     let floor = c.map(|v| v.min(0.0));
     if (0..3).all(|k| c[k] + dy >= floor[k]) {
@@ -805,6 +815,110 @@ mod tests {
             (1.0 - (r - 50.0).abs()).max(0.0) as f32
         });
         row("segments 9 px", &|x, y| if x % 32 == 16 && (12..21).contains(&(y % 32)) { 1.0 } else { 0.0 });
+        // G: saturated colour next to grey (edge at x = 128), noise per channel σ² = 4e-4·c + 1e-6, own statistics,
+        // colours at full, 1/10 and 1/50 brightness. Chroma shift: |Δ mean (R−G, B−G)| from input to output over
+        // |mean (R−G, B−G)| of the clean colour, in the colour's interior and in the 4 px next to the edge;
+        // Y: relative change of its mean there.
+        let noisy_rgb = |clean: &Rgb32f, seed: u32| {
+            let mut z = Rgb32f::filled(w, h, [0.0; 3]);
+            add_noise(&mut z, 1.0, seed);
+            let mut z2 = Rgb32f::filled(w, h, [0.0; 3]);
+            add_noise(&mut z2, 1.0, seed + 100);
+            let mut z3 = Rgb32f::filled(w, h, [0.0; 3]);
+            add_noise(&mut z3, 1.0, seed + 200);
+            let mut img = clean.clone();
+            for (i, p) in img.data.iter_mut().enumerate() {
+                let n = [z.data[i][0], z2.data[i][0], z3.data[i][0]];
+                *p = std::array::from_fn(|k| p[k] + n[k] * (4e-4 * p[k].max(0.0) + 1e-6).sqrt());
+            }
+            img
+        };
+        for (name, colour) in [("red", [0.2f32, 0.004, 0.004]), ("blue", [0.003, 0.006, 0.15]), ("green", [0.01, 0.12, 0.005])] {
+            for k in [1.0f32, 0.1, 0.02] {
+                let c = colour.map(|v| v * k);
+                let grey = [luminance_2020(c); 3];
+                let clean = Rgb32f::from_fn(w, h, |x, _| if x < 128 { c } else { grey });
+                let img = noisy_rgb(&clean, 23);
+                let region = |im: &Rgb32f, xs: std::ops::Range<usize>| {
+                    let mut m = [0.0f64; 3];
+                    let mut n = 0.0;
+                    for y in 16..240 {
+                        for x in xs.clone() {
+                            let p = im.data[y * w + x];
+                            m = std::array::from_fn(|i| m[i] + p[i] as f64);
+                            n += 1.0;
+                        }
+                    }
+                    m.map(|v| v / n)
+                };
+                let diff = |m: [f64; 3]| (m[0] - m[1], m[2] - m[1]);
+                let (cr, cb) = diff(c.map(f64::from));
+                let size = (cr * cr + cb * cb).sqrt();
+                let f: Vec<String> = [0.5f32, 1.0]
+                    .iter()
+                    .map(|&a| {
+                        let out = run(&img, a, None);
+                        let part = |xs: std::ops::Range<usize>| {
+                            let (i, o) = (region(&img, xs.clone()), region(&out, xs));
+                            let ((ir, ib), (or, ob)) = (diff(i), diff(o));
+                            let yl = |m: [f64; 3]| 0.2627 * m[0] + 0.678 * m[1] + 0.0593 * m[2];
+                            (100.0 * ((or - ir).powi(2) + (ob - ib).powi(2)).sqrt() / size, 100.0 * (yl(o) / yl(i) - 1.0))
+                        };
+                        let ((ci, yi), (ce, ye)) = (part(16..112), part(124..128));
+                        format!("{a}: inside chroma {ci:4.1}% Y {yi:+5.1}%, edge chroma {ce:4.1}% Y {ye:+5.1}%")
+                    })
+                    .collect();
+                eprintln!("G {name} ×{k}: {}", f.join("  "));
+            }
+        }
+        // H: slider curves, statistics of the flat image. Flat noise left (RMS at 1 and 16 px), texture kept
+        // (period 8 and 32, amplitude 0.01 on 0.1 with noise) and a 5σ line one pixel aside every two rows kept.
+        let measure = |p: Params| {
+            let go = |img: &Rgb32f| {
+                let mut o = img.clone();
+                denoise(&mut o, &p, Some(&flat_stats));
+                o
+            };
+            let (c, i, o) = (y_of(&flat_clean), y_of(&flat), y_of(&go(&flat)));
+            let n1 = 100.0 * rms_at(&o, &c, w, h, 1) / rms_at(&i, &c, w, h, 1);
+            let n16 = 100.0 * rms_at(&o, &c, w, h, 16) / rms_at(&i, &c, w, h, 16);
+            let tex = |period: f32, amp: f64| {
+                let t: Vec<f64> = (0..w * h)
+                    .map(|i| {
+                        amp * ((i % w) as f32 * std::f32::consts::TAU / period).sin() as f64
+                            * ((i / w) as f32 * std::f32::consts::TAU / period).sin() as f64
+                    })
+                    .collect();
+                let mut img = Rgb32f::from_fn(w, h, |x, y| [0.1 + t[y * w + x] as f32; 3]);
+                add_noise(&mut img, SIGMA, 13);
+                let o = y_of(&go(&img));
+                100.0 * o.iter().zip(&t).map(|(o, t)| (o - 0.1) * t).sum::<f64>() / t.iter().map(|t| t * t).sum::<f64>()
+            };
+            let line = {
+                let shape =
+                    |x: usize, y: usize| if (20..236).contains(&y) && x as f64 == (128.0 + (y as f64 - 128.0) * 0.5).round() { 1.0 } else { 0.0 };
+                let s: Vec<f64> = (0..w * h).map(|i| shape(i % w, i / w)).collect();
+                let mut img = Rgb32f::from_fn(w, h, |x, y| [0.05 + 5.0 * SIGMA * shape(x, y) as f32; 3]);
+                add_noise(&mut img, SIGMA, 11);
+                let o = y_of(&go(&img));
+                100.0 * o.iter().zip(&s).map(|(o, s)| (o - 0.05) * s).sum::<f64>() / (s.iter().sum::<f64>() * (5.0 * SIGMA) as f64)
+            };
+            format!(
+                "noise 1px {n1:5.1}% 16px {n16:5.1}%  texture p8 {:5.1}% p32 {:5.1}% p32 faint {:5.1}%  line 5σ {line:5.1}%",
+                tex(8.0, 0.01),
+                tex(32.0, 0.01),
+                tex(32.0, 0.001)
+            )
+        };
+        for a in [0.1f32, 0.25, 0.5, 0.75, 1.0] {
+            eprintln!("H amount {a} (detail 0.5, contrast 0): {}", measure(Params { amount: a, detail: 0.5, contrast: 0.0 }));
+        }
+        for d in [0.0f32, 0.25, 0.75, 1.0] {
+            eprintln!("H detail {d} (amount 0.5, contrast 0): {}", measure(Params { amount: 0.5, detail: d, contrast: 0.0 }));
+        }
+        for c in [0.25f32, 0.5, 0.75, 1.0] {
+            eprintln!("H contrast {c} (amount 0.5, detail 0.5): {}", measure(Params { amount: 0.5, detail: 0.5, contrast: c }));
+        }
         // E: dark colour: chroma differences kept
         for base in [[0.001f32, 0.02, 0.04], [0.0005, 0.004, 0.01]] {
             let mut img = Rgb32f::filled(w, h, base);
