@@ -103,32 +103,67 @@ fn smooth(src: &Plane, j: usize) -> Plane {
     out
 }
 
-/// `E[max(min(a, b))²]` over the four directions for independent unit Gaussian samples (simulated).
-const DIRECTIONAL_MEAN_SQUARE: f32 = 0.932;
+/// `E[max(min(|a|, |b|))²] / E[d²]` over the eight directions for the noise of the two fine levels
+/// (white noise through the wavelet; test `directional_energy_is_calibrated`).
+const DIRECTIONAL_MEAN_SQUARE: f32 = 1.977;
+
+/// The directions of the fine-level energy as steps in half the level's reach: horizontal, vertical,
+/// both diagonals and the four angles between (a line one pixel aside every two rows).
+const DIRECTIONS: [(isize, isize); 8] = [(2, 0), (0, 2), (2, 2), (2, -2), (1, 2), (-1, 2), (2, 1), (2, -1)];
 
 /// Local energy of the detail plane `d` (level `j`) as an estimate of its mean square. On the fine levels:
-/// along each of four directions (horizontal, vertical, both diagonals) the smaller `|d|` of the two
-/// samples `2^(j+1)` px to either side, the largest of the four, squared and scaled to the mean
-/// square of Gaussian noise. A line or edge is supported along its own direction; the pixel itself
-/// does not count, so an isolated outlier does not protect itself. On the coarse levels a Gaussian mean.
+/// along each of eight directions ([`DIRECTIONS`]) the smaller `|d|` of the two samples `2^(j+1)` px to
+/// either side, each sample the largest within ±1 px across the direction (the diagonals: none), the
+/// largest of the eight, squared and scaled to the mean square of noise. A line or edge of any angle is
+/// supported along its own direction; the pixel itself does not count, so an isolated outlier does not
+/// protect itself. On the coarse levels a Gaussian mean.
 fn energy(d: &Plane, j: usize) -> Plane {
     let (w, h) = (d.width, d.height);
     if j < ROBUST_LEVELS {
-        let s = 2usize << j;
+        let half = 1usize << j;
+        let s = 2 * half;
         let mut e = Plane::new(w, h);
+        // |d| of row r, padded by s + 1 on each side
+        let row_abs = |r: isize, pad: &mut Vec<f32>| {
+            let r = mirror(r, h);
+            pad_row(&d.data[r * w..(r + 1) * w], s + 1, pad);
+            pad.iter_mut().for_each(|v| *v = v.abs());
+        };
         for_rows(&mut e.data, w, |y, row| {
-            let mut pads: [Vec<f32>; 3] = std::array::from_fn(|_| Vec::with_capacity(w + 2 * s));
-            for (k, pad) in pads.iter_mut().enumerate() {
-                let r = mirror(y as isize + (k as isize - 1) * s as isize, h);
-                pad_row(&d.data[r * w..(r + 1) * w], s, pad);
-                pad.iter_mut().for_each(|v| *v = v.abs());
+            let n = w + 2 * s + 2;
+            // per step dy (−2..=2 in half reaches): |d|, its horizontal 3-max, and its vertical 3-max
+            let mut plain: [Vec<f32>; 5] = std::array::from_fn(|_| Vec::with_capacity(n));
+            let mut across_h: [Vec<f32>; 5] = std::array::from_fn(|_| vec![0.0; n]);
+            let mut across_v: [Vec<f32>; 5] = std::array::from_fn(|_| Vec::with_capacity(n));
+            let (mut above, mut below) = (Vec::with_capacity(n), Vec::with_capacity(n));
+            for k in 0..5 {
+                let r = y as isize + (k as isize - 2) * half as isize;
+                row_abs(r, &mut plain[k]);
+                row_abs(r - 1, &mut above);
+                row_abs(r + 1, &mut below);
+                let p = &plain[k];
+                across_v[k].extend(p.iter().zip(&above).zip(&below).map(|((a, b), c)| a.max(*b).max(*c)));
+                for i in 1..n - 1 {
+                    across_h[k][i] = p[i - 1].max(p[i]).max(p[i + 1]);
+                }
             }
-            // pads[row][x + dx] for dx in 0, s, 2s: left, centre, right
-            let at = |r: usize, k: usize| &pads[r][k * s..k * s + w];
-            let (up, down) = ((at(0, 0), at(0, 1), at(0, 2)), (at(2, 0), at(2, 1), at(2, 2)));
-            let (left, right) = (at(1, 0), at(1, 2));
+            fn at(rows: &[Vec<f32>; 5], dx: isize, dy: isize, s: usize, half: usize, w: usize) -> &[f32] {
+                let o = (s as isize + 1 + dx * half as isize) as usize;
+                &rows[(2 + dy) as usize][o..o + w]
+            }
+            let pairs: [(&[f32], &[f32]); 8] = DIRECTIONS.map(|(dx, dy)| {
+                // near-horizontal directions look up and down, near-vertical ones left and right
+                let rows = if dx.abs() == dy.abs() || dx == 0 || dy == 0 {
+                    &plain
+                } else if dx.abs() > dy.abs() {
+                    &across_v
+                } else {
+                    &across_h
+                };
+                (at(rows, dx, dy, s, half, w), at(rows, -dx, -dy, s, half, w))
+            });
             for (x, o) in row.iter_mut().enumerate() {
-                let m = left[x].min(right[x]).max(up.1[x].min(down.1[x])).max(up.0[x].min(down.2[x])).max(up.2[x].min(down.0[x]));
+                let m = pairs.iter().map(|(a, b)| a[x].min(b[x])).fold(0.0f32, f32::max);
                 *o = m * m / DIRECTIONAL_MEAN_SQUARE;
             }
         });
@@ -533,16 +568,31 @@ mod tests {
     }
 
     /// A one pixel wide line ten noise sigmas above its flat surround keeps nearly all of its contrast at
-    /// Amount 100 (the median of a 3 × 3 neighbourhood took it for noise and kept 64 %).
+    /// Amount 100 at any angle (the median of a 3 × 3 neighbourhood took it for noise and kept 64 %; four
+    /// fixed directions kept 68 % of a line one pixel aside every two rows).
     #[test]
     fn thin_lines_are_kept() {
         let (w, h) = (256, 256);
-        let clean = Rgb32f::from_fn(w, h, |x, _| [0.05 + if x == 128 { 10.0 * SIGMA } else { 0.0 }; 3]);
-        let mut img = clean.clone();
-        add_noise(&mut img, SIGMA, 11);
-        let out = y_of(&run(&img, 1.0, None));
-        let contrast = (32..224).map(|r| out[r * w + 128] - 0.5 * (out[r * w + 108] + out[r * w + 148])).sum::<f64>() / 192.0;
-        assert!(contrast > 0.85 * 10.0 * SIGMA as f64, "line contrast {contrast} of {}", 10.0 * SIGMA);
+        let mut flat = Rgb32f::filled(w, h, [0.05; 3]);
+        add_noise(&mut flat, SIGMA, 7);
+        let stats = super::stats(std::slice::from_ref(&flat));
+        for slope in [0.0f64, 0.25, 0.5, 0.75, 1.0, 1.5] {
+            let at = |y: usize| (128.0 + (y as f64 - 128.0) * slope / slope.max(1.0)).round() as usize;
+            // steeper than 45°: the transposed line
+            let on = |x: usize, y: usize| if slope > 1.0 { y == at(x) } else { x == at(y) };
+            let clean = Rgb32f::from_fn(w, h, |x, y| [0.05 + if on(x, y) { 10.0 * SIGMA } else { 0.0 }; 3]);
+            let mut img = clean.clone();
+            add_noise(&mut img, SIGMA, 11);
+            let out = y_of(&run(&img, 1.0, Some(&stats)));
+            let mut contrast = 0.0;
+            for r in 64..192 {
+                let i = |x: usize, y: usize| if slope > 1.0 { x * w + y } else { y * w + x };
+                let p = at(r);
+                contrast += out[i(p, r)] - 0.5 * (out[i(p - 20, r)] + out[i(p + 20, r)]);
+            }
+            contrast /= 128.0;
+            assert!(contrast > 0.85 * 10.0 * SIGMA as f64, "slope {slope}: line contrast {contrast} of {}", 10.0 * SIGMA);
+        }
     }
 
     /// Isolated specks eight noise sigmas off do not protect themselves.
@@ -577,6 +627,23 @@ mod tests {
             let room: f32 = (0..3).map(|k| (c[k] - c[k].min(0.0)) * lightcraft_color::LUMA_2020[k]).sum();
             let want = dy.max(-room);
             assert!((y(out) - y(c) - want).abs() < 1e-6, "{c:?} {dy} -> {out:?}: {} instead of {want}", y(out) - y(c));
+        }
+    }
+
+    #[test]
+    fn directional_energy_is_calibrated() {
+        let (w, h) = (512usize, 512usize);
+        let mut img = Rgb32f::filled(w, h, [0.0; 3]);
+        add_noise(&mut img, 1.0, 5);
+        let mut c = Plane { width: w, height: h, data: img.data.iter().map(|&c| luminance_2020(c)).collect() };
+        for j in 0..ROBUST_LEVELS {
+            let next = smooth(&c, j);
+            let d = c.zip_map(&next, |a, b| a - b);
+            let e = energy(&d, j);
+            let ratio = e.data.iter().map(|&v| f64::from(v)).sum::<f64>() / d.data.iter().map(|&v| f64::from(v * v)).sum::<f64>();
+            eprintln!("level {j}: energy / mean square {ratio:.4}");
+            assert!((ratio - 1.0).abs() < 0.03, "level {j}: {ratio}");
+            c = next;
         }
     }
 
@@ -701,6 +768,43 @@ mod tests {
             })
             .collect();
         eprintln!("D specks ±8σ left: {}", f.join("  "));
+        // F: thin structures at other angles, statistics of the flat image: straight lines x = 128 + slope·(y − 128)
+        // (sharp: one pixel per row; antialiased: split between the two nearest pixels), an antialiased ring
+        // of radius 50 px and short vertical segments of 9 px. Kept: the projection of the change from the
+        // background onto the structure (a blurred structure keeps less), mean of four noise seeds.
+        let kept = |shape: &dyn Fn(usize, usize) -> f32, amp: f32, a: f32| {
+            let s: Vec<f64> = (0..w * h).map(|i| shape(i % w, i / w) as f64).collect();
+            let ss: f64 = s.iter().map(|v| v * v).sum();
+            let mut sum = 0.0;
+            for seed in [11u32, 13, 17, 19] {
+                let mut img = Rgb32f::from_fn(w, h, |x, y| [0.05 + amp * SIGMA * shape(x, y); 3]);
+                add_noise(&mut img, SIGMA, seed);
+                let o = y_of(&run(&img, a, Some(&flat_stats)));
+                sum += o.iter().zip(&s).map(|(o, s)| (o - 0.05) * s).sum::<f64>() / (ss * (amp * SIGMA) as f64);
+            }
+            100.0 * sum / 4.0
+        };
+        let row = |name: &str, shape: &dyn Fn(usize, usize) -> f32| {
+            let f: Vec<String> = [5.0f32, 10.0]
+                .iter()
+                .flat_map(|&amp| amounts.iter().map(move |&a| (amp, a)))
+                .map(|(amp, a)| format!("{amp}σ {a}: {:5.1}%", kept(shape, amp, a)))
+                .collect();
+            eprintln!("F {name}: {}", f.join("  "));
+        };
+        let inner = |x: usize, y: usize| (20..236).contains(&x) && (20..236).contains(&y);
+        for slope in [0.0f64, 0.25, 0.5, 0.75, 1.0] {
+            let centre = move |y: usize| 128.0 + (y as f64 - 128.0) * slope;
+            row(&format!("line slope {slope} sharp"), &|x, y| if inner(x, y) && x as f64 == centre(y).round() { 1.0 } else { 0.0 });
+            row(&format!("line slope {slope} antialiased"), &|x, y| {
+                if inner(x, y) { (1.0 - (x as f64 - centre(y)).abs()).max(0.0) as f32 } else { 0.0 }
+            });
+        }
+        row("ring r50 antialiased", &|x, y| {
+            let r = ((x as f64 - 128.0).powi(2) + (y as f64 - 128.0).powi(2)).sqrt();
+            (1.0 - (r - 50.0).abs()).max(0.0) as f32
+        });
+        row("segments 9 px", &|x, y| if x % 32 == 16 && (12..21).contains(&(y % 32)) { 1.0 } else { 0.0 });
         // E: dark colour: chroma differences kept
         for base in [[0.001f32, 0.02, 0.04], [0.0005, 0.004, 0.01]] {
             let mut img = Rgb32f::filled(w, h, base);
