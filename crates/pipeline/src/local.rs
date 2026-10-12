@@ -675,8 +675,7 @@ mod tests {
             [base[0] + n(1), base[1] + n(2), base[2] + n(3)]
         });
         let run = |p: Process| {
-            let mut s = DevelopSettings::default();
-            s.process = p.version();
+            let mut s = DevelopSettings { process: p.version(), ..Default::default() };
             s.detail.nr_color = 50.0;
             let mut o = img.clone();
             denoise(&mut o, &s, w, w);
@@ -686,8 +685,7 @@ mod tests {
         assert!(v1.data == v2.data, "V1 and V2 share main's colour NR");
         // main's colour NR clamps at 0 and keeps each pixel's luminance; the joint method keeps it too
         assert!(v2.data != v3.data, "V3 takes the joint colour NR");
-        let mut s = DevelopSettings::default();
-        s.process = Process::V3.version();
+        let mut s = DevelopSettings { process: Process::V3.version(), ..Default::default() };
         s.detail.nr_color = 50.0;
         let mut joint = img.clone();
         let p = nrc_params(&s, w, w).expect("Color 50 has parameters");
