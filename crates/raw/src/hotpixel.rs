@@ -28,12 +28,6 @@ use rayon::prelude::*;
 /// A candidate stands more than this many σ above the brightest of its same-colour neighbours (pure noise
 /// hardly reaches 4.5 σ above the brightest of eight; measured on two ILCE-7M4 files at ISO 3200 and 25600).
 const K_HOT: f32 = 5.0;
-fn k_hot() -> f32 {
-    std::env::var("LIGHTCRAFT_HP_K").ok().and_then(|v| v.parse().ok()).unwrap_or(K_HOT)
-}
-fn k_spot() -> f32 {
-    std::env::var("LIGHTCRAFT_HP_SPOT").ok().and_then(|v| v.parse().ok()).unwrap_or(K_SPOT)
-}
 /// A direct neighbour this many σ above its own surroundings means the light is real.
 const K_SPOT: f32 = 4.0;
 /// ...and it takes this many lit neighbours (a hot pair has one).
@@ -167,7 +161,7 @@ impl RawImage {
             let mut buf = Vec::with_capacity(8);
             let n_cand = candidates.len();
             let kept: Vec<_> = candidates.into_iter().filter(|&(x, y, _)| !lit_around(&v, x, y, black, noise, &mut buf)).collect();
-            if std::env::var_os("LIGHTCRAFT_HP_DEBUG").is_some() {
+            if std::env::var_os("LIGHTCRAFT_PROFILE").is_some() {
                 eprintln!(
                     "  hot pixels: noise σ² = {:.3}·L + {:.1} (σ at 0: {:.1}, at 1 %: {:.1}), {n_cand} candidates, {} real light",
                     noise.a,
@@ -317,7 +311,7 @@ fn candidates(v: &View<'_>, (x0, x1, y0, y1): (usize, usize, usize, usize), blac
                     continue;
                 }
                 let m = median(&mut buf);
-                if s - max > k_hot() * noise.sigma(m - black) {
+                if s - max > K_HOT * noise.sigma(m - black) {
                     out.push((x, y, m.round().clamp(0.0, u16::MAX as f32) as u16));
                 }
             }
@@ -337,7 +331,7 @@ fn lit_around(v: &View<'_>, x: usize, y: usize, black: f32, noise: Noise, buf: &
             let s = v.at(nx as isize, ny as isize);
             v.neighbours(nx, ny, buf);
             let m = median(buf);
-            s - m > k_spot() * noise.sigma(m - black)
+            s - m > K_SPOT * noise.sigma(m - black)
         })
         .count()
         >= MIN_LIT
