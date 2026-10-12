@@ -1,8 +1,10 @@
-# Colour NR: experimental joint guide
+# Colour NR: joint guide
 
-The `nr-color-v2` worktree contains an opt-in alternative to the per-channel linear V2.
-Enable it with `NRV2_JOINT=1` (linear mode must also be enabled). It is a CPU reference
-experiment, not a release default. GPU renders use the existing linear-mode CPU fallback.
+From process V3 (`docs/process-versions.md`) colour noise reduction uses this method on the CPU
+(`crates/pipeline/src/nrc_joint.rs`) and the GPU (`crates/gpu/src/wgsl/nrcj.wgsl`, in bands of rows
+whose halo covers the filter's reach). Edits on V1 and V2 keep the blurred chromaticity. The history
+of the method, including the square-root and per-channel variants it replaced, is in
+`docs/nr-color-v2-history.md`.
 
 ## Method
 
@@ -19,7 +21,6 @@ experiment, not a release default. GPU renders use the existing linear-mode CPU 
   towards that median.
   Threshold 64 and at most half at Color 25, threshold 25 and fully at 100. Luminance is never
   changed, so a bright point (a star) keeps its brightness and, by the luminance test, its colour.
-  `NRV2_SPECK_OFF=1` turns it off for comparisons.
 - Make a fixed, lightly denoised guide. At a clear directional edge, average along the
   smoother axis; this keeps thin isoluminant lines visible to the guide.
 - Apply conservative, symmetric colour exchanges at increasing spatial scales. The two
@@ -30,51 +31,23 @@ experiment, not a release default. GPU renders use the existing linear-mode CPU 
   borders. This does not promise identical means inside arbitrary cropped regions.
 - Colour amount controls the radius and ramps the filtered contribution continuously from
   zero to the normal default of 25. Colour Detail changes edge tolerance; Smoothness changes
-  radius. `NRV2_K`, `NRV2_SHARED`, `NRV2_LUMGUIDE` and `NRV2_LUMG_OFF` belong to the preceding
-  V2 experiment and do not tune this guide.
+  radius (`local::nrc_params`: the coarse reach is three times `(2 + 10 · Color) · (1 + Smoothness)`
+  px at full size, scaled with the output).
 - Windowed 8-bit renders request extra surrounding pixels for the diffusion's spatial
   dependencies. The existing window/full-frame comparison retains its original tolerance.
 
 ## Local checks
 
 ```sh
-NRV2_JOINT=1 cargo test --release -p lightcraft-pipeline --lib
-NRV2_JOINT=1 cargo test --release -p lightcraft-pipeline --lib probe_nrc -- --ignored --nocapture
-NRV2_JOINT=1 LIGHTCRAFT_GPU=0 cargo run --release -p lightcraft-cli -- render INPUT.ARW -o OUTPUT.png --set detail.nrColor=100
+cargo test --release -p lightcraft-pipeline --lib nrc_joint
+cargo test --release -p lightcraft-pipeline --lib probe_nrc -- --ignored --nocapture
+cargo test --release -p lightcraft-gpu --test equivalence
+LIGHTCRAFT_GPU=0 cargo run --release -p lightcraft-cli -- render INPUT.ARW -o OUTPUT.png --set detail.nrColor=100
 ```
 
-`NRV2_DEBUG=1` prints the fitted Y/R-Y/B-Y model and the supported luminance range.
-`LIGHTCRAFT_PROFILE=1` prints the filter time. `NRV2_JOINT=0` selects the preceding V2;
-`NRV2_LINEAR=0` selects the older root-based V2.
+`LIGHTCRAFT_PROFILE=1` prints the filter's steps and times and the fitted Y/R-Y/B-Y model.
 
-`NRV2_JOINT_STEP=2` is a separate experimental memory-saving grid. The full-resolution
-default is 1. The reduced grid loses more thin colour detail and its window alignment has
-not been verified; use the default for quality comparisons.
-
-Five ordinary regression tests cover signed dark means, luminance, chroma-noise reduction,
-leaf/black and isoluminant edges, a two-pixel isoluminant line, structured highlights and
-spatially correlated noise. The existing ignored probes also cover three noise seeds and
-two strengths. The full pipeline suite was executed with joint mode enabled.
-
-## Comparing real exports
-
-```sh
-python3 tools/nrc-metrics.py REF.png VARIANT.png --crop 1325 2085 360 240
-```
-
-The script uses four actual spatial quadrants for flat-tile selection, one reference mask
-for all variants, and reports both mean a*/b* colour and average per-pixel C*. The latter
-alone can reward residual noise. PNG measurements describe the displayed result relative
-to a clipped, noisy reference; they are not float ground truth. The candle reference yields
-few genuinely flat dark tiles, so its noise scores have limited coverage.
-
-The camera-look near-black guard from the user's test package `40b889f3` has also been
-brought into this worktree. Without it, source decoding already creates isolated white
-pixels, invalidating comparisons with that package. Its existing regression tests are
-retained alongside the guard.
-
-## Remaining work
-
-See [`nr-color-v2-history.md`](nr-color-v2-history.md) for everything tried, measured and dropped, the speed
-numbers and the known limits (no outlier brake for isolated colour specks yet; flat dark areas smoothed a bit
-less than the root-based V2; little slider effect above 25; prototype switches instead of a process version).
+The regression tests cover signed dark means, luminance, chroma-noise reduction, leaf/black and
+isoluminant edges, a two-pixel isoluminant line, structured highlights, spatially correlated noise,
+the speck brake (specks removed, stars kept) and the routing by process (`colour_nr_follows_the_process`).
+`nrc_joint_reference.rs` keeps an earlier version of the filter for bit-for-bit checks of later speedups.

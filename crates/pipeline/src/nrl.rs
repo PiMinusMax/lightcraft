@@ -26,11 +26,6 @@ pub struct Params {
     pub contrast: f32,
 }
 
-/// The new luminance noise reduction is on unless `LIGHTCRAFT_NRL=0` (prototype switch).
-pub fn enabled() -> bool {
-    std::env::var("LIGHTCRAFT_NRL").map_or(true, |v| v != "0")
-}
-
 /// Gaussian window of the local energy of coarse level `j` (px).
 pub fn energy_sigma(j: usize) -> f32 {
     (2.0 * (1u32 << j) as f32 + 1.0) / 12f32.sqrt()

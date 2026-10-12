@@ -59,7 +59,7 @@ fn wb_gain(img: &mut Rgb32f, info: &SourceInfo, s: &DevelopSettings, gain: f32) 
                     m[2][0] * c[0] + m[2][1] * c[1] + m[2][2] * c[2],
                 ];
             }
-            *p = if late_clamp() { c.map(|v| v * gain) } else { [(c[0] * gain).max(0.0), (c[1] * gain).max(0.0), (c[2] * gain).max(0.0)] };
+            *p = [(c[0] * gain).max(0.0), (c[1] * gain).max(0.0), (c[2] * gain).max(0.0)];
         }
     });
 }
@@ -273,7 +273,7 @@ pub fn base_detail_radius(px_per_long: f64) -> usize {
 pub fn tone_base_detail(s: &DevelopSettings, px_per_long: f64) -> usize {
     match s.process.process() {
         Process::V1 => 0,
-        Process::V2 => base_detail_radius(px_per_long),
+        Process::V2 | Process::V3 | Process::V4 => base_detail_radius(px_per_long),
     }
 }
 
@@ -335,7 +335,7 @@ pub fn denoise(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long:
 /// Whether the luminance NR runs as the wavelet filter after the colour NR ([`denoise_luminance`])
 /// rather than as the old filter before it.
 pub fn wavelet_luminance_nr(s: &DevelopSettings, src_long: usize, out_long: usize) -> bool {
-    nr_params(s, src_long, out_long).0.is_some() && crate::nrl::enabled()
+    nr_params(s, src_long, out_long).0.is_some() && wavelet_luminance(s)
 }
 
 /// The first part of [`denoise`]: everything but the wavelet luminance NR. Its result does not depend
@@ -345,7 +345,7 @@ pub fn wavelet_luminance_nr(s: &DevelopSettings, src_long: usize, out_long: usiz
 pub fn denoise_colour(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long: usize) -> Option<Plane> {
     let (lum, col) = nr_params(s, src_long, out_long);
     let w = img.width;
-    // PROTOTYPE (#1129): the wavelet luminance NR runs after the colour NR, which leaves Y unchanged.
+    // From process V4 the wavelet luminance NR runs after the colour NR, which leaves Y unchanged.
     let new_lum = wavelet_luminance_nr(s, src_long, out_long);
     if let Some(nr) = lum.filter(|_| !new_lum) {
         let _t = crate::profiling().then(std::time::Instant::now);
@@ -363,8 +363,9 @@ pub fn denoise_colour(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, ou
             eprintln!("    nr luminance: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
         }
     }
-    if col.is_some() && nr_v2_enabled() {
-        return color_nr_v2_y(img, s, src_long, out_long, new_lum);
+    if col.is_some() && joint_colour_nr(s) {
+        let p = nrc_params(s, src_long, out_long)?;
+        return crate::nrc_joint::denoise(img, &p, (s.detail.nr_color_detail / 100.0) as f32, (s.detail.nr_color / 100.0) as f32, new_lum);
     } else if let Some(nr) = col {
         let _t = crate::profiling().then(std::time::Instant::now);
         let chroma = img.map(|c| {
@@ -407,47 +408,17 @@ pub fn denoise_luminance(
         };
         crate::nrl::denoise_y(img, &p, lum_stats, y);
     }
-    if late_clamp() {
-        img.data.iter_mut().for_each(|c| *c = c.map(|v| v.max(0.0)));
-    }
 }
 
-/// EXPERIMENT (#1129): negative values are kept until after the noise reduction (`LIGHTCRAFT_LATE_CLAMP=1`).
-pub fn late_clamp() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("LIGHTCRAFT_LATE_CLAMP").is_ok_and(|v| v == "1"))
-}
-
-// PROTOTYPE (tuning knobs via env while the method is worked out)
-/// The new colour noise reduction is on unless `LIGHTCRAFT_NR_V2=0`.
-pub fn nr_v2_enabled() -> bool {
-    std::env::var("LIGHTCRAFT_NR_V2").map_or(true, |v| v != "0")
-}
-
-/// A prototype tuning knob from the environment, read once per process (they are read in per-pixel code).
-fn knob(name: &'static str, default: f32) -> f32 {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock, PoisonError};
-    static READ: OnceLock<Mutex<HashMap<&'static str, Option<f32>>>> = OnceLock::new();
-    let map = READ.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut m = map.lock().unwrap_or_else(PoisonError::into_inner);
-    m.entry(name).or_insert_with(|| std::env::var(name).ok().and_then(|v| v.parse().ok())).unwrap_or(default)
-}
-
-/// [`nrc_linear`], read once (it is asked per pixel).
-fn nrc_linear_cached() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| knob("NRV2_LINEAR", 1.0) > 0.5)
+/// Whether `s` gets the wavelet luminance noise reduction (`nrl`, process V4 on), else main's guided
+/// filter on log luminance.
+pub fn wavelet_luminance(s: &DevelopSettings) -> bool {
+    s.process.process() >= lightcraft_develop::Process::V4
 }
 
 /// Most samples the noise level of the new colour noise reduction is measured from. The CPU and
-/// the GPU sample the same pixels (every [`nrc_sample_stride`]-th of the plane).
+/// the GPU sample the same pixels (see `nrc_joint::noise_sample_stride`).
 pub const NRC_SAMPLES: usize = 131_072;
-
-/// Distance between the measured samples of a plane of `len` pixels.
-pub fn nrc_sample_stride(len: usize) -> usize {
-    len.div_ceil(NRC_SAMPLES).max(7)
-}
 
 /// One self-guided pass of the new colour noise reduction: Gaussian windows of `sigma` px, the
 /// coefficients computed on a plane subsampled by `step`, `eps = k ×` the `pct`-quantile of the
@@ -478,19 +449,12 @@ pub fn nrc_params(s: &DevelopSettings, src_long: usize, out_long: usize) -> Opti
     let detail = (s.detail.nr_color_detail / 100.0) as f32;
     let smooth = 1.0 + (s.detail.nr_color_smoothness / 100.0) as f32;
     let scale = (out_long as f32 / src_long.max(1) as f32).clamp(0.05, 1.0);
-    let sigma = (knob("NRV2_S0", 2.0) + knob("NRV2_S1", 10.0) * amount) * smooth * scale;
-    let k = knob("NRV2_K", if nrc_linear() { 64.0 } else { 16.0 }) * amount * (1.5 - detail);
-    let pct = knob("NRV2_PCT", 0.2);
-    let coarse = knob("NRV2_COARSE", 3.0);
+    let sigma = (2.0 + 10.0 * amount) * smooth * scale;
+    let k = 64.0 * amount * (1.5 - detail);
     // the coefficients vary over about sigma: a grid of sigma / 2 holds them
-    let div = knob("NRV2_STEPDIV", 2.0).max(1.0);
-    let pass = |sigma: f32, k: f32| NrcPass { sigma, step: (sigma / div).floor().clamp(1.0, 16.0) as usize, k, pct };
-    let mut passes = vec![pass(sigma, k)];
-    if coarse > 1.0 {
-        // the coarse pass sees thin colour detail only diluted over its wide window: its own, gentler threshold
-        passes.push(pass(sigma * coarse, k * knob("NRV2_COARSE_K", 1.0)));
-    }
-    Some(NrcParams { off: knob("NRV2_OFF", 0.003), passes })
+    let pass = |sigma: f32| NrcPass { sigma, step: (sigma / 2.0).floor().clamp(1.0, 16.0) as usize, k, pct: 0.2 };
+    // fine, then coarse (three times wider); the joint method takes the coarse one's reach
+    Some(NrcParams { off: 0.003, passes: vec![pass(sigma), pass(sigma * 3.0)] })
 }
 
 /// Chroma noise variance per channel as a function of the local luminance: `α · Y + β` (shot plus read noise).
@@ -505,50 +469,6 @@ impl NrcNoise {
     pub fn var(&self, i: usize, y: f32) -> f32 {
         (self.alpha[i] * y.max(0.0) + self.beta[i]).max(1e-14)
     }
-}
-
-/// Fit [`NrcNoise`] to the local variances `var` against the local luminance `ym` (channel 0): the pixels are
-/// split into 16 luminance bands (square-root spaced), each band's `pct`-quantile is its noise floor, and
-/// `α`, `β ≥ 0` are fitted to the bands by weighted least squares.
-pub fn nrc_noise_model(var: &Rgb32f, ym: &Rgb32f, pct: f32) -> NrcNoise {
-    const BANDS: usize = 16;
-    let stride = nrc_sample_stride(var.data.len()).min(4);
-    let mut samples: Vec<(f32, [f32; 3])> = var
-        .data
-        .iter()
-        .zip(&ym.data)
-        .step_by(stride)
-        .filter(|(v, y)| y[0].is_finite() && v.iter().all(|x| x.is_finite()))
-        .map(|(v, y)| (y[0].max(0.0), *v))
-        .collect();
-    // equal-count bands by luminance: shadows keep their own bands however bright the highlights are
-    samples.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let per = (samples.len() / BANDS).max(1);
-    let bands: Vec<&[(f32, [f32; 3])]> = samples.chunks(per).filter(|c| c.len() >= 32).collect();
-    let mut alpha = [0.0f32; 3];
-    let mut beta = [1e-12f32; 3];
-    for i in 0..3 {
-        // per band: mean luminance, `pct`-quantile of the variance (its noise floor), weight
-        let pts: Vec<(f64, f64, f64)> = bands
-            .iter()
-            .map(|b| {
-                let mut c: Vec<f32> = b.iter().map(|s| s.1[i]).collect();
-                let k = ((c.len() - 1) as f32 * pct.clamp(0.0, 1.0)) as usize;
-                let (_, q, _) = c.select_nth_unstable_by(k, f32::total_cmp);
-                (b.iter().map(|s| s.0 as f64).sum::<f64>() / b.len() as f64, *q as f64, b.len() as f64)
-            })
-            .collect();
-        if pts.is_empty() {
-            continue;
-        }
-        let (a, b) = fit_nonneg_line(&pts);
-        alpha[i] = a as f32;
-        beta[i] = (b as f32).max(1e-12);
-    }
-    if std::env::var_os("NRV2_DEBUG").is_some() {
-        eprintln!("    nr colour v2 noise model: alpha {alpha:?} beta {beta:?} ({} bands)", bands.len());
-    }
-    NrcNoise { alpha, beta }
 }
 
 /// Weighted least squares `v = a · l + b` over `(l, v, weight)` with `a, b ≥ 0`: the free fit if both come out
@@ -571,334 +491,10 @@ pub fn fit_nonneg_line(pts: &[(f64, f64, f64)]) -> (f64, f64) {
     if sse(origin, 0.0) < sse(0.0, constant) { (origin, 0.0) } else { (0.0, constant) }
 }
 
-/// `eps` per channel from the sampled local variances.
-pub fn nrc_eps(samples: &[[f32; 3]], k: f32, pct: f32) -> [f32; 3] {
-    [0, 1, 2].map(|c| {
-        let mut v: Vec<f32> = samples.iter().map(|s| s[c]).filter(|x| x.is_finite()).collect();
-        if v.is_empty() {
-            return 1e-12;
-        }
-        let i = ((v.len() - 1) as f32 * pct.clamp(0.0, 1.0)) as usize;
-        let (_, m, _) = v.select_nth_unstable_by(i, f32::total_cmp);
-        k * m.max(1e-12)
-    })
-}
-
-/// PROTOTYPE: `NRV2_LINEAR=1` filters linear colour differences `c − Y` (nothing clipped, the local mean
-/// kept exactly) with a threshold from a noise model `σ²(Y) = α·Y + β`, instead of square-root differences
-/// with one threshold for the whole image.
-pub fn nrc_linear() -> bool {
-    nrc_linear_cached()
-}
-
-/// The joint guide (`nrc_joint`), on unless `NRV2_JOINT=0` (PROTOTYPE switch).
-pub fn nrc_joint_enabled() -> bool {
-    nr_v2_enabled() && nrc_linear() && knob("NRV2_JOINT", 1.0) > 0.5
-}
-
-/// Chroma of a pixel: linear differences `c − Y` (see [`nrc_linear`]), else differences of square roots
-/// (`√(c + off) − √(Y + off)`).
-#[inline]
-pub fn nrc_chroma(c: [f32; 3], off: f32) -> [f32; 3] {
-    if nrc_linear() {
-        let y = luminance_2020(c);
-        return c.map(|v| v - y);
-    }
-    let y = (luminance_2020(c).max(0.0) + off).sqrt();
-    c.map(|v| (v.max(0.0) + off).sqrt() - y)
-}
-
-/// A pixel with its chroma replaced by `q`, its luminance kept. `removed` is the variance the passes
-/// took out of each square-root channel: smoothing averages square roots, whose square is below the mean
-/// of the squares (Jensen) by that variance, so adding it back keeps the local mean colour.
-#[inline]
-pub fn nrc_recombine(p: [f32; 3], q: [f32; 3], removed: [f32; 3], off: f32) -> [f32; 3] {
-    if nrc_linear() {
-        // additive: channel = Y + filtered difference, then Y pulled back exactly (each channel has its own a)
-        let y = luminance_2020(p);
-        let c = q.map(|d| y + d);
-        let dy = y - luminance_2020(c);
-        return c.map(|v| v + dy);
-    }
-    let yl = luminance_2020(p);
-    let ys = (yl.max(0.0) + off).sqrt();
-    let c: [f32; 3] = std::array::from_fn(|i| ((ys + q[i]).max(0.0).powi(2) + removed[i] - off).max(0.0));
-    let y1 = luminance_2020(c);
-    if y1 > 1e-7 && yl > 0.0 { c.map(|v| v * (yl / y1)) } else { [yl.max(0.0); 3] }
-}
-
-/// Self-guided coefficients of one pass at its subsampled size (see [`NrcPass`]): `a` and `b`
-/// per pixel of `lo`, blurred.
-fn nrc_coeffs(lo: &Rgb32f, ylo: &Rgb32f, pass: &NrcPass) -> (Rgb32f, Rgb32f, Rgb32f) {
-    let sg = pass.sigma / pass.step.max(1) as f32;
-    let (mean, corr) = par_join(|| gaussian(lo, sg), || gaussian(&lo.map(|c| c.map(|v| v * v)), sg));
-    let var = corr.zip_map(&mean, |c, m| [0, 1, 2].map(|i| (c[i] - m[i] * m[i]).max(0.0)));
-    let a = if nrc_linear() {
-        let ym = gaussian(ylo, sg);
-        let model = nrc_noise_model(&var, &ym, pass.pct);
-        if knob("NRV2_SHARED", 0.0) > 0.5 {
-            // one coefficient for all channels: each channel's variance in units of its noise, averaged, so
-            // every channel gets the same transition width at an edge (no hue change across it). With
-            // `NRV2_LUMGUIDE > 0`, luminance structure (in units of its own noise) counts too.
-            let lg = knob("NRV2_LUMGUIDE", 0.0);
-            let lum = (lg > 0.0).then(|| {
-                let m2 = gaussian(&ylo.map(|c| [c[0] * c[0], 0.0, 0.0]), sg);
-                let vy = m2.zip_map(&ym, |m2, m| {
-                    let v = (m2[0] - m[0] * m[0]).max(0.0);
-                    [v, v, v]
-                });
-                let ly = nrc_noise_model(&vy, &ym, pass.pct);
-                (vy, ly)
-            });
-            let mut a = var.zip_map(&ym, |v, y| {
-                let s = (0..3).map(|i| v[i] / model.var(i, y[0])).sum::<f32>() / 3.0;
-                [s; 3]
-            });
-            if let Some((vy, ly)) = &lum {
-                for ((s, v), y) in a.data.iter_mut().zip(&vy.data).zip(&ym.data) {
-                    let add = lg * v[0] / ly.var(0, y[0]);
-                    *s = s.map(|x| x + add);
-                }
-            }
-            a.map(|s| s.map(|s| s / (s + pass.k)))
-        } else {
-            // per channel; with `NRV2_LUMGUIDE > 0` luminance structure (in units of its own noise) raises every
-            // channel's share, so colour on textured or edged luminance (leaves, fur) is kept
-            let lg = knob("NRV2_LUMGUIDE", 0.0);
-            if lg > 0.0 {
-                let m2 = gaussian(&ylo.map(|c| [c[0] * c[0], 0.0, 0.0]), sg);
-                let vy = m2.zip_map(&ym, |m2, m| {
-                    let v = (m2[0] - m[0] * m[0]).max(0.0);
-                    [v, v, v]
-                });
-                let ly = nrc_noise_model(&vy, &ym, pass.pct);
-                let s = var.zip_map(&ym, |v, y| [0, 1, 2].map(|i| v[i] / model.var(i, y[0])));
-                // only luminance variance well above its noise counts as structure (flat noisy areas stay smoothed)
-                let off = knob("NRV2_LUMG_OFF", 3.0);
-                let g = vy.zip_map(&ym, |v, y| [lg * (v[0] / ly.var(0, y[0]) - off).max(0.0); 3]);
-                s.zip_map(&g, |s, g| [0, 1, 2].map(|i| (s[i] + g[i]) / (s[i] + g[i] + pass.k)))
-            } else {
-                var.zip_map(&ym, |v, y| [0, 1, 2].map(|i| v[i] / (v[i] + pass.k * model.var(i, y[0]))))
-            }
-        }
-    } else {
-        let stride = nrc_sample_stride(var.data.len());
-        let samples: Vec<[f32; 3]> = var.data.iter().step_by(stride).copied().collect();
-        let eps = nrc_eps(&samples, pass.k, pass.pct);
-        var.map(|v| [0, 1, 2].map(|i| v[i] / (v[i] + eps[i])))
-    };
-    let b = mean.zip_map(&a, |m, a| [0, 1, 2].map(|i| m[i] - a[i] * m[i]));
-    // what `a · d + b` takes out of the variance: var − a² · var
-    let bias = if nrc_linear() { 0.0 } else { bias_knob() };
-    let removed = var.zip_map(&a, |v, a| [0, 1, 2].map(|i| (1.0 - a[i] * a[i]) * v[i] * bias));
-    let (ab, rb) = par_join(|| par_join(|| gaussian(&a, sg), || gaussian(&b, sg)), || gaussian(&removed, sg));
-    (ab.0, ab.1, rb)
-}
-
-/// PROTOTYPE: `NRV2_BIAS=0` leaves the removed variance out (the mean colour of noisy areas then drifts).
-fn bias_knob() -> f32 {
-    knob("NRV2_BIAS", 1.0)
-}
-
-/// One pass's coefficients and the taps that upsample them to the full size
-/// (`resize(…, Filter::Bilinear)`, evaluated a row at a time).
-struct NrcUp {
-    a: Rgb32f,
-    b: Rgb32f,
-    r: Rgb32f,
-    /// For a pass that smooths only the coarse part (`NRV2_COARSE_DETAIL`): its subsampled input. The pass then
-    /// replaces `lo` by `a · lo + b` and keeps `d − lo` (finer detail, such as thin coloured lines) as it is.
-    lo: Option<Rgb32f>,
-    ux: Vec<(usize, Vec<f32>)>,
-    uy: Vec<(usize, Vec<f32>)>,
-}
-
-#[inline]
-fn madd3(acc: [f32; 3], v: [f32; 3], f: f32) -> [f32; 3] {
-    [acc[0] + f * v[0], acc[1] + f * v[1], acc[2] + f * v[2]]
-}
-
-impl NrcUp {
-    /// Apply this pass to `d`, row `y` of the full-size chroma, in place, and add the variance it
-    /// removes to `removed`.
-    fn apply_row(
-        &self,
-        y: usize,
-        d: &mut [[f32; 3]],
-        removed: &mut [[f32; 3]],
-        va: &mut Vec<[f32; 3]>,
-        vb: &mut Vec<[f32; 3]>,
-        vr: &mut Vec<[f32; 3]>,
-    ) {
-        let lw = self.a.width;
-        for v in [&mut *va, &mut *vb, &mut *vr] {
-            v.clear();
-            v.resize(lw, [0.0; 3]);
-        }
-        if let Some((y0, wy)) = self.uy.get(y) {
-            for (j, &f) in wy.iter().enumerate() {
-                let rows = (y0 + j) * lw..(y0 + j + 1) * lw;
-                let (Some(ra), Some(rb), Some(rr)) = (self.a.data.get(rows.clone()), self.b.data.get(rows.clone()), self.r.data.get(rows)) else {
-                    continue;
-                };
-                for x in 0..lw {
-                    va[x] = madd3(va[x], ra[x], f);
-                    vb[x] = madd3(vb[x], rb[x], f);
-                    vr[x] = madd3(vr[x], rr[x], f);
-                }
-            }
-        }
-        // the subsampled input upsampled to this row (only for a coarse-only pass)
-        let vl: Vec<[f32; 3]> = match &self.lo {
-            None => Vec::new(),
-            Some(lo) => {
-                let mut row = vec![[0.0f32; 3]; lw];
-                if let Some((y0, wy)) = self.uy.get(y) {
-                    for (j, &f) in wy.iter().enumerate() {
-                        if let Some(r) = lo.data.get((y0 + j) * lw..(y0 + j + 1) * lw) {
-                            for x in 0..lw {
-                                row[x] = madd3(row[x], r[x], f);
-                            }
-                        }
-                    }
-                }
-                (0..d.len())
-                    .map(|x| {
-                        let Some((x0, wx)) = self.ux.get(x) else { return [0.0; 3] };
-                        wx.iter().enumerate().fold([0.0; 3], |acc, (k, &f)| row.get(x0 + k).map_or(acc, |v| madd3(acc, *v, f)))
-                    })
-                    .collect()
-            }
-        };
-        for (x, (p, rem)) in d.iter_mut().zip(removed.iter_mut()).enumerate() {
-            let Some((x0, wx)) = self.ux.get(x) else { continue };
-            let (mut ca, mut cb, mut cr) = ([0.0; 3], [0.0; 3], [0.0; 3]);
-            for (k, &f) in wx.iter().enumerate() {
-                if let (Some(a), Some(b), Some(r)) = (va.get(x0 + k), vb.get(x0 + k), vr.get(x0 + k)) {
-                    ca = madd3(ca, *a, f);
-                    cb = madd3(cb, *b, f);
-                    cr = madd3(cr, *r, f);
-                }
-            }
-            match &self.lo {
-                None => *p = [0, 1, 2].map(|i| ca[i] * p[i] + cb[i]),
-                Some(_) => {
-                    let cl = vl.get(x).copied().unwrap_or([0.0; 3]);
-                    *p = [0, 1, 2].map(|i| p[i] + (ca[i] - 1.0) * cl[i] + cb[i]);
-                }
-            }
-            *rem = [0, 1, 2].map(|i| rem[i] + cr[i].max(0.0));
-        }
-    }
-}
-
-/// Scratch rows of [`NrcUp::apply_row`].
-#[derive(Default)]
-struct NrcScratch {
-    va: Vec<[f32; 3]>,
-    vb: Vec<[f32; 3]>,
-    vr: Vec<[f32; 3]>,
-}
-
-/// Row `y` of the chroma after the passes in `ups`, computed from the image row `src`, and the
-/// variance the passes removed per pixel.
-fn nrc_row(src: &[[f32; 3]], y: usize, ups: &[NrcUp], off: f32, s: &mut NrcScratch) -> (Vec<[f32; 3]>, Vec<[f32; 3]>) {
-    let mut d: Vec<[f32; 3]> = src.iter().map(|c| nrc_chroma(*c, off)).collect();
-    let mut removed = vec![[0.0; 3]; d.len()];
-    for up in ups {
-        up.apply_row(y, &mut d, &mut removed, &mut s.va, &mut s.vb, &mut s.vr);
-    }
-    (d, removed)
-}
-
-/// Colour noise reduction, second method: chroma as differences of square roots (noise of about
-/// the same size at every brightness, and no blow-up near black as `c / Y` has), smoothed by a
-/// self-guided filter whose threshold follows the noise measured in the image, the luminance kept.
-///
-/// No full-size intermediate is stored: each pass's subsampled input is gathered row by row from
-/// the image (its chroma after the earlier passes, recomputed per row), and the last step applies
-/// every pass and recombines a row at a time.
-pub fn color_nr_v2(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long: usize) {
-    color_nr_v2_y(img, s, src_long, out_long, false);
-}
-
-/// [`color_nr_v2`], with `want_y` also the luminance of the result when the joint NR made it (see
-/// `nrc_joint::denoise`).
-pub fn color_nr_v2_y(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long: usize, want_y: bool) -> Option<Plane> {
-    use lightcraft_raster::resample::{Filter, weights};
-    let p = nrc_params(s, src_long, out_long)?;
-    if nrc_joint_enabled() {
-        return crate::nrc_joint::denoise(img, &p, (s.detail.nr_color_detail / 100.0) as f32, (s.detail.nr_color / 100.0) as f32, want_y);
-    }
-    let _t = crate::profiling().then(std::time::Instant::now);
-    let (w, h) = (img.width, img.height);
-    let mut ups: Vec<NrcUp> = Vec::with_capacity(p.passes.len());
-    for pass in &p.passes {
-        let step = pass.step.max(1);
-        let (lw, lh) = (w.div_ceil(step).max(1), h.div_ceil(step).max(1));
-        // `resize(chroma after the earlier passes, lw, lh, Filter::Box)`
-        let (bx, by) = (weights(w, lw, Filter::Box), weights(h, lh, Filter::Box));
-        let mut lo = Rgb32f::new(lw, lh);
-        let src = &*img;
-        let done = &ups;
-        for_rows(&mut lo.data, lw, |yo, row| {
-            let mut scratch = NrcScratch::default();
-            let Some((y0, wy)) = by.get(yo) else { return };
-            for (j, &f) in wy.iter().enumerate() {
-                if f == 0.0 || y0 + j >= h {
-                    continue;
-                }
-                let (d, _) = nrc_row(src.row(y0 + j), y0 + j, done, p.off, &mut scratch);
-                for (xo, o) in row.iter_mut().enumerate() {
-                    let Some((x0, wx)) = bx.get(xo) else { continue };
-                    let mut acc = [0.0; 3];
-                    for (k, &g) in wx.iter().enumerate() {
-                        if let Some(v) = d.get(x0 + k) {
-                            acc = madd3(acc, *v, g);
-                        }
-                    }
-                    *o = madd3(*o, acc, f);
-                }
-            }
-        });
-        // the pass's luminance at the same size (for the noise model)
-        let mut ylo = Rgb32f::new(lw, lh);
-        for_rows(&mut ylo.data, lw, |yo, row| {
-            let Some((y0, wy)) = by.get(yo) else { return };
-            for (j, &f) in wy.iter().enumerate() {
-                if f == 0.0 || y0 + j >= h {
-                    continue;
-                }
-                let srow = src.row(y0 + j);
-                for (xo, o) in row.iter_mut().enumerate() {
-                    let Some((x0, wx)) = bx.get(xo) else { continue };
-                    let mut acc = 0.0;
-                    for (k, &g) in wx.iter().enumerate() {
-                        if let Some(c) = srow.get(x0 + k) {
-                            acc += g * luminance_2020(*c);
-                        }
-                    }
-                    o[0] += f * acc;
-                }
-            }
-        });
-        let (a, b, r) = nrc_coeffs(&lo, &ylo, pass);
-        let coarse_only = !ups.is_empty() && nrc_linear() && knob("NRV2_COARSE_DETAIL", 1.0) > 0.5;
-        let lo = coarse_only.then_some(lo);
-        ups.push(NrcUp { a, b, r, lo, ux: weights(lw, w, Filter::Bilinear), uy: weights(lh, h, Filter::Bilinear) });
-    }
-    let off = p.off;
-    for_rows(&mut img.data, w, |y, row| {
-        let mut scratch = NrcScratch::default();
-        let (q, removed) = nrc_row(row, y, &ups, off, &mut scratch);
-        for ((px, qv), r) in row.iter_mut().zip(q).zip(removed) {
-            *px = nrc_recombine(*px, qv, r, off);
-        }
-    });
-    if let Some(t) = _t {
-        eprintln!("    nr colour v2: {:.1} ms ({:?})", t.elapsed().as_secs_f64() * 1e3, p.passes.iter().map(|q| q.sigma).collect::<Vec<_>>());
-    }
-    None
+/// Whether `s` gets the joint colour noise reduction (`nrc_joint`, process V3 on), else main's
+/// blurred chromaticity.
+pub fn joint_colour_nr(s: &DevelopSettings) -> bool {
+    s.process.process() >= lightcraft_develop::Process::V3
 }
 
 pub fn log_lum(c: [f32; 3]) -> f32 {
@@ -1104,6 +700,72 @@ pub fn airlight_of(mut v: Vec<f32>) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    /// Edits saved under V1 and V2 keep main's colour noise reduction (blurred chromaticity); V3 gets
+    /// the joint method of `nrc_joint`.
+    #[test]
+    fn colour_nr_follows_the_process() {
+        use lightcraft_develop::{DevelopSettings, Process};
+        let (w, h) = (96usize, 64usize);
+        let img = Rgb32f::from_fn(w, h, |x, y| {
+            let n = |c: u32| {
+                let mut v = (x as u32).wrapping_mul(0x9e37_79b9) ^ (y as u32).wrapping_mul(0x85eb_ca6b) ^ c.wrapping_mul(0xc2b2_ae35) | 1;
+                v ^= v << 13;
+                v ^= v >> 17;
+                v ^= v << 5;
+                (v as f32 / u32::MAX as f32 - 0.5) * 0.02
+            };
+            let base = if x < w / 2 { [0.06, 0.03, 0.02] } else { [0.02, 0.04, 0.06] };
+            [base[0] + n(1), base[1] + n(2), base[2] + n(3)]
+        });
+        let run = |p: Process| {
+            let mut s = DevelopSettings { process: p.version(), ..Default::default() };
+            s.detail.nr_color = 50.0;
+            let mut o = img.clone();
+            denoise(&mut o, &s, w, w, None);
+            o
+        };
+        let (v1, v2, v3) = (run(Process::V1), run(Process::V2), run(Process::V3));
+        assert!(v1.data == v2.data, "V1 and V2 share main's colour NR");
+        // main's colour NR clamps at 0 and keeps each pixel's luminance; the joint method keeps it too
+        assert!(v2.data != v3.data, "V3 takes the joint colour NR");
+        let mut s = DevelopSettings { process: Process::V3.version(), ..Default::default() };
+        s.detail.nr_color = 50.0;
+        let mut joint = img.clone();
+        let p = nrc_params(&s, w, w).expect("Color 50 has parameters");
+        crate::nrc_joint::denoise(&mut joint, &p, (s.detail.nr_color_detail / 100.0) as f32, 0.5, false);
+        assert!(joint.data == v3.data, "V3 is the joint method");
+    }
+
+    /// Edits up to V3 keep main's luminance noise reduction (guided filter on log luminance); V4 gets the
+    /// wavelet filter of `nrl`, after the colour NR.
+    #[test]
+    fn luminance_nr_follows_the_process() {
+        use lightcraft_develop::{DevelopSettings, Process};
+        let (w, h) = (96usize, 64usize);
+        let img = Rgb32f::from_fn(w, h, |x, y| {
+            let mut v = (x as u32).wrapping_mul(0x9e37_79b9) ^ (y as u32).wrapping_mul(0x85eb_ca6b) | 1;
+            v ^= v << 13;
+            v ^= v >> 17;
+            v ^= v << 5;
+            let n = (v as f32 / u32::MAX as f32 - 0.5) * 0.02;
+            let base = if x < w / 2 { 0.05 } else { 0.12 };
+            [base + n; 3]
+        });
+        let run = |p: Process| {
+            let mut s = DevelopSettings { process: p.version(), ..Default::default() };
+            s.detail.nr_luminance = 50.0;
+            let mut o = img.clone();
+            denoise(&mut o, &s, w, w, None);
+            o
+        };
+        let (v2, v3, v4) = (run(Process::V2), run(Process::V3), run(Process::V4));
+        assert!(v2.data == v3.data, "V2 and V3 share main's luminance NR");
+        assert!(v3.data != v4.data, "V4 takes the wavelet luminance NR");
+        let mut wavelet = img.clone();
+        crate::nrl::denoise(&mut wavelet, &crate::nrl::Params { amount: 0.5, detail: 0.5, contrast: 0.0 }, None);
+        assert!(wavelet.data == v4.data, "V4 is the wavelet filter");
+    }
+
     /// Float mean of a flat, noisy dark patch over three noise realisations; linear modes assert drift bounds.
     #[test]
     #[ignore]
@@ -1141,15 +803,13 @@ mod tests {
                     let mut s = DevelopSettings::default();
                     s.detail.nr_color = nr;
                     let mut a = img.clone();
-                    color_nr_v2(&mut a, &s, w, w);
+                    denoise(&mut a, &s, w, w, None);
                     let m = mean(&a);
                     let clipped0 = mean(&img.map(|p| p.map(|v| v.max(0.0))));
                     let sd = |im: &Rgb32f, mm: [f64; 3]| {
                         [0, 1, 2].map(|i| (im.data.iter().map(|p| (p[i] as f64 - mm[i]).powi(2)).sum::<f64>() / im.data.len() as f64).sqrt())
                     };
-                    if nrc_linear() {
-                        worst = worst.max([0, 1, 2].iter().map(|&i| (m[i] / m0[i] - 1.0).abs()).fold(0.0, f64::max));
-                    }
+                    worst = worst.max([0, 1, 2].iter().map(|&i| (m[i] / m0[i] - 1.0).abs()).fold(0.0, f64::max));
                     println!(
                         "{name} NR {nr}: true mean {m0:.5?}, clipped noisy mean {clipped0:.5?}, after v2 {m:.5?} → {:+.3?} % vs true; noise sd {:.5?} → {:.5?}",
                         [0, 1, 2].map(|i| 100.0 * (m[i] / m0[i] - 1.0)),
@@ -1159,11 +819,8 @@ mod tests {
                 }
             }
         }
-        if nrc_linear() {
-            println!("worst mean deviation {:.4} %", 100.0 * worst);
-            let limit = if nrc_joint_enabled() { 0.0005 } else { 0.01 };
-            assert!(worst < limit, "linear mode moved a channel's mean by {:.3} %", 100.0 * worst);
-        }
+        println!("worst mean deviation {:.4} %", 100.0 * worst);
+        assert!(worst < 0.0005, "the joint colour NR moved a channel's mean by {:.3} %", 100.0 * worst);
     }
 
     /// PROBE (prints, never fails): what colour NR v2 keeps of real colour. A clean synthetic scene (an
@@ -1230,7 +887,7 @@ mod tests {
             let mut s = DevelopSettings::default();
             s.detail.nr_color = nr;
             let mut o = img.clone();
-            color_nr_v2(&mut o, &s, w, w);
+            denoise(&mut o, &s, w, w, None);
             let px = |x: usize, y: usize| o.data[y * w + x];
             // edge: chroma error 1..8 px either side, relative to the step between the two colours
             let step = dist(chroma(red), chroma(green));

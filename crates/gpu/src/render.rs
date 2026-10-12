@@ -684,11 +684,10 @@ pub fn render(
                 None => Arc::new(linear(&mut cx, &sampled, info, &plan, &mut host)),
             };
             let wavelet = local::wavelet_luminance_nr(s, plan.src_long, out_long);
-            let lin = if wavelet || local::late_clamp() {
+            let lin = if wavelet {
                 let stats = match cached.as_ref().and_then(|e| e.lum_stats.clone()).filter(|(k, _)| *k == plan.pre_key) {
                     Some((_, st)) => Some(st),
-                    None if wavelet => lightcraft_pipeline::lum_stats(src, info, &plan),
-                    None => None,
+                    None => lightcraft_pipeline::lum_stats(src, info, &plan),
                 };
                 let out = luminance_nr(&mut cx, &pre, w, h, s, stats.as_ref());
                 kept_stats = stats.map(|st| (plan.pre_key, st));
@@ -861,8 +860,8 @@ fn denoise(cx: &mut Cx<'_>, img: Buf, plan: &Plan<'_>) -> Buf {
     let n = w * h;
     let (lum, col) = local::nr_params(&plan.settings, plan.src_long, plan.frame.output_long(w, h));
     let mut img = img;
-    // PROTOTYPE (#1129): the old luminance filter only without the wavelet one
-    if let Some(nr) = lum.filter(|_| !lightcraft_pipeline::nrl::enabled()) {
+    // the old luminance filter for edits before process V4 (the wavelet one runs after the colour NR)
+    if let Some(nr) = lum.filter(|_| !local::wavelet_luminance(&plan.settings)) {
         let l = cx.gpu.buffer(n);
         map(cx, "log_lum_k", n, &[], [Some(&img), None, None], &l);
         let f = guided(cx, &l, w, h, nr.sigma, nr.eps);
@@ -870,27 +869,19 @@ fn denoise(cx: &mut Cx<'_>, img: Buf, plan: &Plan<'_>) -> Buf {
         map(cx, "nr_lum", n, &[nr.k.to_bits()], [Some(&img), Some(&l), Some(&f)], &out);
         img = out;
     }
-    if col.is_some()
-        && local::nrc_joint_enabled()
-        && std::env::var("NRV2_JOINT_STEP").map_or(true, |v| v.trim() == "1")
-        && let Some(p) = local::nrc_params(&plan.settings, plan.src_long, plan.frame.output_long(w, h))
-    {
+    if col.is_some() && local::joint_colour_nr(&plan.settings) {
+        let Some(p) = local::nrc_params(&plan.settings, plan.src_long, plan.frame.output_long(w, h)) else { return img };
         let s = &plan.settings.detail;
-        if let Some(out) = color_nr_joint(cx, &img, w, h, &p, (s.nr_color_detail / 100.0) as f32, (s.nr_color / 100.0) as f32) {
+        let (detail, amount) = ((s.nr_color_detail / 100.0) as f32, (s.nr_color / 100.0) as f32);
+        if let Some(out) = color_nr_joint(cx, &img, w, h, &p, detail, amount) {
             return out;
         }
-    }
-    if col.is_some() && local::nr_v2_enabled() && local::nrc_linear() {
-        // PROTOTYPE: the linear mode has no GPU kernels yet, it runs on the CPU
+        // too small for the noise samples, or not even one band fits the device: this step on the CPU
         let mut host = cx.read_rgb(&img, w, h);
-        local::color_nr_v2(&mut host, &plan.settings, plan.src_long, plan.frame.output_long(w, h));
+        let mut d = (*plan.settings).clone();
+        d.detail.nr_luminance = 0.0;
+        local::denoise(&mut host, &d, plan.src_long, plan.frame.output_long(w, h), None);
         return cx.gpu.upload(rgb_words(&host));
-    }
-    if col.is_some() && local::nr_v2_enabled() {
-        if let Some(p) = local::nrc_params(&plan.settings, plan.src_long, plan.frame.output_long(w, h)) {
-            return color_nr_v2(cx, &img, w, h, &p);
-        }
-        return img;
     }
     if let Some(nr) = col {
         let chroma = cx.gpu.buffer(n * 3);
@@ -919,15 +910,10 @@ fn nrl_smooth(cx: &mut Cx<'_>, src: &Buf, w: usize, h: usize, j: usize) -> Buf {
 /// approximation and shrunk into the change of Y, which is then added to R, G and B.
 fn luminance_nr(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, s: &DevelopSettings, stats: Option<&nrl::Stats>) -> Buf {
     let n = w * h;
-    let late = local::late_clamp() as u32;
     let d = &s.detail;
     let p = nrl::Params { amount: (d.nr_luminance / 100.0) as f32, detail: (d.nr_detail / 100.0) as f32, contrast: (d.nr_contrast / 100.0) as f32 };
     let Some(stats) = stats.filter(|_| w >= 8 && h >= 8 && p.amount > 0.0) else {
-        // nothing to reduce: only the experiment's clamp
-        let change = cx.zeroed(n);
-        let out = cx.gpu.buffer(n * 3);
-        map(cx, "nrl_apply", n, &[late], [Some(img), Some(&change), None], &out);
-        return out;
+        return cx.copy(img);
     };
     let started = profiling().then(std::time::Instant::now);
     // Bands as in the joint colour NR: a band holds its input rows (3 values per pixel), Y's change, var,
@@ -936,7 +922,7 @@ fn luminance_nr(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, s: &DevelopSetti
     // are the whole image's.
     let halo = nrl::halo();
     let out = match band_rows(cx, band_budget(cx, "luminance"), w, h, 48, 12 * n, halo) {
-        Some(core) if core >= h => luminance_band(cx, img, w, h, &p, stats, late),
+        Some(core) if core >= h => luminance_band(cx, img, w, h, &p, stats),
         Some(core) => {
             if profiling() {
                 eprintln!("  gpu luminance bands: {} of {core} rows (halo {halo})", h.div_ceil(core));
@@ -947,7 +933,7 @@ fn luminance_nr(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, s: &DevelopSetti
                 let y1 = (y0 + core).min(h);
                 let (b0, b1) = (y0.saturating_sub(halo), (y1 + halo).min(h));
                 let input = cx.slice(img, 3 * b0 * w, 3 * (b1 - b0) * w);
-                let band = luminance_band(cx, &input, w, b1 - b0, &p, stats, late);
+                let band = luminance_band(cx, &input, w, b1 - b0, &p, stats);
                 drop(input);
                 let kept = cx.slice(&band, 3 * (y0 - b0) * w, 3 * (y1 - y0) * w);
                 drop(band);
@@ -963,9 +949,6 @@ fn luminance_nr(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, s: &DevelopSetti
             // not even one band fits: this step on the CPU
             let mut host = cx.read_rgb(img, w, h);
             nrl::denoise(&mut host, &p, Some(stats));
-            if late == 1 {
-                host.data.iter_mut().for_each(|c| *c = c.map(|v| v.max(0.0)));
-            }
             cx.gpu.upload(rgb_words(&host))
         }
     };
@@ -977,7 +960,7 @@ fn luminance_nr(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, s: &DevelopSetti
 }
 
 /// [`luminance_nr`] of one band (or the whole image) `img` of `w × h`.
-fn luminance_band(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, p: &nrl::Params, stats: &nrl::Stats, late: u32) -> Buf {
+fn luminance_band(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, p: &nrl::Params, stats: &nrl::Stats) -> Buf {
     let n = w * h;
     let change = cx.zeroed(n);
     let y = cx.gpu.buffer(n);
@@ -1012,13 +995,10 @@ fn luminance_band(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, p: &nrl::Param
     // allocated last: with the levels gone (peak: the input, Y's change, var, two levels and the
     // coarse energy's two buffers)
     let out = cx.gpu.buffer(n * 3);
-    map(cx, "nrl_apply", n, &[late], [Some(img), Some(&change), None], &out);
+    map(cx, "nrl_apply", n, &[], [Some(img), Some(&change), None], &out);
     out
 }
 
-/// The new colour noise reduction (`local::color_nr_v2`). The image's chroma is never stored at
-/// full size: the first pass reads it from the image while downsampling and applying, the last
-/// pass recombines as it applies.
 /// Run a `nrcj.wgsl` kernel on `n` items with inputs `a`, `b` and output `out`.
 fn nrcj(cx: &mut Cx<'_>, k: &str, n: usize, p: &[u32], a: &Buf, b: Option<&Buf>, out: &Buf) {
     cx.run(k, p, &[Some(a), b, Some(out)], groups1(n));
@@ -1032,9 +1012,9 @@ const VRAM_RESERVE: u64 = 640 << 20;
 
 /// The device memory a noise reduction may plan its bands with (`what` names it in the profile): the
 /// memory free right now (where the driver can be asked, `crate::vram`) plus our own pooled buffers,
-/// which we reuse, less [`VRAM_RESERVE`]; else a fixed 2 GB. PROTOTYPE: `NRV2_GPU_BAND_MB` overrides it.
+/// which we reuse, less [`VRAM_RESERVE`]; else a fixed 2 GB. Tests set it with `Fault::BandBudget`.
 fn band_budget(cx: &Cx<'_>, what: &str) -> usize {
-    let fixed = BAND_BUDGET.get().or_else(|| std::env::var("NRV2_GPU_BAND_MB").ok().and_then(|v| v.parse::<usize>().ok()).map(|mb| mb << 20));
+    let fixed = BAND_BUDGET.get();
     let measured = crate::vram::free_bytes(&cx.gpu.info).map(|free| {
         let pooled = crate::ctx::memory().pooled;
         (free.saturating_add(pooled).saturating_sub(VRAM_RESERVE)) as usize
@@ -1042,7 +1022,7 @@ fn band_budget(cx: &Cx<'_>, what: &str) -> usize {
     let budget = fixed.or(measured).unwrap_or(2048 << 20);
     if profiling() {
         let source = if fixed.is_some() {
-            "NRV2_GPU_BAND_MB"
+            "Fault::BandBudget"
         } else if measured.is_some() {
             "free device memory"
         } else {
@@ -1203,81 +1183,6 @@ fn joint_band(
     drop((scratch, paths, links, guide));
     cx.sync();
     filtered
-}
-
-fn color_nr_v2(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, p: &local::NrcParams) -> Buf {
-    let n = w * h;
-    let off = p.off.to_bits();
-    let mut prev: Option<Buf> = None;
-    let mut out = None;
-    for (i, pass) in p.passes.iter().enumerate() {
-        let last = i + 1 == p.passes.len();
-        let step = pass.step.max(1);
-        let (lw, lh) = (w.div_ceil(step).max(1), h.div_ceil(step).max(1));
-        let lo = match &prev {
-            None => {
-                let mut prm = vec![w as u32, lw as u32, off, 0, 0];
-                tap_tables(&mut prm, (w, lw), (h, lh), Filter::Box, 4);
-                let lo = cx.gpu.buffer(lw * lh * 3);
-                map(cx, "nrc_down", lw * lh, &prm, [Some(img), None, None], &lo);
-                lo
-            }
-            Some(q) => resize(cx, q, (w, h), (lw, lh), 3, Filter::Box),
-        };
-        let ab = nrc_coeffs(cx, &lo, lw, lh, pass);
-        let mut prm = vec![lw as u32, lh as u32, w as u32, off, (lw * lh * 3) as u32, prev.is_some() as u32, 0, 0, last as u32];
-        tap_tables(&mut prm, (lw, w), (lh, h), Filter::Bilinear, 7);
-        let q = cx.gpu.buffer(n * 3);
-        map(cx, "nrc_apply", n, &prm, [Some(img), Some(&ab), prev.as_ref()], &q);
-        if last {
-            out = Some(q);
-        } else {
-            prev = Some(q);
-        }
-    }
-    out.unwrap_or_else(|| cx.copy(img))
-}
-
-/// Append the `resize` tap tables for x (`sx → dx`) and y to the kernel parameters `prm` (which
-/// will follow the pixel count, so word `i` of `prm` is `P[i + 1]`), and store where each starts
-/// (as a P index) at `P[at]`, `P[at + 1]`. Weight words in a table count from its start.
-fn tap_tables(prm: &mut Vec<u32>, (sx, dx): (usize, usize), (sy, dy): (usize, usize), filter: Filter, at: usize) {
-    let tx = prm.len() + 1;
-    prm.extend(taps(sx, dx, filter));
-    let ty = prm.len() + 1;
-    prm.extend(taps(sy, dy, filter));
-    prm[at - 1] = tx as u32;
-    prm[at] = ty as u32;
-}
-
-/// Self-guided coefficients of one pass at its subsampled size (`local::self_guided3`): all a,
-/// then all b, blurred. Reads back the sampled local variances (at most `local::NRC_SAMPLES` × 3
-/// values) for the noise level. (The blur takes at most three channels: d and d², a and b are
-/// separate buffers.)
-fn nrc_coeffs(cx: &mut Cx<'_>, lo: &Buf, lw: usize, lh: usize, pass: &local::NrcPass) -> Buf {
-    let ln = lw * lh;
-    let sg = pass.sigma / pass.step.max(1) as f32;
-    let sq = cx.gpu.buffer(ln * 3);
-    map(cx, "nrc_sq", ln, &[], [Some(lo), None, None], &sq);
-    let m = gaussian(cx, lo, lw, lh, 3, sg);
-    let c2 = gaussian(cx, &sq, lw, lh, 3, sg);
-    let stride = local::nrc_sample_stride(ln);
-    let count = ln.div_ceil(stride);
-    let smp = cx.gpu.buffer(count * 3);
-    map(cx, "nrc_var_sample", count, &[stride as u32], [Some(&m), Some(&c2), None], &smp);
-    let v: Vec<f32> = cx.read(&smp, count * 3);
-    let samples: Vec<[f32; 3]> = v.as_chunks::<3>().0.to_vec();
-    let eps = local::nrc_eps(&samples, pass.k, pass.pct);
-    let ca = cx.gpu.buffer(ln * 3);
-    map(cx, "nrc_a", ln, &eps.map(f32::to_bits), [Some(&m), Some(&c2), None], &ca);
-    let cb = cx.gpu.buffer(ln * 3);
-    map(cx, "nrc_b", ln, &[], [Some(&m), Some(&ca), None], &cb);
-    let ca = gaussian(cx, &ca, lw, lh, 3, sg);
-    let cb = gaussian(cx, &cb, lw, lh, 3, sg);
-    let ab = cx.gpu.buffer(ln * 6);
-    cx.copy_into(&ca, &ab, 0);
-    cx.copy_into(&cb, &ab, ln * 3);
-    ab
 }
 
 /// The planes the per-pixel stage reads.

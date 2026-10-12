@@ -275,7 +275,7 @@ impl CameraColourModel<'_> {
                 Some(tables) => tables.apply(rgb, gain),
                 None => rgb.map(|v| v * gain),
             };
-            self.hue_sat.map_or(rgb, |h| h.apply(rgb)).map(|v| if late_clamp() { v } else { v.max(0.0) })
+            self.hue_sat.map_or(rgb, |h| h.apply(rgb)).map(|v| v.max(0.0))
         });
     }
 }
@@ -876,12 +876,6 @@ impl crate::Session {
         }
         self
     }
-}
-
-/// EXPERIMENT (#1129): keep negative values until after the noise reduction (`LIGHTCRAFT_LATE_CLAMP=1`).
-pub fn late_clamp() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("LIGHTCRAFT_LATE_CLAMP").is_ok_and(|v| v == "1"))
 }
 
 #[cfg(test)]

@@ -164,8 +164,7 @@ fn nrl_coarse(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgrou
     dst[i] = dst[i] - nrl_removed(a[i], b[i], c[i], pf(1u));
 }
 
-// `nrl::add_luminance` of RGB image `a` and the change of Y `b` (then, with P[1] = 1, the experiment's
-// late clamp at 0). P: n, clamp.
+// `nrl::add_luminance` of RGB image `a` and the change of Y `b`. P: n.
 @compute @workgroup_size(256)
 fn nrl_apply(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
     let i = lin_index(g, nw);
@@ -207,9 +206,6 @@ fn nrl_apply(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroup
                 break;
             }
         }
-    }
-    if (pu(1u) == 1u) {
-        out = array<f32, 3>(max(out[0], 0.0), max(out[1], 0.0), max(out[2], 0.0));
     }
     dst[3u * i] = out[0];
     dst[3u * i + 1u] = out[1];

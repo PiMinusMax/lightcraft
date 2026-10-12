@@ -386,8 +386,7 @@ pub fn tolerance(detail: f32) -> f32 {
 /// half), stronger up to 100. Below 25 the final blend (`strength`) fades it out with the rest.
 pub fn speck_brake(amount: f32) -> SpeckBrake {
     let t = ((amount - 0.25) / 0.75).clamp(0.0, 1.0);
-    let off = std::env::var_os("NRV2_SPECK_OFF").is_some();
-    SpeckBrake { threshold: 64.0 - 39.0 * t, share: if off { 0.0 } else { 0.5 + 0.5 * t } }
+    SpeckBrake { threshold: 64.0 - 39.0 * t, share: 0.5 + 0.5 * t }
 }
 
 /// See [`speck_brake`]; `share` 0 turns the brake off.
@@ -532,10 +531,9 @@ fn despeck(img: &mut Rgb32f, noise: &JointNoise, brake: SpeckBrake) {
 /// computed row by row as each row is written (the luminance NR's input, without another pass).
 /// `None` when nothing was done or `want_y` is false.
 pub(crate) fn denoise(img: &mut Rgb32f, params: &NrcParams, detail: f32, amount: f32, want_y: bool) -> Option<Plane> {
-    let step = std::env::var("NRV2_JOINT_STEP").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1).clamp(1, 2);
     // Continuous ramp from zero; from the ordinary default Color=25 onward the spatial
     // scale controls the extra smoothing. Noise calibration and edge decisions stay fixed.
-    denoise_grid_y(img, params, step, detail, strength(amount), speck_brake(amount), want_y)
+    denoise_grid_y(img, params, 1, detail, strength(amount), speck_brake(amount), want_y)
 }
 
 #[cfg(test)]
@@ -607,24 +605,11 @@ fn denoise_grid_y(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32
     let mut noise = noise_model(&original);
     lap("noise model", &mut tt);
     noise.tolerance = tolerance(detail);
-    if let Some(path) = std::env::var_os("NRV2_DUMP") {
-        // PROTOTYPE: the transformed image (w, h as u32, then Y, R−Y, B−Y as f32) and the noise model
-        let mut bytes = Vec::with_capacity(8 + 12 * original.len());
-        bytes.extend((w as u32).to_le_bytes());
-        bytes.extend((h as u32).to_le_bytes());
-        for p in &original.data {
-            for v in p {
-                bytes.extend(v.to_le_bytes());
-            }
-        }
-        let _ = std::fs::write(&path, bytes);
-        eprintln!("    nr joint dump: alpha {:?} beta {:?} ymax {:?}", noise.model.alpha, noise.model.beta, noise.ymax);
-    }
     despeck(&mut original, &noise, brake);
     lap("speck brake", &mut tt);
     let planes = pilot(&original, &noise);
     lap("pilot", &mut tt);
-    if std::env::var_os("NRV2_DEBUG").is_some() {
+    if start.is_some() {
         eprintln!("    nr joint: {w}x{h}, Y/R-Y/B-Y alpha {:?} beta {:?}, supported Y {:?}", noise.model.alpha, noise.model.beta, noise.ymax);
     }
     // Working buffers carry the two chroma components only (Y is restored from the image at the end).

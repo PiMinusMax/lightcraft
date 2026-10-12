@@ -436,11 +436,11 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
             // The joint diffusion reads a chain of neighbours across its scales, the luminance
             // wavelet its coarsest level. Keep those reads outside the requested zoom window, just
             // as spot reads are.
-            let joint = local::nrc_joint_enabled()
+            let joint = local::joint_colour_nr(s)
                 .then(|| local::nrc_params(s, src.width.max(src.height), frame.output_long(full_w, full_h)))
                 .flatten()
                 .map_or(0, |params| params.passes.last().map_or(0, |p| (6.0 * p.sigma).ceil() as usize).saturating_add(4));
-            let lum = if s.detail.nr_luminance > 0.0 && nrl::enabled() { nrl::halo() } else { 0 };
+            let lum = if s.detail.nr_luminance > 0.0 && local::wavelet_luminance(s) { nrl::halo() } else { 0 };
             let halo = joint.max(lum);
             if req.depth == OutputDepth::U8 && halo > 0 {
                 let x = work.x.saturating_sub(halo);
@@ -470,7 +470,7 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         format!("{eyes:?}"),
         format!("{:?}", s.optics),
         local_tone::enabled(info, s),
-        if nrl::enabled() { [0; 3] } else { lum },
+        if local::wavelet_luminance(s) { [0; 3] } else { lum },
         [d.nr_color, d.nr_color_detail, d.nr_color_smoothness].map(f64::to_bits),
         src_long,
     ));
@@ -485,7 +485,8 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         local_tone::enabled(info, s),
         src_long,
     ));
-    let lin_key = hash_of((pre_nr_key, [d.nr_luminance, d.nr_detail, d.nr_contrast, d.nr_color, d.nr_color_detail, d.nr_color_smoothness].map(f64::to_bits)));
+    let lin_key =
+        hash_of((pre_nr_key, [d.nr_luminance, d.nr_detail, d.nr_contrast, d.nr_color, d.nr_color_detail, d.nr_color_smoothness].map(f64::to_bits)));
     Plan { settings, frame, w, h, px_per_long, src_long, geo, lin_key, pre_key, pre_nr_key, eyes, fixed_air, keep, mattes: info.mattes.clone(), full }
 }
 
@@ -495,7 +496,7 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
 /// alone, are left out. `None` when the luminance NR is off.
 pub fn lum_stats(src: &Rgb32f, info: &SourceInfo, p: &Plan<'_>) -> Option<nrl::Stats> {
     let s = &*p.settings;
-    if s.detail.nr_luminance <= 0.0 || !nrl::enabled() {
+    if s.detail.nr_luminance <= 0.0 || !local::wavelet_luminance(s) {
         return None;
     }
     let t = profiling().then(std::time::Instant::now);
@@ -664,7 +665,7 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
                     (Arc::new(img), y)
                 }
             };
-            let lin = if !local::wavelet_luminance_nr(s, src_long, out_long) && !local::late_clamp() {
+            let lin = if !local::wavelet_luminance_nr(s, src_long, out_long) {
                 pre.clone()
             } else {
                 let stats = match cached.as_ref().and_then(|e| e.lum_stats.clone()).filter(|(k, _)| *k == plan.pre_key) {
