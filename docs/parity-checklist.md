@@ -1,6 +1,6 @@
 # Lightroom parity checklist
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-11 · **Change:** minor (LR-MERGE-HDR: merges of raws without colour matrices keep their colour (#965); rapid slider entry; LR-PROF-CAMERACOLOR: tone curve from black-and-white camera JPEGs; LR-VIEW-ZOOM, LR-VIEW-COMPARE: Compare and Reference zoom windows; LR-IMP-FORMATS, LR-IMP-CAMERA-COVERAGE: EOS R5 Mark II CR3 decodes; renamed from `parity.md`; Top gaps moved to gaps.md, shortcut notes to ui-parity.md; filesystem history retry/Undo/Redo evidence; renamed from `parity.md`; Top gaps moved to gaps.md, shortcut notes to ui-parity.md) · **Target:** Adobe Lightroom Classic 15.5 / Lightroom 9.6
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** minor (LR-EDIT-AUTO: scoped MCP correction and bundled photo-editing skill; parity status unchanged) · **Target:** Adobe Lightroom Classic 15.5 / Lightroom 9.6
 
 The measured, row-by-row checklist: one row per Lightroom feature, menu item and shortcut, what we
 have and what is missing. It answers *does the feature exist?* (feature breadth). Whether it is good
@@ -174,7 +174,7 @@ differences and missing bindings are in [ui-parity.md](ui-parity.md#shortcuts).
 
 | Id | Feature | Tier | Status | Evidence | Missing / notes |
 |---|---|---|---|---|---|
-| LR-EDIT-AUTO | Auto settings | P0 | ✅ | `cmd:develop.auto`, `crates/pipeline/src/auto.rs` | a Lightroom-like recipe calibrated black-box on Lightroom's Auto results for 24 Sony raws: Exposure from the scene's scene-linear log-average luminance (Lightroom's observed slope, -0.41 EV per EV), Highlights -66 and Shadows +52 (Lightroom's average Auto values), Contrast +68 and Vibrance +30 fitted on our scales. Held out one photo at a time: on the 16 photos whose start Sony's DRO doesn't brighten, a median dE76 of 6.4 from Lightroom's Auto results against 8.3 unedited; on all 24, 7.7 against 7.9 (issues #318, #209). Calibrated on Sony files only; Whites and Blacks stay 0 |
+| LR-EDIT-AUTO | Auto settings | P0 | ✅ | `cmd:develop.auto`, `crates/pipeline/src/auto.rs` | a Lightroom-like recipe calibrated black-box on Lightroom's Auto results for 24 Sony raws: Exposure from the scene's scene-linear log-average luminance (Lightroom's observed slope, -0.41 EV per EV), Highlights -66 and Shadows +52 (Lightroom's average Auto values), Contrast +68 and Vibrance +30 fitted on our scales. Held out one photo at a time: on the 16 photos whose start Sony's DRO doesn't brighten, a median dE76 of 6.4 from Lightroom's Auto results against 8.3 unedited; on all 24, 7.7 against 7.9 (issues #318, #209). Calibrated on Sony files only; Whites and Blacks stay 0; agent workflow: `skills/lightcraft-photo-editing/SKILL.md`, `docs/mcp.md`, `crates/mcp/src/tools.rs` (`auto_develop`, explicit photo target, before/after settings, single undo; tone and white balance separately) |
 | LR-EDIT-BW | Black & white | P0 | ✅ | `cmd:develop.treatment` | |
 | LR-EDIT-HDR-MODE | HDR editing | P2 | ✅ | `cmd:develop.hdr`, `ctl:hdr.maxEv`, `crates/ui-egui/src/panels/edit.rs` (`hdr_row`) | HDR button next to B&W in the Edit panel header, as Lightroom (Visualize HDR and the headroom limit in the Light panel while it's on); see Q. HDR |
 | LR-EDIT-LIGHT-EXPOSURE | Exposure | P0 | ✅ | `ctl:light.exposure` | |
@@ -789,6 +789,7 @@ Latin stays upright. Advanced Japanese composition remains open. Regression cove
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-13 | minor | LR-EDIT-AUTO: bundled agent photo-editing skill and MCP workflow resource; typed, single-photo automatic tone/white-balance helper with before/after settings and Undo. Existing parity status unchanged. |
 | 2026-10-11 | minor | LR-MERGE-HDR: HDR and panorama merges of raws without colour matrices (CR2, NEF, ARW…) write the colour they open with as DNG tags (issue #965); status unchanged |
 | 2026-10-12 | minor | LR-META-XMP: Read Metadata from File no longer auto-writes the sidecar it has just read, which added `lc:settings` and hid another app's later `crs:` edits (#934); status unchanged (✅) |
 | 2026-10-12 | patch | LR-IMP-CAMERA-COVERAGE: CR2 white level from the active area, not the saturated masked rows above it (issue #1272); status unchanged (🟡) |
