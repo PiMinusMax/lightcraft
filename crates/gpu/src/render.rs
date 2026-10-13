@@ -610,6 +610,7 @@ pub fn render(
     stages: Option<&GpuStages>,
     fault: Option<crate::Fault>,
 ) -> Option<Rendered> {
+    let _in_flight = InFlight::new();
     let mut t = profiling().then(std::time::Instant::now);
     // Each stage is submitted on its own; under `LIGHTCRAFT_PROFILE` also waited for, so the
     // timings are real.
@@ -921,7 +922,8 @@ fn luminance_nr(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, s: &DevelopSetti
     // besides. A band's halo covers the filter's reach (`nrl::halo`, as for a window), so its kept rows
     // are the whole image's.
     let halo = nrl::halo();
-    let out = match band_rows(cx, band_budget(cx, "luminance"), w, h, 48, 12 * n, halo) {
+    let (budget, _bands) = band_budget(cx, "luminance");
+    let out = match band_rows(cx, budget, w, h, 48, 12 * n, halo) {
         Some(core) if core >= h => luminance_band(cx, img, w, h, &p, stats),
         Some(core) => {
             if profiling() {
@@ -1010,15 +1012,15 @@ fn nrcj(cx: &mut Cx<'_>, k: &str, n: usize, p: &[u32], a: &Buf, b: Option<&Buf>,
 /// budget planned with 384 MB, and ran with 1500 MB).
 const VRAM_RESERVE: u64 = 640 << 20;
 
-/// The device memory a noise reduction may plan its bands with (`what` names it in the profile): the
-/// memory free right now (where the driver can be asked, `crate::vram`) plus our own pooled buffers,
-/// which we reuse, less [`VRAM_RESERVE`]; else a fixed 2 GB. Tests set it with `Fault::BandBudget`.
-fn band_budget(cx: &Cx<'_>, what: &str) -> usize {
+/// The device memory a noise reduction may plan its bands with (`what` names it in the profile):
+/// [`band_budget_from`] the memory free right now (where the driver can be asked, `crate::vram`); else a
+/// fixed 2 GB. Tests set it with `Fault::BandBudget`. Comes with the [`BANDS`] lock: the caller holds it
+/// until its bands are done, so no other render plans from the same free memory meanwhile.
+fn band_budget(cx: &Cx<'_>, what: &str) -> (usize, std::sync::MutexGuard<'static, ()>) {
+    let lock = BANDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let fixed = BAND_BUDGET.get();
-    let measured = crate::vram::free_bytes(&cx.gpu.info).map(|free| {
-        let pooled = crate::ctx::memory().pooled;
-        (free.saturating_add(pooled).saturating_sub(VRAM_RESERVE)) as usize
-    });
+    let renders = RENDERS.load(std::sync::atomic::Ordering::Relaxed);
+    let measured = crate::vram::free_bytes(&cx.gpu.info).map(|free| band_budget_from(free, crate::ctx::memory().pooled, renders));
     let budget = fixed.or(measured).unwrap_or(2048 << 20);
     if profiling() {
         let source = if fixed.is_some() {
@@ -1028,9 +1030,9 @@ fn band_budget(cx: &Cx<'_>, what: &str) -> usize {
         } else {
             "fixed default"
         };
-        eprintln!("  gpu {what} budget: {} MB ({source})", budget >> 20);
+        eprintln!("  gpu {what} budget: {} MB ({source}, {renders} render(s) on the device)", budget >> 20);
     }
-    budget
+    (budget, lock)
 }
 
 thread_local! {
@@ -1051,6 +1053,37 @@ fn band_rows(cx: &Cx<'_>, budget: usize, w: usize, h: usize, per_pixel: usize, o
     } else {
         None
     }
+}
+
+/// Renders on the device right now ([`render`]). An export batch renders photos side by side: while one
+/// plans its noise reduction bands, each of the others may still allocate the buffers of its other stages.
+static RENDERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Held while a noise reduction plans its bands and runs them: two plans made at once from the same free
+/// memory would together ask for more than there is.
+static BANDS: Mutex<()> = Mutex::new(());
+
+/// Counts a render in [`RENDERS`] while it lives.
+struct InFlight;
+
+impl InFlight {
+    fn new() -> Self {
+        RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        InFlight
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        RENDERS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The band budget from the device memory free right now and our own pooled buffers (which we reuse), less
+/// [`VRAM_RESERVE`] for each render on the device (this one's other stages and every other render's).
+fn band_budget_from(free: u64, pooled: u64, renders: usize) -> usize {
+    let reserve = VRAM_RESERVE.saturating_mul(renders.max(1) as u64);
+    free.saturating_add(pooled).saturating_sub(reserve) as usize
 }
 
 /// The joint colour noise reduction (`lightcraft_pipeline::nrc_joint`) on the GPU, the same steps as the
@@ -1101,8 +1134,8 @@ fn color_nr_joint(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, p: &local::Nrc
     let halo = plan.iter().map(|d| 2 * d.0).sum::<usize>() + plan.last().map_or(0, |d| d.0) + 10;
     // Memory: the whole output (3 values per pixel) is held besides the input; a band then holds about
     // 12 values per pixel (guide 3, two chroma buffers 2 + 2, paths 2, weights 2; up to 12 while the
-    // speck brake and the guide run), planned within `band_budget`.
-    let budget = band_budget(cx, "joint");
+    // speck brake and the guide run), planned within `band_budget`, whose lock is held until the bands are done.
+    let (budget, _bands) = band_budget(cx, "joint");
     // not even one band with its halo fits: this stage runs on the CPU (the rest of the render stays here)
     let core = band_rows(cx, budget, w, h, 48, 12 * n, halo)?;
     let out = cx.gpu.buffer(3 * n);
@@ -1431,6 +1464,26 @@ fn masks(cx: &mut Cx<'_>, lin: &Buf, prep: &Prep, plan: &Plan<'_>, host: &mut Ho
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two exports side by side: each band plan leaves room for the other render, so the two together
+    /// stay within the free memory they both measured.
+    #[test]
+    fn band_budget_leaves_room_for_every_render_on_the_device() {
+        let (free, pooled) = (3000u64 << 20, 200u64 << 20);
+        let alone = band_budget_from(free, pooled, 1);
+        assert_eq!(alone, (3200usize << 20) - VRAM_RESERVE as usize);
+        assert_eq!(band_budget_from(free, pooled, 0), alone, "the render itself is always counted");
+        let two = band_budget_from(free, pooled, 2);
+        assert_eq!(two, alone - VRAM_RESERVE as usize);
+        assert_eq!(band_budget_from(100 << 20, 0, 3), 0, "nothing left: no band fits, the CPU runs the step");
+        let before = RENDERS.load(std::sync::atomic::Ordering::Relaxed);
+        {
+            let _a = InFlight::new();
+            let _b = InFlight::new();
+            assert!(RENDERS.load(std::sync::atomic::Ordering::Relaxed) >= before + 2);
+        }
+        assert!(RENDERS.load(std::sync::atomic::Ordering::Relaxed) < before + 2, "a finished render no longer counts");
+    }
 
     #[test]
     fn coverage_mask_matches_per_pixel_decision() {
