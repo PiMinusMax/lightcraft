@@ -581,6 +581,7 @@ pub fn render(
     stages: Option<&GpuStages>,
     fault: Option<crate::Fault>,
 ) -> Option<Rendered> {
+    let _in_flight = InFlight::new();
     let mut t = profiling().then(std::time::Instant::now);
     // Each stage is submitted on its own; under `LIGHTCRAFT_PROFILE` also waited for, so the
     // timings are real.
@@ -841,6 +842,37 @@ fn nrcj(cx: &mut Cx<'_>, k: &str, n: usize, p: &[u32], a: &Buf, b: Option<&Buf>,
 /// render, the display, other programs).
 const VRAM_RESERVE: u64 = 384 << 20;
 
+/// Renders on the device right now ([`render`]). An export batch renders photos side by side: while one
+/// plans its noise reduction bands, each of the others may still allocate the buffers of its other stages.
+static RENDERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Held while a noise reduction plans its bands and runs them: two plans made at once from the same free
+/// memory would together ask for more than there is.
+static BANDS: Mutex<()> = Mutex::new(());
+
+/// Counts a render in [`RENDERS`] while it lives.
+struct InFlight;
+
+impl InFlight {
+    fn new() -> Self {
+        RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        InFlight
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        RENDERS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The band budget from the device memory free right now and our own pooled buffers (which we reuse), less
+/// [`VRAM_RESERVE`] for each render on the device (this one's other stages and every other render's).
+fn band_budget_from(free: u64, pooled: u64, renders: usize) -> usize {
+    let reserve = VRAM_RESERVE.saturating_mul(renders.max(1) as u64);
+    free.saturating_add(pooled).saturating_sub(reserve) as usize
+}
+
 /// The joint colour noise reduction (`lightcraft_pipeline::nrc_joint`) on the GPU, the same steps as the
 /// CPU: only the noise samples are read back (the noise model is fitted on the CPU, by the same code).
 /// Large images are filtered in horizontal bands whose halo covers every step's reach, so each kept pixel
@@ -889,18 +921,17 @@ fn color_nr_joint(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, p: &local::Nrc
     let halo = plan.iter().map(|d| 2 * d.0).sum::<usize>() + plan.last().map_or(0, |d| d.0) + 10;
     // Memory: the whole output (3 values per pixel) is held besides the input; a band then holds about
     // 12 values per pixel (guide 3, two chroma buffers 2 + 2, paths 2, weights 2; up to 12 while the
-    // speck brake and the guide run). The budget for both together is the device memory free right now (where the
-    // driver can be asked, `crate::vram`) plus our own pooled buffers, which we reuse, less a reserve for
-    // the rest of the render and other programs; else a fixed 2 GB. PROTOTYPE: `NRV2_GPU_BAND_MB` overrides it.
+    // speck brake and the guide run). The budget for both together is `band_budget_from` the device memory
+    // free right now (where the driver can be asked, `crate::vram`); else a fixed 2 GB. One band plan at a
+    // time (`BANDS`), held until the bands are done. PROTOTYPE: `NRV2_GPU_BAND_MB` overrides it.
+    let _bands = BANDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let fixed = std::env::var("NRV2_GPU_BAND_MB").ok().and_then(|v| v.parse::<usize>().ok()).map(|mb| mb << 20);
-    let measured = crate::vram::free_bytes(&cx.gpu.info).map(|free| {
-        let pooled = crate::ctx::memory().pooled;
-        (free.saturating_add(pooled).saturating_sub(VRAM_RESERVE)) as usize
-    });
+    let renders = RENDERS.load(std::sync::atomic::Ordering::Relaxed);
+    let measured = crate::vram::free_bytes(&cx.gpu.info).map(|free| band_budget_from(free, crate::ctx::memory().pooled, renders));
     let budget = fixed.or(measured).unwrap_or(2048 << 20);
     if profiling() {
         eprintln!(
-            "  gpu joint budget: {} MB ({})",
+            "  gpu joint budget: {} MB ({}, {renders} render(s) on the device)",
             budget >> 20,
             if fixed.is_some() {
                 "NRV2_GPU_BAND_MB"
@@ -1250,6 +1281,26 @@ fn masks(cx: &mut Cx<'_>, lin: &Buf, prep: &Prep, plan: &Plan<'_>, host: &mut Ho
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two exports side by side: each band plan leaves room for the other render, so the two together
+    /// stay within the free memory they both measured.
+    #[test]
+    fn band_budget_leaves_room_for_every_render_on_the_device() {
+        let (free, pooled) = (3000u64 << 20, 200u64 << 20);
+        let alone = band_budget_from(free, pooled, 1);
+        assert_eq!(alone, (3200usize << 20) - VRAM_RESERVE as usize);
+        assert_eq!(band_budget_from(free, pooled, 0), alone, "the render itself is always counted");
+        let two = band_budget_from(free, pooled, 2);
+        assert_eq!(two, alone - VRAM_RESERVE as usize);
+        assert_eq!(band_budget_from(100 << 20, 0, 3), 0, "nothing left: no band fits, the CPU runs the step");
+        let before = RENDERS.load(std::sync::atomic::Ordering::Relaxed);
+        {
+            let _a = InFlight::new();
+            let _b = InFlight::new();
+            assert!(RENDERS.load(std::sync::atomic::Ordering::Relaxed) >= before + 2);
+        }
+        assert!(RENDERS.load(std::sync::atomic::Ordering::Relaxed) < before + 2, "a finished render no longer counts");
+    }
 
     #[test]
     fn coverage_mask_matches_per_pixel_decision() {
