@@ -373,24 +373,6 @@ pub(crate) enum Mode {
 }
 
 fn decode_with(bytes: &[u8], mode: Mode) -> Result<RawImage> {
-    let mut r = decode_samples(bytes, mode)?;
-    if mode == Mode::Full && hot_pixels_enabled() {
-        let t = std::time::Instant::now();
-        let n = r.suppress_hot_pixels();
-        if std::env::var_os("LIGHTCRAFT_PROFILE").is_some() {
-            eprintln!("  raw hot pixels: {n} replaced in {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
-        }
-    }
-    Ok(r)
-}
-
-/// PROTOTYPE: hot pixel suppression is off unless `LIGHTCRAFT_HOT_PIXELS=1` (optional: cameras correct most
-/// themselves, it costs time and can catch real point lights).
-pub fn hot_pixels_enabled() -> bool {
-    std::env::var("LIGHTCRAFT_HOT_PIXELS").is_ok_and(|v| v == "1")
-}
-
-fn decode_samples(bytes: &[u8], mode: Mode) -> Result<RawImage> {
     match probe(bytes).ok_or(RawError::NotRaw)? {
         RawFormat::Dng => dng::decode(bytes, mode).map(lift_clipped),
         RawFormat::Cr2 => vendor::cr2::decode(bytes, mode),

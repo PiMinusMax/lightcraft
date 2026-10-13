@@ -2,6 +2,12 @@
 
 ## 2026-10-13
 
+### Remove Hot Pixels
+- Detail ▸ Noise Reduction has a new box, Remove Hot Pixels (raws only), on for newly imported raws (issue #1345).
+  At high ISO single photosites read far brighter than all their neighbours and turn into small red, green or blue
+  dots that noise reduction only makes fainter. They are now replaced before the raw is developed. A point of light
+  spread over neighbouring photosites, such as a star, is kept; untick the box for star fields that need every
+  single-photosite point. Photos edited earlier keep their look: the box is off for them.
 ### Slider drags on large raws
 - Dragging a slider no longer re-renders the edited photo's filmstrip thumbnail on every frame; it follows once you
   let go. On a 64 MP raw the first of those renders decoded the whole file again, which held up the loupe's
