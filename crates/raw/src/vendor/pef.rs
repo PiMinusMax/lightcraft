@@ -103,8 +103,10 @@ impl<'a> Bits<'a> {
     pub fn consumed_bits(&self) -> usize {
         self.pos * 8 - self.n as usize
     }
+    /// Whether more bits were handed out than the source holds (the zeros read past its end are lookahead padding,
+    /// not data; using them would fabricate samples).
     pub fn overrun(&self) -> bool {
-        self.pos > self.src.len() + 8
+        self.consumed_bits() > self.src.len() * 8
     }
 }
 
@@ -150,13 +152,17 @@ pub(crate) fn decode_huffman(src: &[u8], h: &Huffman, w: usize, hgt: usize, bits
         let row = &mut out[y * w..(y + 1) * w];
         for (x, o) in row.iter_mut().enumerate() {
             let d = diff(&mut bits, h).ok_or_else(|| RawError::Corrupt(format!("PEF: invalid Huffman code at row {y}")))?;
+            // a run of large differences in a corrupt stream can drive a predictor past i32 (issue #1515)
+            let overflow = || RawError::Corrupt(format!("PEF: predictor out of range at row {y}"));
             let p = if x < 2 {
-                vpred[y & 1][x] += d;
-                hpred[x] = vpred[y & 1][x];
-                hpred[x]
+                let v = vpred[y & 1][x].checked_add(d).ok_or_else(overflow)?;
+                vpred[y & 1][x] = v;
+                hpred[x] = v;
+                v
             } else {
-                hpred[x & 1] += d;
-                hpred[x & 1]
+                let v = hpred[x & 1].checked_add(d).ok_or_else(overflow)?;
+                hpred[x & 1] = v;
+                v
             };
             *o = p.clamp(0, max) as u16;
         }
@@ -388,6 +394,49 @@ mod tests {
         // truncated data is reported, not a panic
         assert!(decode_huffman(&src[..src.len() / 3], &h, w, hgt, 14).is_err());
         assert!(table(&tb[..20], ByteOrder::Big).is_err());
+    }
+
+    /// Zero-padded lookahead past the end must not be decoded as samples: with no entropy at all, the zero bits
+    /// are a valid code (category 1) in this table, so a reader that only limits the refill position accepts them.
+    #[test]
+    fn symbols_decoded_from_padding_past_the_end_are_rejected() {
+        let (tb, codes) = test_table();
+        let h = table(&tb, ByteOrder::Big).unwrap();
+        assert!(decode_huffman(&[], &h, 2, 1, 14).is_err());
+        // the same image with its real entropy still decodes, including the last byte's padding bits
+        let px = [5u16, 9];
+        let src = encode(&px, 2, &codes);
+        assert_eq!(decode_huffman(&src, &h, 2, 1, 14).unwrap(), px);
+        // one byte short of the real entropy is rejected
+        assert!(decode_huffman(&src[..src.len() - 1], &h, 2, 1, 14).is_err());
+    }
+
+    /// A long run of the largest difference drove a predictor past i32: a panic in builds with overflow checks,
+    /// wrapped values otherwise (issue #1515). Both the row and the column predictors now stop with an error.
+    #[test]
+    fn predictor_overflow_is_an_error_not_a_panic() {
+        let (tb, codes) = test_table();
+        let h = table(&tb, ByteOrder::Big).unwrap();
+        let (c, l) = codes[14];
+        let d = (1u32 << 14) - 1;
+        let stream = |n: usize| {
+            let mut bits: Vec<bool> = Vec::with_capacity(n * (l as usize + 14));
+            for _ in 0..n {
+                (0..l).rev().for_each(|i| bits.push((c >> (12 - l)) >> i & 1 == 1));
+                (0..14).rev().for_each(|i| bits.push(d >> i & 1 == 1));
+            }
+            bits.chunks(8).map(|c| c.iter().enumerate().fold(0u8, |a, (i, &b)| a | (b as u8) << (7 - i))).collect::<Vec<u8>>()
+        };
+        // differences one predictor needs to pass i32::MAX
+        let steps = (i32::MAX as u32 / d) as usize + 2;
+        // along a row: every other sample adds to the same predictor
+        let w = 2 * steps + 2;
+        let err = decode_huffman(&stream(w), &h, w, 1, 14).unwrap_err();
+        assert!(matches!(err, RawError::Corrupt(ref m) if m.contains("predictor")), "{err}");
+        // down two columns: each row adds to the predictor of its parity
+        let rows = 2 * steps + 2;
+        let err = decode_huffman(&stream(2 * rows), &h, 2, rows, 14).unwrap_err();
+        assert!(matches!(err, RawError::Corrupt(ref m) if m.contains("predictor")), "{err}");
     }
 
     /// A big-endian one-strip PEF-style TIFF of `w × h` 12-bit samples with the given compression tag and strip

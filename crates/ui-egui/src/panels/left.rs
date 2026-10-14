@@ -1068,6 +1068,9 @@ fn folder_tree(
         app.toast(ui.ctx(), e);
     }
     resp.context_menu(|ui| {
+        // the library actions of the Folders tree, when this folder (or one inside it) holds library photos
+        let library = app.caches.folder_tree(&app.session.catalog);
+        let held = library_node_for(&library, path);
         if (transient || indent > 0.0)
             && ui
                 .button(crate::i18n::tr(if transient { "Keep in Local" } else { "Add to Local" }))
@@ -1111,6 +1114,9 @@ fn folder_tree(
         {
             let _ = f(path);
         }
+        if let Some(held) = &held {
+            synchronize_item(app, ui, &held.0, &held.1);
+        }
     });
     if open && indent < 12.0 * 8.0 {
         for (n, p) in subfolders(ui, path) {
@@ -1150,6 +1156,10 @@ type AlbumKids = std::collections::HashMap<Option<AlbumId>, Vec<Album>>;
 
 /// `open_to`: folders forced open this frame (the way down to an album that was just made).
 fn albums_tree(app: &mut LightcraftApp, ui: &mut egui::Ui, all: &AlbumKids, parent: Option<AlbumId>, indent: f32, open_to: &[AlbumId]) {
+    // 64 folders deep at most (16 points a level): a catalog that loops must not overflow the stack
+    if indent > 64.0 * 16.0 {
+        return;
+    }
     let Some(kids) = all.get(&parent) else { return };
     for a in kids {
         if a.folder {
@@ -1816,6 +1826,38 @@ fn locate_missing_item(app: &mut LightcraftApp, ui: &mut egui::Ui, n: &FolderNod
         }
         ui.close();
     }
+}
+
+/// The node Synchronize Folder… of a Local folder `path` works on, with the name its dialog shows:
+/// the Folders row for that very folder, else (a folder above rows) the folder itself, as a folder
+/// holding other folders. `None` when no library photo lies in `path` or inside it. Reads the
+/// cached Folders tree only; the disk is not touched.
+fn library_node_for(tree: &[FolderNode], path: &str) -> Option<(FolderNode, String)> {
+    use lightcraft_catalog::query::folder_within;
+    fn exact<'a>(tree: &'a [FolderNode], path: &str) -> Option<&'a FolderNode> {
+        tree.iter().find_map(|n| if same_folder(&n.path, path) { Some(n) } else { exact(&n.children, path) })
+    }
+    fn any_inside(tree: &[FolderNode], path: &str) -> bool {
+        tree.iter().any(|n| (n.count > 0 && folder_within(&n.path, path)) || any_inside(&n.children, path))
+    }
+    if let Some(n) = exact(tree, path).filter(|n| n.count > 0) {
+        return Some((n.clone(), lightcraft_catalog::folders::folder_label(&n.path)));
+    }
+    if !any_inside(tree, path) {
+        return None;
+    }
+    let name = std::path::Path::new(path).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string());
+    let node = FolderNode {
+        name: name.clone(),
+        path: path.to_string(),
+        count: 0,
+        own: 0,
+        volume: false,
+        selectable: false,
+        label: None,
+        children: Vec::new(),
+    };
+    Some((node, name))
 }
 
 /// Synchronize Folder… of a Folders row (widget `folderSynchronize`): opens its dialog, which

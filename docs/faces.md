@@ -292,6 +292,37 @@ shot), so check a model on your own photos before trusting it:
 (ignoring shots taken within a few seconds of it, which would make it too easy) and reports, for each threshold, how many
 suggestions it would make and how many were right.
 
+## Face pictures in the People view
+
+Each face on a person card, in Unnamed faces and on a person's page is a square around the face, about 1.7 times the
+face box, cut out of the photo with the photo's own look (`Session::face_job`). Where the pixels come from:
+
+- **An unedited raw** (it still looks the way it was imported, the case in which its grid thumbnail is the camera's
+  embedded JPEG too) is cut from its **largest embedded preview** (`crates/engine/src/face_tiles.rs`). The preview is
+  read the planned way ([raw-preview-reads](raw-preview-reads.md)): the file's header and the JPEG, never the sensor
+  data, and the raw is not developed. The preview is used when it holds the square at **at least ¾ of the pixels the
+  tile asks for** (up to the 2,560 px the develop path would use); the square is then enlarged by at most 4⁄3, which
+  is not visible at tile size (the camera's JPEG is sharpened, so its pixels carry more detail than a binned raw's),
+  and is the bound the raw path already accepts when it bins an X-Trans sensor for a preview. A smaller preview, one of
+  another shape than the photo (letterboxed, another aspect ratio), one that does not decode, or a file that is offline
+  leaves the face to the develop path below.
+- **Everything else** (an edited raw, whose edits the camera's JPEG can't take the way the raw does; JPEG, HEIC and
+  other files; a raw whose preview is too small) is a develop render of the photo with its crop replaced by the square,
+  from the smallest source level that keeps the face sharp, as before.
+
+Measured on two Sony raws on an external 5400 rpm disk (file cache dropped before each face, a centred face box of 4 %
+and 10 % of the frame, 176 and 352 px tiles): an α1 ARW (74 MB, 8640 × 5760 Adobe RGB preview) read 70.6 MiB in
+0.77–0.92 s per face before and reads 7.8 MiB in 0.20–0.26 s; an A7S III ARW (25 MB, full-size 4240 × 2832 preview)
+read 24.3 MiB in 0.38–0.56 s and reads 1.1 MiB in 0.04–0.09 s. The tiles differ from the develop path's by 2–6 levels
+of 255 on average (the camera's rendering against LightCraft's camera look, which is fitted to it).
+
+Rendered faces are kept like other thumbnails: in memory, and in the library's thumbnail cache on disk (`thumbs/`,
+within the Settings ▸ Performance cache budget, least recently used files go first). The key is the photo's content
+hash, its develop settings with the face's square as the crop, the tile size, the renderer version and the camera
+profiles, so an edit, another square or a new renderer makes a new picture, and the next launch shows the faces
+without reading the originals. Tile sizes are rounded up to a multiple of 16 px, so moving the thumbnail slider
+reuses the pictures of its step instead of rendering every face again.
+
 ## Commands
 
 All of this is reachable from the control channel, the CLI and MCP: `faces.models.list`, `faces.models.inspect {path}`,

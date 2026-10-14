@@ -895,6 +895,28 @@ mod tests {
         assert_eq!(h.app.session.filter.text, "wedding", "and the library is filtered by it");
     }
 
+    /// Issue #1648: clearing the filters from the loupe's pill empties the search field too, so
+    /// the field never shows a search that is no longer applied.
+    #[test]
+    fn clearing_the_loupe_filters_empties_the_search_field() {
+        let mut h = demo([1200.0, 760.0]);
+        let t = Duration::from_secs(10);
+        h.settle(SETTLE);
+        for (method, params) in [("ui.clickWidget", json!({"id": "field:search"})), ("ui.text", json!({"text": "a"}))] {
+            let r = h.request(method, params, t);
+            assert_eq!(r["ok"], true, "{r}");
+            h.settle(SETTLE);
+        }
+        assert_eq!(h.app.session.filter.text, "a", "filtered while typing");
+        assert!(!h.app.session.visible_cloned().is_empty(), "the search finds photos, so the loupe has one to show");
+        h.request("engine.execute", json!({"command": "view.detail"}), t);
+        h.settle(SETTLE);
+        let r = h.request("ui.clickWidget", json!({"id": "loupe:filters"}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        h.settle(SETTLE);
+        assert_eq!((h.app.ui.search.as_str(), h.app.session.filter.text.as_str()), ("", ""));
+    }
+
     /// Esc in the search field gives back the search from before the edit, and the filter with it.
     #[test]
     fn escape_in_the_search_field_gives_back_the_search() {
@@ -3455,6 +3477,40 @@ mod tests {
         let fresh = h.app.session.selection.active.expect("re-imported photo selected");
         assert_ne!(fresh, id);
         assert!(!h.app.session.catalog.photo(fresh).unwrap().deleted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Importing while an album is shown (issue #1446): the new photos aren't in it, so the view
+    /// switches to All Photos with the first of them active, instead of an active photo the grid
+    /// and the filmstrip don't show.
+    #[test]
+    fn an_import_from_an_album_view_shows_the_first_new_photo() {
+        let dir = std::env::temp_dir().join(format!("lc-ui-import-show-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..3u8 {
+            let img = lightcraft_raster::Rgba8 { width: 8, height: 8, data: vec![[i * 40, 3, 9, 255]; 64] };
+            let png = lightcraft_codecs::encode_png(&lightcraft_codecs::EncodeImage::rgba8(&img), &lightcraft_codecs::EncodeMeta::default()).unwrap();
+            std::fs::write(dir.join(format!("IMG_{i:02}.png")), png).unwrap();
+        }
+        let mut h = demo([1300.0, 900.0]);
+        let t = Duration::from_secs(10);
+        let album = h.app.session.catalog.albums().find(|a| !a.folder && !a.is_smart()).map(|a| a.id.0).expect("a demo album");
+        let r = h.request("engine.execute", json!({"command": "library.source", "params": {"kind": "album", "id": album}}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        h.settle(SETTLE);
+        let before: Vec<lightcraft_catalog::PhotoId> = h.app.session.catalog.photos().map(|p| p.id).collect();
+        let r = h.request("engine.execute", json!({"command": "file.addPhotos", "params": {"paths": [dir.to_string_lossy()]}}), t);
+        assert_eq!(r["result"]["scanning"], true, "{r}");
+        h.step_until(SETTLE, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })));
+        let r = h.request("ui.dialog.confirm", json!({}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        h.settle(SETTLE);
+        assert!(h.app.import.is_none(), "finished");
+        let active = h.app.session.selection.active.expect("a photo is active");
+        assert!(!before.contains(&active), "the active photo is a new one: {active:?}");
+        assert_eq!(h.app.session.source, lightcraft_engine::LibrarySource::All);
+        assert!(h.app.session.visible_cloned().contains(&active), "the grid shows the active photo");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

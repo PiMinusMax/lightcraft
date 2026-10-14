@@ -26,8 +26,11 @@ fn section_param(p: &Value, c: &str) -> Result<Section> {
     serde_json::from_value(v).map_err(|e| bad(c, e.to_string()))
 }
 
-fn groups_param(p: &Value) -> Option<Vec<SettingsGroup>> {
-    p.get("groups").and_then(|g| serde_json::from_value(g.clone()).ok())
+fn groups_param(p: &Value, c: &str) -> Result<Option<Vec<SettingsGroup>>> {
+    match p.get("groups") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => serde_json::from_value(v.clone()).map(Some).map_err(|e| bad(c, format!("invalid `groups`: {e}"))),
+    }
 }
 
 fn crop_dims(s: &Session, id: PhotoId) -> (f64, f64) {
@@ -497,13 +500,15 @@ pub fn specs() -> Vec<CommandSpec> {
         }),
         cmd!("develop.curve", "Set Point Curve", [], None, "{channel: master|red|green|blue, points: [[x,y],...] in 0..1}", has_active, |s, p| {
             let ch = str_param(p, "channel").unwrap_or("master").to_string();
-            let pts: Vec<Point> = p
+            let mut pts: Vec<Point> = p
                 .get("points")
                 .and_then(Value::as_array)
                 .ok_or_else(|| bad("develop.curve", "missing points"))?
                 .iter()
                 .filter_map(|q| Some(Point::new(q.get(0)?.as_f64()?.clamp(0.0, 1.0), q.get(1)?.as_f64()?.clamp(0.0, 1.0))))
                 .collect();
+            // stored in the order the curve runs, as the editor draws and drags them
+            pts.sort_by(|a, b| a.x.total_cmp(&b.x));
             edit(s, "develop.curve", "Tone Curve", |d| {
                 match ch.as_str() {
                     "master" | "rgb" => d.curve.master = pts,
@@ -782,8 +787,9 @@ pub fn specs() -> Vec<CommandSpec> {
             "{groups?: [settingsGroup]} (default: all but crop, masks, remove)",
             has_active,
             |s, p| {
-                let id = active(s, "develop.copy")?;
-                if let Some(g) = groups_param(p) {
+                let c = "develop.copy";
+                let id = active(s, c)?;
+                if let Some(g) = groups_param(p, c)? {
                     s.copy_groups = g;
                 }
                 let d = s.develop_of(id).unwrap_or_default();
@@ -802,7 +808,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 let c = "develop.pastePrevious";
                 let prev =
                     s.previous_active.filter(|id| s.catalog.photo(*id).is_some_and(|ph| !ph.deleted)).ok_or_else(|| bad(c, "no previous photo"))?;
-                let groups = groups_param(p).unwrap_or_else(|| s.copy_groups.clone());
+                let groups = groups_param(p, c)?.unwrap_or_else(|| s.copy_groups.clone());
                 let partial = lightcraft_develop::extract_groups(&s.develop_of(prev).unwrap_or_default(), &groups);
                 let ids: Vec<PhotoId> = s.targets(p).into_iter().filter(|id| *id != prev).collect();
                 let ops = ids
@@ -823,8 +829,9 @@ pub fn specs() -> Vec<CommandSpec> {
             "{ids?, groups?: [settingsGroup] (paste only these of the copied groups)}",
             has_clipboard,
             |s, p| {
+                let c = "develop.paste";
                 let mut clip = s.clipboard.clone().unwrap_or_default();
-                if let Some(only) = groups_param(p) {
+                if let Some(only) = groups_param(p, c)? {
                     // the clipboard holds whole groups: rebuild it with just the chosen (copied) ones
                     let only: Vec<_> = only.into_iter().filter(|g| s.copy_groups.contains(g)).collect();
                     let full = lightcraft_develop::apply_partial(&DevelopSettings::default(), &clip, 1.0);
@@ -849,8 +856,9 @@ pub fn specs() -> Vec<CommandSpec> {
             "{groups?} — copy the active photo's settings to all selected photos",
             has_selection,
             |s, p| {
-                let id = active(s, "develop.sync")?;
-                let groups = groups_param(p).unwrap_or_else(SettingsGroup::default_copy);
+                let c = "develop.sync";
+                let id = active(s, c)?;
+                let groups = groups_param(p, c)?.unwrap_or_else(SettingsGroup::default_copy);
                 let d = s.develop_of(id).unwrap_or_default();
                 let partial = lightcraft_develop::extract_groups(&d, &groups);
                 let ops = s
@@ -979,10 +987,11 @@ pub fn specs() -> Vec<CommandSpec> {
             ok()
         }),
         cmd!("preset.create", "Create Preset", ["Photo"], None, "{name, group?, groups?: [settingsGroup]}", has_active, |s, p| {
-            let id = active(s, "preset.create")?;
-            let name = str_param(p, "name").ok_or_else(|| bad("preset.create", "missing name"))?;
+            let c = "preset.create";
+            let id = active(s, c)?;
+            let name = str_param(p, "name").ok_or_else(|| bad(c, "missing name"))?;
             let group = str_param(p, "group").unwrap_or("User Presets");
-            let groups = groups_param(p).unwrap_or_else(SettingsGroup::default_copy);
+            let groups = groups_param(p, c)?.unwrap_or_else(SettingsGroup::default_copy);
             let d = s.develop_of(id).unwrap_or_default();
             let pid = format!("user.{}.{}", s.presets.len(), name.to_lowercase().replace(' ', "-"));
             s.presets.push(Preset::from_settings(&pid, name, group, &d, &groups));
@@ -1026,7 +1035,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 let c = "preset.update";
                 let id = active(s, c)?;
                 let current = s.develop_of(id).unwrap_or_default().to_json();
-                let groups = groups_param(p);
+                let groups = groups_param(p, c)?;
                 let pr = user_preset(s, p, c)?;
                 pr.settings = match groups {
                     Some(g) => lightcraft_develop::extract_groups(&serde_json::from_value(current).unwrap_or_default(), &g),

@@ -205,10 +205,24 @@ fn detect_without_the_model_says_where_to_get_it() {
     let d = temp("nodetector");
     let mut s = Session::with_demo();
     // no folder for models at all, then a folder that has none yet
-    assert!(s.execute("faces.detect", &json!({})).is_err());
+    let e = s.execute("faces.detect", &json!({})).unwrap_err();
+    assert_ne!(e.kind(), crate::ErrorKind::ModelMissing(crate::AiModel::FaceDetector), "nothing to download into: {e}");
     s.face_models_dir = Some(d.join("models"));
-    let e = s.execute("faces.detect", &json!({})).unwrap_err().to_string();
-    assert!(e.contains("Settings > Faces"), "{e}");
+    let e = s.execute("faces.detect", &json!({})).unwrap_err();
+    // the app offers the download on the kind (#1046), the person reads the message
+    assert_eq!(e.kind(), crate::ErrorKind::ModelMissing(crate::AiModel::FaceDetector), "{e}");
+    assert!(
+        e.to_string().starts_with("invalid parameters for `faces.detect`: ") && e.to_string().contains("Settings > Faces"),
+        "the `error` text clients see is unchanged: {e}"
+    );
+    // a detector that is there but unusable also points to Settings > Faces, and is not a missing one
+    let home = d.join("models").join(lightcraft_faces::known::YUNET_ID);
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("model.onnx"), b"not a model").unwrap();
+    std::fs::write(home.join("face-model.json"), b"{}").unwrap();
+    let e = s.execute("faces.detect", &json!({})).unwrap_err();
+    assert!(e.to_string().contains("Settings > Faces"), "{e}");
+    assert_eq!(e.kind(), crate::ErrorKind::BadParams, "{e}");
     let _ = std::fs::remove_dir_all(&d);
 }
 

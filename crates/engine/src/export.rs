@@ -108,6 +108,10 @@ impl Default for Resize {
     }
 }
 
+/// The most pixels an export enlarged past its photo's own size can have: 512 megapixels, also
+/// Lightroom's ceiling. A full-size or smaller export is never held to it.
+pub const MAX_ENLARGED_PIXELS: f64 = 512e6;
+
 impl Resize {
     pub fn long_edge(px: u32) -> Self {
         Self { value: px as f32, ..Default::default() }
@@ -131,8 +135,12 @@ impl Resize {
             ResizeMode::Percent => v / 100.0,
         };
         let k = if self.dont_enlarge { k.min(1.0) } else { k };
-        // at least one pixel, at most the encoders' 65535 limit
-        k.clamp(1.0 / short, 65_535.0 / long)
+        // an enlargement stops at 512 megapixels (Lightroom's ceiling too): 20000 typed for 2000
+        // with Don't Enlarge off asked for gigapixels, more memory than a computer has
+        let k = k.min((MAX_ENLARGED_PIXELS / (w * h)).sqrt().max(1.0));
+        // at least one pixel, at most the encoders' 65535 limit; the limit wins for a photo more
+        // than 65535 times as long as it is short (where `clamp` would panic: min above max)
+        k.max(1.0 / short).min(65_535.0 / long)
     }
 
     /// Output size for a `w × h` (cropped, full-resolution) photo.
@@ -1670,10 +1678,16 @@ fn prepare_guarded(
     let (full_px, long) = ((p.width as usize).saturating_mul(p.height as usize), p.width.max(p.height) as usize);
     let (work, weight) = if o.format.is_rendered() {
         let (w, h) = output_size(p, o);
+        let (nw, nh) = lightcraft_pipeline::native_output_size(p.width.max(1) as usize, p.height.max(1) as usize, &p.develop);
+        let native_px = (nw.round().max(1.0) * nh.round().max(1.0)) as usize;
+        let label = p.file_name.clone();
         let meta = export_metadata(p, &session.catalog, o);
         let gain_map = o.hdr_output() && o.format == ExportFormat::Jpeg;
         let job = session.export_job(id, w, h, o.effective_space(), o.effective_depth())?;
         let weight = render_weight(full_px, long, job.level, w.saturating_mul(h));
+        if let Some(why) = too_big_for_memory((w, h), native_px, weight, crate::memory::total_ram()) {
+            return Err(format!("{label}: {why}"));
+        }
         let hdr_job = if gain_map { Some(session.export_job(id, w, h, o.effective_space(), OutputDepth::F32Hdr)?) } else { None };
         (Work::Render(Box::new(RenderWork { job, hdr_job, meta, opts: o.clone() })), weight)
     } else {
@@ -1695,6 +1709,26 @@ fn prepare_guarded(
         (work, weight)
     };
     Ok(PreparedExport { photo: id, file_name, work, guard, weight })
+}
+
+/// Why an export of `out` pixels (`w`, `h`), from a photo of `native_px` pixels at its own size,
+/// can't be made on a computer with `ram` bytes, given its working memory `weight`: an export
+/// enlarged past the photo's size that needs more memory than the computer has would fail to
+/// allocate, which ends the process rather than the export. Full-size and smaller exports, and
+/// computers whose memory isn't known, are never refused.
+fn too_big_for_memory(out: (usize, usize), native_px: usize, weight: usize, ram: Option<usize>) -> Option<String> {
+    let ram = ram?;
+    if out.0.saturating_mul(out.1) <= native_px || weight <= ram {
+        return None;
+    }
+    let gb = |b: usize| b as f64 / (1u64 << 30) as f64;
+    Some(format!(
+        "exporting at {} × {} needs about {:.0} GB of memory, more than this computer has ({:.0} GB); choose a smaller size",
+        out.0,
+        out.1,
+        gb(weight).ceil(),
+        gb(ram)
+    ))
 }
 
 /// Working memory of rendering a photo of `full_px` pixels (long edge `long`) from source level
@@ -2738,8 +2772,42 @@ mod tests {
         assert_eq!(ExportOptions::from_json(&ExportOptions::resize_json(None)).resize, None);
         assert_eq!(ExportOptions::from_json(&json!({"ppi": 300})).ppi, 300);
         // never larger than the encoders' limit, never empty
-        assert_eq!(size(json!({"percent": 10000, "dontEnlarge": false}), 6000.0, 4000.0), Some((65535, 43690)));
+        assert_eq!(size(json!({"percent": 10000, "dontEnlarge": false}), 6000.0, 4000.0), Some((27713, 18475)), "512 MP at most");
+        assert_eq!(size(json!({"width": 70000, "dontEnlarge": false}), 60000.0, 100.0), Some((65535, 109)), "65535 px an edge");
         assert_eq!(size(json!({"width": 1}), 6000.0, 40.0).map(|s| s.1), Some(1));
+    }
+
+    /// Typing 20000 for 2000 (or percent 10000) with Don't Enlarge off asked for gigapixels: the
+    /// render's first plane alone (34 GB at 65535 × 43690) failed to allocate, which aborts the
+    /// process. An enlargement stops at 512 megapixels; full-size and smaller exports of photos
+    /// larger than that are untouched.
+    #[test]
+    fn enlargements_stop_at_512_megapixels() {
+        let size = |p: serde_json::Value, w: f64, h: f64| ExportOptions::from_json(&p).resize.map(|r| r.apply(w, h)).unwrap();
+        for p in [json!({"longEdge": 60000, "dontEnlarge": false}), json!({"megapixels": 5000}), json!({"percent": 10000, "dontEnlarge": false})] {
+            let (w, h) = size(p.clone(), 6000.0, 4000.0);
+            assert!((w * h) as f64 <= MAX_ENLARGED_PIXELS * 1.001, "{p}: {w}×{h}");
+            assert!((w as f64 / h as f64 - 1.5).abs() < 0.001, "{p}: keeps the shape");
+        }
+        // below the ceiling an enlargement is as asked
+        assert_eq!(size(json!({"longEdge": 12000, "dontEnlarge": false}), 6000.0, 4000.0), (12000, 8000));
+        // a 600 MP panorama exports at full size, and smaller, as before; it is never enlarged
+        assert_eq!(size(json!({"percent": 100, "dontEnlarge": false}), 30000.0, 20000.0), (30000, 20000));
+        assert_eq!(size(json!({"percent": 50}), 30000.0, 20000.0), (15000, 10000));
+        assert_eq!(size(json!({"percent": 200, "dontEnlarge": false}), 30000.0, 20000.0), (30000, 20000));
+    }
+
+    /// An enlarged export that needs more memory than the computer has is refused with a message,
+    /// before it starts; everything else goes ahead.
+    #[test]
+    fn enlarged_exports_must_fit_the_computers_memory() {
+        let gb = 1usize << 30;
+        let why = too_big_for_memory((27713, 18475), 24_000_000, 20 * gb, Some(16 * gb)).unwrap();
+        assert!(why.contains("27713 × 18475") && why.contains("20 GB") && why.contains("16 GB") && why.contains("smaller size"), "{why}");
+        assert_eq!(too_big_for_memory((27713, 18475), 24_000_000, 20 * gb, Some(32 * gb)), None, "fits");
+        assert_eq!(too_big_for_memory((6000, 4000), 24_000_000, 20 * gb, Some(gb)), None, "full size is never refused");
+        assert_eq!(too_big_for_memory((3000, 2000), 24_000_000, 20 * gb, Some(gb)), None, "nor a smaller export");
+        assert_eq!(too_big_for_memory((27713, 18475), 24_000_000, 20 * gb, None), None, "unknown memory");
     }
 
     #[test]
@@ -2781,6 +2849,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A photo more than 65535 times as long as it is short (a 70000 × 1 strip) made `scale`
+    /// clamp with its lower bound above its upper one, which panics, in the export and in the
+    /// Export dialog's preview on the UI thread. The encoders' limit wins, the short edge keeps a
+    /// pixel.
+    #[test]
+    fn resize_survives_photos_too_long_for_the_encoders() {
+        let modes = [
+            json!({"longEdge": 2000}),
+            json!({"shortEdge": 1}),
+            json!({"width": 500, "height": 500}),
+            json!({"megapixels": 1}),
+            json!({"percent": 50}),
+            json!({"percent": 1000, "dontEnlarge": false}),
+        ];
+        for p in modes {
+            for (w, h) in [(70_000.0, 1.0), (1.0, 70_000.0), (1e9, 3.0), (65_536.0, 1.0)] {
+                let r = ExportOptions::from_json(&p).resize.unwrap();
+                let (ow, oh) = r.apply(w, h);
+                assert!((1..=65_535).contains(&ow) && (1..=65_535).contains(&oh), "{p} on {w}×{h}: {ow}×{oh}");
+                assert!(r.scale(w, h).is_finite());
+            }
+        }
+        // (a short edge under a pixel would be scaled up to one, which the limit then caps)
+        assert_eq!(Resize::long_edge(2000).apply(70_000.0, 1.0), (65_535, 1));
+        assert_eq!(Resize::long_edge(2000).apply(1.0, 70_000.0), (1, 65_535));
     }
 
     /// A flat field of a saturated green inside Display P3 but outside sRGB, rendered into `space`.

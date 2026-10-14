@@ -253,8 +253,8 @@ impl Filter {
             return false;
         }
         match &self.folder {
-            // browsed photos only show in folder views
-            None if p.local => return false,
+            // browsed photos only show in folder views, and in Recently Deleted once deleted (#1430)
+            None if p.local && !p.deleted => return false,
             None => {}
             Some(dir) => {
                 let crate::Source::File { path } = &p.source else { return false };

@@ -8,6 +8,7 @@
 
 pub mod album_picker;
 pub mod brush_live;
+mod command_error;
 pub mod control;
 pub mod credits;
 pub mod date_picker;
@@ -64,6 +65,8 @@ mod tests_dialog_fit;
 #[cfg(test)]
 mod tests_dialogs;
 #[cfg(test)]
+mod tests_error_kinds;
+#[cfg(test)]
 mod tests_filmstrip;
 #[cfg(test)]
 mod tests_grading;
@@ -108,6 +111,8 @@ mod tests_preview_limit;
 #[cfg(test)]
 mod tests_quit_unsaved;
 #[cfg(test)]
+mod tests_sam_setup;
+#[cfg(test)]
 mod tests_scroll;
 #[cfg(test)]
 mod tests_switch_library;
@@ -128,9 +133,10 @@ mod tests_zoom_keys;
 
 use std::sync::mpsc::{Receiver, Sender};
 
-use lightcraft_engine::Session;
+use lightcraft_engine::{AiModel, ErrorKind, Session};
 use serde_json::Value;
 
+pub use command_error::CommandError;
 pub use control::{ControlRequest, ControlResponse};
 pub use state::UiState;
 
@@ -155,6 +161,9 @@ pub type OpenUrlFn = Box<dyn FnMut(&str) -> Result<(), String>>;
 pub type OpenWithFn = Box<dyn FnMut(&str, &str) -> Result<(), String>>;
 /// Open several files with one start of an application (`app` as for [`OpenWithFn`]).
 pub type OpenAllWithFn = Box<dyn FnMut(&[String], &str) -> Result<(), String>>;
+/// Linux model-folder work: wait for the default opener on a background task.
+#[cfg(target_os = "linux")]
+pub type OpenModelFolderFn = std::sync::Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 /// The ICC profile of the screen showing the window, as the system colour-manages it (`None`:
 /// not known).
 pub type ScreenProfileFn = Box<dyn FnMut() -> Option<Vec<u8>>>;
@@ -223,6 +232,9 @@ pub struct Services {
     /// Open several files with one start of the editor (Open Original; desktop only): an editor
     /// that keeps one window takes them all. None = [`Services::open_with`] for each.
     pub open_all_with: Option<OpenAllWithFn>,
+    /// Optional worker-safe model-folder opener alongside `open_with` (Linux desktop only).
+    #[cfg(target_os = "linux")]
+    pub open_model_folder: Option<OpenModelFolderFn>,
     /// Checked before Edit In renders a copy, so a missing editor leaves no copy behind (none =
     /// assume it can).
     pub check_editor: Option<CheckEditorFn>,
@@ -500,14 +512,20 @@ impl LightcraftApp {
 
     /// Run a UI or engine command by id. The single entry point for every frontend path.
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        self.run_typed(id, params).map_err(|e| e.message)
+    }
+
+    /// [`LightcraftApp::run`], keeping what kind of error a refusal is: for code that decides on it
+    /// (offer a model's download, treat a cancel as one) instead of reading the message.
+    pub fn run_typed(&mut self, id: &str, params: Value) -> Result<Value, CommandError> {
         if let Some(result) = model_setup::intercept(self, id, &params) {
-            return result;
+            return result.map_err(CommandError::from);
         }
         if let Some(r) = menus::run_ui_command(self, id, &params) {
             if r.is_ok() {
                 docking::reveal_command(self, id)?;
             }
-            return r;
+            return r.map_err(CommandError::from);
         }
         let params = if id == "crop.aspect"
             && params.get("aspect").and_then(Value::as_str) == Some("toggle")
@@ -518,7 +536,7 @@ impl LightcraftApp {
         } else {
             params
         };
-        let r = self.session.execute(id, &params).map_err(|e| e.to_string());
+        let r = self.session.execute(id, &params).map_err(CommandError::from);
         if r.is_ok() && matches!(id, "crop.aspect" | "crop.rotateAspect") {
             self.ui.crop_default_aspect = if id == "crop.aspect" && params.get("aspect").and_then(Value::as_str) == Some("original") {
                 Some(serde_json::json!("original"))
@@ -528,6 +546,11 @@ impl LightcraftApp {
                     .and_then(|photo| self.session.develop_of(photo))
                     .map(|d| d.crop.aspect.map_or(serde_json::json!("free"), |(w, h)| serde_json::json!([w as f64 / 100.0, h as f64 / 100.0])))
             };
+        }
+        if r.is_ok() && id == "library.clearFilter" {
+            // the search field shows the text filter: cleared from anywhere (the loupe's pill, the
+            // menu), it must not keep a search that no longer applies (issue #1648)
+            self.ui.search.clear();
         }
         if r.is_ok() && id == "mask.adjust" {
             // Judge local adjustments on the photo, without the selection overlay obscuring them.
@@ -566,9 +589,9 @@ impl LightcraftApp {
         match &r {
             Err(e) => {
                 log::warn!("{id}: {e}");
-                self.ui.status = e.clone();
+                self.ui.status = e.message.clone();
                 // no detector yet: offer it (its terms first) instead of only saying so
-                if id == "faces.detect" && e.contains("Settings > Faces") {
+                if id == "faces.detect" && e.kind == ErrorKind::ModelMissing(AiModel::FaceDetector) {
                     panels::faces::offer_detector(self);
                 }
             }
@@ -748,16 +771,11 @@ impl LightcraftApp {
         if self.ui.sam_downloading && !download.running {
             self.ui.sam_downloading = false;
             let open = matches!(self.ui.dialog, Some(state::Dialog::SamModel { .. }));
-            match (&download.error, open) {
-                (_, true) => {}
-                (Some(e), false) if e.contains("cancelled") => {
-                    self.toast(ctx, crate::i18n::tr("SAM 3 download stopped: it resumes where it left off next time."))
-                }
-                (Some(e), false) => self.toast_error(ctx, crate::i18n::tr_format!("The SAM 3 download failed: {e}", e = e)),
-                (None, false) if download.finished => {
-                    self.toast_error(ctx, crate::i18n::tr("The SAM 3 model is installed: Object and Describe masks are ready."))
-                }
-                (None, false) => {}
+            match sam_download_ended(&download) {
+                _ if open => {}
+                Some((text, true)) => self.toast_error(ctx, text),
+                Some((text, false)) => self.toast(ctx, text),
+                None => {}
             }
         }
         if let Some((due, mask)) = self.ui.detail_due {
@@ -776,13 +794,14 @@ impl LightcraftApp {
     }
 
     /// An AI mask error: when the model isn't installed, the dialog that offers to download it
-    /// (`then`: the AI mask to start afterwards); otherwise a toast.
-    pub fn ai_error(&mut self, ctx: &egui::Context, e: impl Into<String>, then: Option<(&str, &str)>) {
+    /// (`then`: the AI mask to start afterwards); otherwise a toast. Decided on the error's kind
+    /// ([`ErrorKind::ModelMissing`]), not its words.
+    pub fn ai_error(&mut self, ctx: &egui::Context, e: impl Into<CommandError>, then: Option<(&str, &str)>) {
         let e = e.into();
-        if lightcraft_engine::segment::Segmenter::AVAILABLE && e.starts_with(lightcraft_engine::segment::NOT_INSTALLED) {
+        if lightcraft_engine::segment::Segmenter::AVAILABLE && e.kind == ErrorKind::ModelMissing(AiModel::Sam3) {
             self.offer_sam_download(then);
         } else {
-            self.toast_error(ctx, e);
+            self.toast_error(ctx, e.message);
         }
     }
 
@@ -1392,6 +1411,19 @@ fn detect_summary(v: &Value) -> String {
         (0, n) => format!("No faces found in {}", plural(n, "photo")),
         (f, 1) => format!("Found {}", plural(f, "face")),
         (f, _) => format!("Found {} in {}", plural(f, "face"), plural(with, "photo")),
+    }
+}
+
+/// What to say when a SAM 3 download ended while its dialog was closed: the text, and whether it is
+/// shown as an error toast. A cancel is told by `cancelled`, not by the error's words.
+fn sam_download_ended(download: &lightcraft_engine::segment::DownloadStatus) -> Option<(String, bool)> {
+    match &download.error {
+        Some(_) if download.cancelled => {
+            Some((crate::i18n::tr("SAM 3 download stopped: it resumes where it left off next time.").to_string(), false))
+        }
+        Some(e) => Some((crate::i18n::tr_format!("The SAM 3 download failed: {e}", e = e), true)),
+        None if download.finished => Some((crate::i18n::tr("The SAM 3 model is installed: Object and Describe masks are ready.").to_string(), true)),
+        None => None,
     }
 }
 

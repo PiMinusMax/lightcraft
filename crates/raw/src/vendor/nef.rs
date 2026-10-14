@@ -177,7 +177,8 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
         (Some([2, 2]), Some(p)) if p.len() == 4 && p.iter().all(|&c| c <= 2) => Cfa { width: 2, height: 2, pattern: p.to_vec() },
         _ => Cfa::bayer_static("RGGB"),
     };
-    let body = measured_body(&ifd0.string(t::MODEL).unwrap_or_default(), w, h, bits);
+    let model = ifd0.string(t::MODEL).unwrap_or_default();
+    let body = measured_body(&model, w, h, bits);
     let active_w = trailing_masked_columns(samples, w, bits);
     // the white level is measured from the whole image (or known for a measured body); the probe (no samples in its
     // result) takes the nominal one
@@ -212,7 +213,11 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
         color: ColorData::default(),
         wb_multipliers: wb,
         linearized: false,
-        opcodes: OpcodeLists::default(),
+        // Nikon's in-file distortion correction, about the optical centre (which follows the sensor shift)
+        opcodes: OpcodeLists {
+            list3: super::nef_lens::distortion(&model, raw, Rect::new(0, 0, active_w, h), crop).into_iter().collect(),
+            ..Default::default()
+        },
         metadata,
     };
     img.validate_for(mode)?;
@@ -314,6 +319,49 @@ mod tests {
         }
         ifd0.add_sub_ifd(raw);
         TiffWriter::new(order, false).write(&[ifd0]).unwrap()
+    }
+
+    /// A Z 6II NEF carrying NikonNEFInfo gets Nikon's distortion correction as one warp, in the header probe and
+    /// the full decode alike, and keeps it through DNG export; another body with the same data gets none.
+    #[test]
+    fn nikon_in_file_distortion_becomes_a_warp() {
+        use super::super::nef_lens::tests::{distortion_block, nef_info_blob, offset_block};
+        let (w, h) = (48u32, 32u32);
+        let file = |model: &str| {
+            let words: Vec<u8> = (0..w * h).flat_map(|i| (600 + (i % 97) as u16 * 50).to_be_bytes()).collect();
+            let mut raw = IfdBuilder::new();
+            raw.set(t::NEW_SUBFILE_TYPE, Value::Long(vec![0]));
+            raw.set(t::IMAGE_WIDTH, Value::Long(vec![w]));
+            raw.set(t::IMAGE_LENGTH, Value::Long(vec![h]));
+            raw.set(t::BITS_PER_SAMPLE, Value::Short(vec![14]));
+            raw.set(t::COMPRESSION, Value::Short(vec![1]));
+            raw.set(t::PHOTOMETRIC, Value::Short(vec![photometric::CFA]));
+            raw.set(t::CFA_REPEAT_PATTERN_DIM, Value::Short(vec![2, 2]));
+            raw.set(t::CFA_PATTERN_EP, Value::Byte(vec![0, 1, 1, 2]));
+            let info = nef_info_blob(&[
+                (0x0005, distortion_block(3, 21.6, 4, [0.039895, 0.019211, -0.127218], -0.025043)),
+                (0x0008, offset_block(1.5, -0.75)),
+            ]);
+            raw.set(0xc7d5, Value::Undefined(info));
+            raw.set_image(ImageData::Strips { rows_per_strip: h, strips: vec![words] });
+            let mut ifd0 = IfdBuilder::new();
+            ifd0.set(t::MAKE, Value::Ascii("NIKON CORPORATION".into()));
+            ifd0.set(t::MODEL, Value::Ascii(model.into()));
+            ifd0.add_sub_ifd(raw);
+            TiffWriter::new(ByteOrder::Little, false).write(&[ifd0]).unwrap()
+        };
+        let bytes = file("NIKON Z 6_2");
+        let header = decode(&bytes, Mode::Header).unwrap();
+        let full = decode(&bytes, Mode::Full).unwrap();
+        assert_eq!(header.info(), full.info());
+        assert_eq!(header.opcodes.list3, full.opcodes.list3);
+        let [crate::Opcode::WarpRectilinear { planes, center }] = full.opcodes.list3.as_slice() else { panic!("{:?}", full.opcodes.list3) };
+        assert!((planes[0][0] - 1.0 / (1.0 - 0.025043)).abs() < 1e-5, "{planes:?}");
+        assert!((center[0] * 47.0 - (23.5 + 1.5)).abs() < 0.01 && (center[1] * 31.0 - (15.5 - 0.75)).abs() < 0.01, "{center:?}");
+        let dng = crate::write_dng(&full, &Default::default()).unwrap();
+        assert_eq!(crate::decode(&dng).unwrap().opcodes.list3, full.opcodes.list3);
+        full.develop(crate::Method::Bilinear).unwrap();
+        assert!(decode(&file("NIKON D850"), Mode::Full).unwrap().opcodes.list3.is_empty());
     }
 
     #[test]

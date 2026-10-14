@@ -1018,6 +1018,41 @@ fn sony_embedded_distortion_is_limited_to_validated_models() {
     eprintln!("Sony distortion model boundary: {checked} corpus files checked");
 }
 
+/// Nikon's in-file distortion correction (docs/nikon-lens-corrections.md) reaches only the validated bodies: the
+/// Z f sample (a Tamron 35-150 at 150 mm) gets one warp, the DSLR and Coolpix samples none, and the header probe
+/// describes every file as its full decode does.
+#[test]
+fn nikon_in_file_distortion_is_limited_to_validated_bodies() {
+    let root = corpus_root().join("raw");
+    let mut checked = 0;
+    for (name, model, expected) in [
+        ("nef-nikon-zf-lossless.nef", "NIKON Z f", 1),
+        ("nef-nikon-d5100-lossless.nef", "NIKON D5100", 0),
+        ("nef-nikon-d5100-uncompressed.nef", "NIKON D5100", 0),
+        ("nef-nikon-d7000-lossy12.nef", "NIKON D7000", 0),
+        ("nef-nikon-d7500-lossless12.nef", "NIKON D7500", 0),
+        ("nef-nikon-d7500-lossless14.nef", "NIKON D7500", 0),
+        ("nrw-nikon-b700-uncompressed.nrw", "COOLPIX B700", 0),
+    ] {
+        let path = root.join(name);
+        if !path.exists() {
+            eprintln!("skip: {} absent", path.display());
+            continue;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let full = decode(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(probe_info(&bytes).unwrap(), full.info(), "{name}");
+        assert_eq!(full.metadata.model.as_deref(), Some(model), "{name}");
+        assert_eq!(full.opcodes.list3.len(), expected, "{name}");
+        if let Some(lightcraft_raw::Opcode::WarpRectilinear { planes, .. }) = full.opcodes.list3.first() {
+            // the stored zoom (0.0557) frames the corrected picture as the camera does
+            assert!((planes[0][0] - 1.0 / 1.055719).abs() < 1e-4, "{name}: {planes:?}");
+        }
+        checked += 1;
+    }
+    eprintln!("Nikon distortion boundary: {checked} corpus files checked");
+}
+
 /// Kodak DCS520C (`crates/raw/src/vendor/kodak.rs`): the two-component lossless JPEG strip decodes through the
 /// file's response curve to a 1736 x 1160 GRBG mosaic with 12-bit white, per-position black levels and the
 /// white balance of the vendor IFD. Looks for the corpus copy, then the raw.pixls.us folder; skips without either.

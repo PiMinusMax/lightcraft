@@ -56,7 +56,7 @@ pub use lightcraft_meta::Metadata;
 pub use lightcraft_raster::Rgb32f;
 pub use opcodes::{Opcode, OpcodeLists};
 pub use preview::{
-    PREVIEW_PREFIX, PreviewColorSpace, PreviewRange, bounded_preview, embedded_preview, embedded_preview_color_space,
+    PREVIEW_PREFIX, PreviewColorSpace, PreviewRange, bounded_preview, embedded_preview, embedded_preview_color_space, embedded_preview_covering,
     embedded_preview_dynamic_range_optimized, embedded_preview_from_range,
 };
 pub use semantic::{SemanticMask, semantic_masks};
@@ -715,6 +715,10 @@ impl RawImage {
         if self.width == 0 || self.height == 0 || !(1..=4).contains(&self.cpp) {
             return Err(RawError::Corrupt("bad dimensions".into()));
         }
+        // two samples a pixel are neither one colour nor RGB: nothing downstream can develop them (issue #1511)
+        if self.cpp == 2 {
+            return Err(RawError::Unsupported("2 samples per pixel".into()));
+        }
         if samples && self.data.len() != self.width * self.height * self.cpp {
             return Err(RawError::Corrupt("data length mismatch".into()));
         }
@@ -768,7 +772,10 @@ impl RawImage {
                 for s in 0..cpp {
                     let v = src(base + x * cpp + s);
                     let b = self.black.at(x, y, s, cpp);
-                    row[x * cpp + s] = (v - b) * scale[s];
+                    // a NaN or infinite sample (a float DNG's, or a black level a file got wrong)
+                    // reads as black, so the demosaic and every stage after it see numbers
+                    let n = (v - b) * scale[s];
+                    row[x * cpp + s] = if n.is_finite() { n } else { 0.0 };
                 }
             }
         });

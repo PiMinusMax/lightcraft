@@ -13,7 +13,114 @@
   colour edges at high values instead of bleeding them into fringes (issue #815). It filters the colour differences
   R−Y and B−Y, leaving brightness exactly as it was, along edges found in a denoised guide, and takes isolated
   coloured specks out. New photos get it; photos edited before keep their look until Update to Current Process.
+## 2026-10-14
+
+### Hard-edged Heal and Clone spots
+- A spot with Feather at 0 no longer draws black pixels exactly on its radius. This also fixes spots at 0% Opacity
+  changing pixels along their edge. The hard edge now leaves pixels on the radius unchanged.
+
 ## 2026-10-13
+
+### HDR merges keep the lens correction
+- An HDR made with Photo ▸ Photo Merge ▸ HDR now keeps the lens correction the photos carry (Sony's, Panasonic's
+  and Leica's, and the one some DNGs carry, e.g. from drones): Optics ▸ Enable Lens Corrections straightens it as it
+  does the photos it was made from. HDRs merged before this don't have it; merge them again.
+
+### Portable mode
+- A file named `portable.txt` next to the LightCraft program makes it keep its settings, logs and downloaded
+  models in a `LightCraftData` folder beside it instead of the per-user settings folder (issue #1200), as
+  PhotoCraft does. If that folder can't be written, the usual folder is used and the log says why.
+
+### Reliability
+- A photo whose Defringe amount was stored far past the sliders' 20 (in a damaged catalog or sidecar) no longer
+  crashes LightCraft each time it renders: the amount acts as 20.
+
+### Reliability
+- Importing a preset zip that unpacks to far more than any preset (a "zip bomb") is refused with a message naming
+  the file, instead of asking for gigabytes of memory, which could end LightCraft.
+
+### Reliability
+- A crop of no size (from an agent or a sidecar) no longer gives the Detail view a photo of no size to lay out
+  (its width over its height was 0 / 0, which stopped debug builds); it shows as a single pixel's colour.
+
+### Reliability
+- A crop a hair wide (or of no size), set by an agent or read from a sidecar, no longer crashes or hangs the
+  render with Clarity, Dehaze, Texture or Highlights / Shadows on: their blurs are held to the picture's size.
+- A crop of no size with healing spots or masks no longer crashes the render: samples outside the picture read its
+  edge.
+
+### Reliability
+- A library whose catalog file was damaged (or edited by hand) in a way that still reads no longer crashes
+  LightCraft when it shows a stack, or hangs it when a folder is moved: on opening, records are put back under
+  their own ids, stacks keep only photos that exist (at least two), folders inside themselves move to the top,
+  and new photos never reuse an id in use. What was repaired is written to the log.
+
+### Nikon lens corrections
+- Raws from the Nikon Z 6II, Z 8 and Z f now open with the camera's own distortion correction, as Lightroom applies a
+  built-in profile: straight lines near the edges stay straight and the framing matches the camera's JPEG. It works
+  with Z lenses and with F-mount lenses on the FTZ adapter, follows the in-body stabilisation's shift of the optical
+  centre, and can be turned off under Lens Corrections. Vignetting correction from the file comes later.
+
+### Thumbnail cache stays in its folder
+- The thumbnail cache no longer follows a shard folder (`thumbs/ab/`) that is a symlink or junction to somewhere
+  else (issue #1504): trimming or clearing the cache can't delete files outside it, and thumbnails are never read
+  from or written through such a link.
+
+### Large libraries: Synchronize Folder, import and sidecars start sooner
+- Opening Synchronize Folder, an import review or an import no longer makes a table of every photo in the library
+  before it looks at the first file. In a library of 3.5 million photos that held the window for about 6 s before
+  a Synchronize scan began (now under 1 s), 2.6 s before an import review (now 0.05 s) and 1.7 s before an import
+  (now 0.05 s). The scan looks up only the files it finds and the contents it reads, on its own thread.
+- Writing one photo's XMP sidecar (Save Metadata to File, or automatically after an edit) no longer works out who
+  owns every shared sidecar name in the library: 2.4 s a write in that library, now under 1 s.
+- Nothing else changes: the same files are found new, already there, moved or missing, and sidecars get the same
+  names.
+
+### Faces load faster in the People view
+- Faces on unedited raws are cut from the camera's preview inside the file instead of developing the raw (issue
+  #1440): a Sony α1 face reads 8 MB instead of 70 MB, an A7S III face about 1 MB instead of 24 MB, several times
+  faster on an external hard disk. A face whose preview is too small, and any edited photo, is still developed from
+  the raw, so it keeps its look.
+- Raws whose preview is in Adobe RGB (Sony α1 among others) no longer read the whole file for their grid thumbnail:
+  only the header and the preview are read, as for other raws.
+- Faces are kept in the thumbnail cache at a few fixed sizes, so moving the thumbnail slider no longer renders them
+  all again.
+
+### Reliability
+- A raw file whose black level is stored as "not a number" (or infinity), or a floating-point DNG with such
+  samples, no longer crashes LightCraft at 1:1 or on export: the bad values read as black.
+
+### Reliability
+- Exporting a photo more than 65,535 times as long as it is wide (a one-pixel strip), or opening the Export dialog's
+  watermark preview for it, no longer crashes LightCraft; the export is capped at the encoders' 65,535 pixels.
+
+### Reliability
+- Dragging a Tone Curve point that sits very close to its neighbours (two clicks side by side, or a curve from a
+  sidecar, a preset or an agent) no longer crashes LightCraft; the point stays between them. Curve points sent to
+  `develop.curve` are kept in order, and a sidecar curve with a "NaN" or "inf" point is ignored.
+
+### Reliability
+- A demo photo whose stored size was damaged (a width of 4294967295) is rendered at its own size instead of
+  one that overflows.
+
+### DNG camera identity
+- DNG export and Convert to DNG no longer duplicate the camera make when the model already
+  contains it: `Canon EOS R6` stays `Canon EOS R6`, rather than `Canon Canon EOS R6` (the camera
+  identity subissue in #840). The separate Make and Model tags keep their original values.
+  This does not change colour matrices, camera calibration or RAW noise rendering.
+### Building from source
+- The English and Simplified Chinese build guides now describe command-local job and release
+  profile overrides for memory-constrained builders (issue #1196), including why packaging
+  recipes can override inherited settings. Default release profiles and application behavior
+  are unchanged; the guidance does not guarantee a build will fit every 16 GB machine.
+### Lightroom catalog import
+- A Lightroom Classic catalog whose changes are all still in its `.lrcat-wal` file (a new catalog Lightroom has
+  open and hasn't written back yet) imports instead of failing with "unsupported SQLite schema format".
+
+### Reliability
+- An export enlarged far past the photo's size (20000 typed for 2000 with Don't Enlarge off) no longer ends
+  LightCraft: an enlargement stops at 512 megapixels, as in Lightroom, and one that needs more memory than the
+  computer has is refused with the size it would take, before it starts.
 
 ### Slider drags on large raws
 - Dragging a slider no longer re-renders the edited photo's filmstrip thumbnail on every frame; it follows once you
@@ -21,6 +128,15 @@
   previews for up to a second.
 - A thumbnail of the photo open in Detail is made from its already decoded preview instead of decoding the file
   again.
+### Dehaze while zoomed in
+- With Dehaze on, panning a photo zoomed to 1:1 or moving a slider while zoomed no longer samples the whole
+  original again to find the haze colour. On a 64 MP raw (Sony A7R VI) that took ~0.2 s of CPU per pan and per
+  slider step; a slider step now takes ~5 ms on the GPU.
+### Thumbnails of raw files appear sooner
+- Grid thumbnails and the first picture in the loupe of an unedited raw now come from the smallest JPEG the camera
+  stored that is big enough, not always from the largest one. On a Sony A7R VI file a 512 px thumbnail decodes
+  0.3 MB of JPEG instead of 5.6 MB and is ready several times sooner; Nikon and Panasonic raws with a mid-sized
+  JPEG get faster too.
 ## 2026-10-12
 
 ### Canon CR2 highlights
@@ -539,7 +655,7 @@
   12–32 mm kit zoom was off by about 5 % of the image width at the corners before. Files shot with the correction off
   are unchanged; photos imported before this change get it when imported again.
 - Canon CR3 raws now develop from their sensor data: lossless RAW and C-RAW, checked sample for sample on the EOS
-  M50, R100 and R8. CR3 files the decoder can't read yet still open from their embedded JPEG, as before.
+  M50, R100, R8 and RP (on the RP also in 1.6× crop mode). CR3 files the decoder can't read yet still open from their embedded JPEG, as before.
 - Canon EOS R7 C-RAW files develop from their sensor data too, instead of opening from their embedded JPEG. For R7
   C-RAWs imported earlier, Photo ▸ Reload from Disk picks up the raw data.
 - Canon CRW, Minolta MRW, Sigma X3F, Kodak KDC, Leaf MOS and Epson ERF files that LightCraft can't decode yet

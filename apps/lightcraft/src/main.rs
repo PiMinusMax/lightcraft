@@ -462,6 +462,14 @@ fn services(cc: &eframe::CreationContext<'_>, log_file: Option<&std::path::Path>
         pick_folder: Some(Box::new(|| {
             file_dialog().set_title(lightcraft_ui_egui::i18n::tr("Open Library")).pick_folder().map(|p| p.to_string_lossy().to_string())
         })),
+        #[cfg(target_os = "linux")]
+        open_model_folder: Some(std::sync::Arc::new(|path: &str| {
+            std::process::Command::new("xdg-open")
+                .arg(path)
+                .status()
+                .map_err(|e| e.to_string())
+                .and_then(|s| if s.success() { Ok(()) } else { Err(format!("opening folder failed: {s}")) })
+        })),
         open_with: Some(Box::new(editors::open_with)),
         open_all_with: Some(Box::new(editors::open_all_with)),
         check_editor: Some(Box::new(editors::check)),
@@ -666,7 +674,8 @@ OPTIONS:
   --version, --help
 
 ENVIRONMENT:
-  LIGHTCRAFT_CONFIG_DIR=DIR   use this settings folder instead of the platform default (empty = no settings folder)
+  LIGHTCRAFT_CONFIG_DIR=DIR   use this settings folder instead of the platform default (empty = no settings folder).
+                   Without it, a portable.txt file next to the program puts the folder beside it (LightCraftData)
   LIGHTCRAFT_GPU_BACKEND=dx12|vulkan|metal|auto|off   graphics backend (default: DX12 on Windows, Metal on macOS,
                    Vulkan on Linux; off = render on the CPU); else WGPU_BACKEND. LIGHTCRAFT_GPU=0: CPU rendering.
   LIGHTCRAFT_SAM3_DIR=DIR   the SAM 3 model for Object / Describe masks (default: <settings folder>/models/sam3;

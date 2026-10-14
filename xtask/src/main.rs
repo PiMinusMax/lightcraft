@@ -524,6 +524,26 @@ const RAW_SAMPLES: &[(&str, &str, &str)] = &[
         "https://raw.pixls.us/getfile.php/6587/nice/Canon%20-%20EOS%20R8%20-%203:2.CR3",
         "df33cf394573645ce03dea1b2e9f0b5cc2b7734e9e3391ee7114151414cf2812",
     ),
+    (
+        "cr3-canon-rp-raw.cr3",
+        "https://raw.pixls.us/getfile.php/4674/nice/Canon%20-%20EOS%20RP%20-%203:2.CR3",
+        "dcbd0f6f9929de2e2331b0fd10a9d01e7cfd04c5a5e4038456de1647d714cdf2",
+    ),
+    (
+        "cr3-canon-rp-craw.cr3",
+        "https://raw.pixls.us/getfile.php/4672/nice/Canon%20-%20EOS%20RP%20-%203:2.CR3",
+        "bd3270610593d37ff8a399908bb9406a4e32f9151d55bf19ac1cf8f10d787b46",
+    ),
+    (
+        "cr3-canon-rp-raw-crop.cr3",
+        "https://raw.pixls.us/getfile.php/4673/nice/Canon%20-%20EOS%20RP%20-%203:2.CR3",
+        "7d4ba45dc9264d598336133593c677b09774bcdf13b602ee770e72415a652a16",
+    ),
+    (
+        "cr3-canon-rp-craw-crop.cr3",
+        "https://raw.pixls.us/getfile.php/4671/nice/Canon%20-%20EOS%20RP%20-%203:2.CR3",
+        "4a859ab137f792aedaf3416b0aad1497ebaab02052a49453902e226699154aa7",
+    ),
     // EOS R5 Mark II, full frame and 1.6x crop mode: odd-height (2825- / 1787-row) Bayer planes.
     (
         "cr3-canon-r5m2-raw.cr3",

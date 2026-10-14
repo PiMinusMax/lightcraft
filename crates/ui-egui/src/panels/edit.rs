@@ -950,7 +950,11 @@ fn curve_editor(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId, d: &Dev
             "blue" => &d.curve.blue,
             _ => &d.curve.master,
         };
-        if v.is_empty() { vec![Point::new(0.0, 0.0), Point::new(1.0, 1.0)] } else { v.clone() }
+        // in the order the curve is drawn (points from a sidecar, a preset or an agent can come
+        // unsorted or not finite): the drag below keeps each point between its neighbours
+        let mut v: Vec<Point> = v.iter().copied().filter(|q| q.x.is_finite() && q.y.is_finite()).collect();
+        v.sort_by(|a, b| a.x.total_cmp(&b.x));
+        if v.len() < 2 { vec![Point::new(0.0, 0.0), Point::new(1.0, 1.0)] } else { v }
     };
     let pts = pts_of(d);
     let curve = lightcraft_color::spline::MonotoneCurve::new(&pts.iter().map(|q| (q.x, q.y)).collect::<Vec<_>>());
@@ -1041,8 +1045,12 @@ fn curve_editor(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId, d: &Dev
                 x = x.min(hi);
             } else if i + 1 == v.len() {
                 x = x.max(lo);
-            } else {
+            } else if lo <= hi {
                 x = x.clamp(lo, hi);
+            } else {
+                // neighbours closer than the 0.02 spacing (two clicks side by side, or points
+                // from a file) leave no room: the point stays midway (`clamp` would panic: min above max)
+                x = (v[i - 1].x + v[i + 1].x) / 2.0;
             }
             v[i] = Point::new(x, y);
             new_pts = Some(v);

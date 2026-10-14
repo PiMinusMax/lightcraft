@@ -1043,8 +1043,10 @@ fn filter_pill(app: &mut LightcraftApp, ui: &mut egui::Ui, canvas: Rect) {
     let label =
         chips.iter().map(|c| crate::panels::chips::display_label(c, &app.session.filter, &app.session.catalog)).collect::<Vec<_>>().join("  ·  ");
     let g = p.layout_no_wrap(crate::i18n::tr_format!("Filtered: {label}", label = label), t.font(12.0), Color32::from_gray(225));
-    let w = (g.size().x + 40.0).min((canvas.width() - 24.0).max(60.0));
-    let r = Rect::from_min_size(canvas.min + vec2(12.0, 3.0), vec2(w, 20.0));
+    // the same inset from the left as from the top, so the pill sits in the corner (#1645)
+    let inset = 3.0;
+    let w = (g.size().x + 40.0).min((canvas.width() - 2.0 * inset).max(60.0));
+    let r = Rect::from_min_size(canvas.min + vec2(inset, inset), vec2(w, 20.0));
     let resp = ui.interact(r, egui::Id::new("loupe-filter-pill"), Sense::click());
     register(ui.ctx(), "loupe:filters", r);
     p.rect_filled(r, 10.0, Color32::from_black_alpha(if resp.hovered() { 225 } else { 185 }));
@@ -1934,7 +1936,7 @@ fn mask_overlay(app: &mut LightcraftApp, ui: &mut egui::Ui, resp: &egui::Respons
         {
             let n = map.norm(q);
             let exclude = ui.input(|i| i.modifiers.alt);
-            match app.run("mask.objectPoint", json!({"x": n.x, "y": n.y, "exclude": exclude})) {
+            match app.run_typed("mask.objectPoint", json!({"x": n.x, "y": n.y, "exclude": exclude})) {
                 Ok(_) => {
                     if let Some(mid) = app.session.active_mask {
                         app.ui.detail_due = Some((ui.input(|i| i.time) + 1.0, mid));
@@ -2333,21 +2335,28 @@ pub(crate) fn filmstrip(app: &mut LightcraftApp, ui: &mut egui::Ui, r: Rect) {
                     p.galley(pos2(br.min.x + 17.0, br.center().y - g.size().y / 2.0), g, Color32::WHITE);
                 }
             }
-            if resp.clicked() && app.ui.view == crate::state::ViewMode::Compare {
-                // Compare: the clicked photo replaces the active side (or swaps with the other one)
-                if let Err(e) = app.run("compare.set", json!({"id": id.0})) {
+            if resp.clicked() {
+                let m = ui.input(|i| i.modifiers);
+                let compare = app.ui.view == crate::state::ViewMode::Compare;
+                let r = if compare && !m.command && !m.shift {
+                    // Compare: the clicked photo replaces the active side (or swaps with the other one)
+                    app.run("compare.set", json!({"id": id.0}))
+                } else if compare {
+                    // ⌘/Ctrl- and Shift-clicks change the selection; the pair on screen stays (#187)
+                    super::compare::select_with_modifier(app, *id, !m.command)
+                } else {
+                    let mode = if m.command {
+                        "toggle"
+                    } else if m.shift {
+                        "range"
+                    } else {
+                        "replace"
+                    };
+                    app.run("library.select", json!({"ids": [id.0], "mode": mode}))
+                };
+                if compare && let Err(e) = r {
                     app.toast(ui.ctx(), e);
                 }
-            } else if resp.clicked() {
-                let m = ui.input(|i| i.modifiers);
-                let mode = if m.command {
-                    "toggle"
-                } else if m.shift {
-                    "range"
-                } else {
-                    "replace"
-                };
-                let _ = app.run("library.select", json!({"ids": [id.0], "mode": mode}));
             }
             // the same photo actions as the grid and loupe (Restore / Delete Permanently in Recently Deleted)
             resp.context_menu(|ui| super::grid::context_menu(app, ui, *id));
@@ -2655,5 +2664,28 @@ mod wheel_zoom_tests {
         assert_eq!(wheel_notches(&[wheel(egui::MouseWheelUnit::Point, 40.0, m)]), 0.0);
         assert_eq!(wheel_notches(&[wheel(egui::MouseWheelUnit::Line, 1.0, egui::Modifiers::CTRL)]), 0.0);
         assert_eq!(wheel_notches(&[wheel(egui::MouseWheelUnit::Line, f32::NAN, m)]), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod filter_pill_tests {
+    use super::*;
+
+    /// #1645: the filter pill sits in the loupe's top-left corner as far from the left edge as
+    /// from the top one.
+    #[test]
+    fn the_filter_pill_is_inset_equally_from_both_edges() {
+        let mut app = LightcraftApp::new(lightcraft_engine::Session::with_demo(), crate::Services { png: None, ..Default::default() });
+        app.session.filter.text = "717".into();
+        let ctx = egui::Context::default();
+        let canvas = Rect::from_min_size(pos2(52.0, 82.0), vec2(800.0, 500.0));
+        let raw = crate::headless::HeadlessView::raw_input(vec2(1000.0, 700.0), 1.0, 0.0, vec![]);
+        let mut out = ctx.run_ui(raw, |ui| filter_pill(&mut app, ui, canvas));
+        out.textures_delta.clear();
+        let widgets = crate::widgets::take_registry(&ctx);
+        let pill = widgets.iter().find(|(w, _)| w == "loupe:filters").map(|(_, r)| *r).expect("the pill shows with a search");
+        let (left, top) = (pill.left() - canvas.left(), pill.top() - canvas.top());
+        assert!(top > 0.0, "inside the canvas: {pill:?}");
+        assert_eq!(left, top, "left and top insets: {pill:?} in {canvas:?}");
     }
 }

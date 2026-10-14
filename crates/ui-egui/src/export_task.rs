@@ -138,7 +138,7 @@ pub fn apple_photos_note(outcome: &Value) -> String {
         return crate::i18n::tr_format!("not added to Apple Photos: {e}", e = e);
     }
     if let Some(why) = outcome.get("skipped").and_then(Value::as_str) {
-        if why.contains("cancelled") {
+        if outcome.get("cancelled").and_then(Value::as_bool) == Some(true) {
             return crate::i18n::tr("not added to Apple Photos (cancelled)").to_string();
         }
         return crate::i18n::tr_format!("not added to Apple Photos: {e}", e = why);
@@ -342,7 +342,14 @@ mod tests {
             &json!({"error": "LightCraft isn't allowed to control Photos. Allow it in System Settings › Privacy & Security › Automation"}),
         );
         assert!(denied.starts_with("not added to Apple Photos: ") && denied.contains("Automation"), "{denied}");
-        assert_eq!(apple_photos_note(&json!({"skipped": "the export was cancelled"})), "not added to Apple Photos (cancelled)");
+        assert_eq!(apple_photos_note(&json!({"skipped": "the export was cancelled", "cancelled": true})), "not added to Apple Photos (cancelled)");
         assert_eq!(apple_photos_note(&json!({"skipped": "the export wrote no files"})), "not added to Apple Photos: the export wrote no files");
+        // decided on the `cancelled` flag, not the words (#1046): reworded it is still a cancel, and a
+        // reason that only mentions the word is shown as it is
+        assert_eq!(apple_photos_note(&json!({"skipped": "Export abgebrochen", "cancelled": true})), "not added to Apple Photos (cancelled)");
+        assert_eq!(
+            apple_photos_note(&json!({"skipped": "an earlier, cancelled request is still running"})),
+            "not added to Apple Photos: an earlier, cancelled request is still running"
+        );
     }
 }

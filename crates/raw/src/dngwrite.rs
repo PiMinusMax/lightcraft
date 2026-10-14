@@ -25,6 +25,10 @@ pub enum DngCompression {
     },
 }
 
+/// Software tag of the DNGs this writer makes. A bare "LightCraft" marks older files, whose CFAPattern is anchored at
+/// the sensor origin instead of the ActiveArea (the reader keeps their original reading).
+pub const SOFTWARE: &str = "LightCraft DNG 2";
+
 /// IEEE 754 binary32 → binary16 (round to nearest even; overflow → ±inf, NaN kept).
 pub fn f32_to_f16(v: f32) -> u16 {
     let b = v.to_bits();
@@ -108,18 +112,27 @@ pub fn write_dng(raw: &RawImage, opts: &DngWriteOptions) -> Result<Vec<u8>> {
     ifd.set(t::PHOTOMETRIC, Value::Short(vec![if raw.cfa.is_some() { photometric::CFA } else { photometric::LINEAR_RAW }]));
     ifd.set(t::DNG_VERSION, Value::Byte(vec![1, 4, 0, 0]));
     ifd.set(t::DNG_BACKWARD_VERSION, Value::Byte(vec![1, 3, 0, 0]));
-    let make = raw.metadata.make.clone().unwrap_or_default();
-    let model = raw.metadata.model.clone().unwrap_or_default();
+    let make = raw.metadata.make.as_deref().unwrap_or_default();
+    let model = raw.metadata.model.as_deref().unwrap_or_default();
     if !make.is_empty() {
-        ifd.set(t::MAKE, Value::Ascii(make.clone()));
+        ifd.set(t::MAKE, Value::Ascii(make.to_owned()));
     }
     if !model.is_empty() {
-        ifd.set(t::MODEL, Value::Ascii(model.clone()));
+        ifd.set(t::MODEL, Value::Ascii(model.to_owned()));
     }
-    let unique = format!("{make} {model}").trim().to_string();
+    let model_includes_make = !make.is_empty()
+        && model.get(..make.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(make))
+        && model.get(make.len()..).is_some_and(|suffix| suffix.chars().next().is_none_or(|c| !c.is_alphanumeric() && c != '_'));
+    let unique = if model_includes_make || make.is_empty() {
+        model.to_owned()
+    } else if model.is_empty() {
+        make.to_owned()
+    } else {
+        format!("{make} {model}")
+    };
     ifd.set(t::UNIQUE_CAMERA_MODEL, Value::Ascii(if unique.is_empty() { "LightCraft".into() } else { unique }));
     ifd.set(t::ORIENTATION, Value::Short(vec![raw.orientation.to_exif()]));
-    ifd.set(t::SOFTWARE, Value::Ascii("LightCraft".into()));
+    ifd.set(t::SOFTWARE, Value::Ascii(SOFTWARE.into()));
     let xmp = opts.xmp.clone().unwrap_or_else(|| lightcraft_meta::write_xmp(&raw.metadata, None));
     ifd.set(t::XMP, Value::Byte(xmp.into_bytes()));
 

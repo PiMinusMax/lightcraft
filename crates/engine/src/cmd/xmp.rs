@@ -12,8 +12,9 @@ fn save(s: &mut Session, p: &Value) -> Result<Value> {
     let mut merged = Vec::new();
     let mut backups = Vec::new();
     let mut failed = Vec::new();
-    let owners = crate::sidecar::StemOwners::of(&s.catalog);
-    for id in s.targets(p) {
+    let ids = s.targets(p);
+    let owners = crate::sidecar::StemOwners::among(&s.catalog, &ids);
+    for id in ids {
         match s.save_sidecar_with(id, &owners) {
             Ok(r) => {
                 let path = r.path.display().to_string();

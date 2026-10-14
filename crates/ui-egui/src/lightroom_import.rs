@@ -361,17 +361,19 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
             return;
         }
     };
+    // The task's cancel flag says whether it was cancelled (the worker only stops for it), not an
+    // error's words: a real failure that mentions "cancelled" is still reported as a failure.
     match message {
         Message::Inspected(result) => match result {
             Ok(report) if !task.cancel.load(Ordering::Relaxed) => terminal(app, ctx, &task, report),
             Ok(_) => terminal(app, ctx, &task, json!({"cancelled": true})),
-            Err(e) if task.cancel.load(Ordering::Relaxed) || e.contains("cancelled") => terminal(app, ctx, &task, json!({"cancelled": true})),
+            Err(_) if task.cancel.load(Ordering::Relaxed) => terminal(app, ctx, &task, json!({"cancelled": true})),
             Err(e) => terminal(app, ctx, &task, json!({"error": e})),
         },
         Message::Prepared(result) => {
             let prepared = match result {
                 Ok(p) => p,
-                Err(e) if task.cancel.load(Ordering::Relaxed) || e.contains("cancelled") => {
+                Err(_) if task.cancel.load(Ordering::Relaxed) => {
                     terminal(app, ctx, &task, json!({"cancelled": true}));
                     return;
                 }
@@ -525,6 +527,30 @@ mod tests {
         assert!(h.app.lightroom.is_none());
         assert_eq!(h.app.lightroom_last, Some(serde_json::json!({"cancelled": true, "path": "fixture.lrcat"})));
         assert!(h.app.session.activity.list().is_empty());
+    }
+
+    /// Whether the task was cancelled is the task's flag, not an error's words (#1046): a cancel
+    /// reads as one whatever the message says, and a failure that mentions "cancelled" is a failure.
+    #[test]
+    fn lightroom_cancel_is_the_flag_not_the_words() {
+        let mut h = demo();
+        let (task, tx, cancel, _) = fake_import(&h);
+        h.app.lightroom = Some(task);
+        cancel.store(true, Ordering::Relaxed);
+        tx.send(Message::Prepared(Err("Lightroom-Import abgebrochen".into()))).unwrap();
+        h.step();
+        assert_eq!(h.app.lightroom_last, Some(serde_json::json!({"cancelled": true, "path": "fixture.lrcat"})));
+
+        for message in
+            [Message::Prepared(Err("the drive was ejected: copy cancelled by the system".into())), Message::Inspected(Err("cancelled".into()))]
+        {
+            let (task, tx, _, _) = fake_import(&h);
+            h.app.lightroom = Some(task);
+            tx.send(message).unwrap();
+            h.step();
+            let last = h.app.lightroom_last.clone().unwrap_or_default();
+            assert!(last.get("cancelled").is_none() && last["error"].as_str().is_some_and(|e| e.contains("cancelled")), "{last}");
+        }
     }
 
     #[test]

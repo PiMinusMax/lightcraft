@@ -97,6 +97,31 @@ pub fn set_photo(app: &mut LightcraftApp, id: PhotoId, side: Option<&str>) -> Re
     Ok(json!({"select": a.0, "candidate": b.0}))
 }
 
+/// A ⌘/Ctrl-click (`range: false`, toggles the photo) or Shift-click (`range: true`, extends
+/// from the active photo) on the filmstrip in Compare: the selection changes as it does in the
+/// grid, but the two photos shown stay selected and the active one stays active, so the photo the
+/// rating keys act on is still on screen (#744). A plain click is [`set_photo`].
+pub fn select_with_modifier(app: &mut LightcraftApp, id: PhotoId, range: bool) -> Result<Value, String> {
+    if app.session.catalog.photo(id).is_none_or(|p| p.deleted) {
+        return Err(format!("no photo {}", id.0));
+    }
+    let (sel, cand) = compare_pair(app).ok_or("nothing to compare")?;
+    let mut next = app.session.selection.clone();
+    if range {
+        next.extend_to(id, &app.session.visible_cloned());
+    } else {
+        next.toggle(id);
+    }
+    for shown in [sel, cand] {
+        if !next.contains(shown) {
+            next.ids.push(shown);
+        }
+    }
+    let active = app.session.selection.active.filter(|a| next.contains(*a)).unwrap_or(cand);
+    let ids: Vec<u64> = next.ids.iter().map(|p| p.0).collect();
+    app.session.execute("library.select", &json!({"ids": ids, "active": active.0})).map_err(|e| e.to_string())
+}
+
 /// The candidate becomes the select; the next photo becomes the candidate.
 pub fn make_select(app: &mut LightcraftApp) -> Result<Value, String> {
     let (_, b) = compare_pair(app).ok_or("nothing to compare")?;

@@ -611,6 +611,74 @@ mod tests {
         assert_eq!(r["ok"], true, "{r}");
     }
 
+    /// Press the default Select Only Active Photo chord (the command key on every platform).
+    fn select_only_active_chord(h: &mut crate::headless::Headless) {
+        let r = h.request("ui.key", json!({"key": "D", "cmd": true, "shift": true}), std::time::Duration::from_secs(20));
+        assert_eq!(r["ok"], true, "{r}");
+    }
+
+    #[test]
+    fn select_only_active_keeps_the_active_photo_and_the_edit_undo_step() {
+        use crate::state::ViewMode;
+        use lightcraft_catalog::PhotoId;
+        for view in [ViewMode::PhotoGrid, ViewMode::SquareGrid, ViewMode::Detail] {
+            let mut h = library();
+            h.app.ui.view = view;
+            h.app.session.execute("library.select", &json!({"ids": [1, 2, 3], "active": 2})).unwrap();
+            h.app.session.execute("photo.rate", &json!({"rating": 4})).unwrap();
+            select_only_active_chord(&mut h);
+            assert_eq!(h.app.session.selection.ids, vec![PhotoId(2)]);
+            assert_eq!(h.app.session.active(), Some(PhotoId(2)));
+            // Narrowing the selection does not replace the last photo-edit undo step.
+            h.app.session.execute("edit.undo", &json!({})).unwrap();
+            for id in 1..=3 {
+                assert_eq!(h.app.session.catalog.photo(PhotoId(id)).unwrap().rating, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn select_only_active_yields_to_a_focused_text_field() {
+        use lightcraft_catalog::PhotoId;
+        let mut h = library();
+        h.app.session.execute("library.select", &json!({"ids": [1, 2], "active": 2})).unwrap();
+        let r = h.request("ui.clickWidget", json!({"id": "field:search"}), std::time::Duration::from_secs(20));
+        assert_eq!(r["ok"], true, "{r}");
+        select_only_active_chord(&mut h);
+        assert_eq!(h.app.session.selection.ids, vec![PhotoId(1), PhotoId(2)]);
+        assert_eq!(h.app.session.active(), Some(PhotoId(2)));
+    }
+
+    #[test]
+    fn select_only_active_follows_the_keymap() {
+        use lightcraft_catalog::PhotoId;
+        let mut h = library();
+        let both = vec![PhotoId(1), PhotoId(2)];
+        h.app.session.execute("library.select", &json!({"ids": [1, 2], "active": 2})).unwrap();
+        assert_eq!(super::shortcut_of(&h.app.ui.settings.keymap, "library.selectOnlyActive"), Some("Cmd+Shift+D"));
+        // unbound: the default chord does nothing
+        super::assign(&mut h.app.ui.settings.keymap, "library.selectOnlyActive", None).unwrap();
+        select_only_active_chord(&mut h);
+        assert_eq!(h.app.session.selection.ids, both);
+        // rebound: the new key narrows the selection and the old chord still does not
+        super::assign(&mut h.app.ui.settings.keymap, "library.selectOnlyActive", Some("F9")).unwrap();
+        select_only_active_chord(&mut h);
+        assert_eq!(h.app.session.selection.ids, both);
+        key(&mut h, "F9", false);
+        assert_eq!(h.app.session.selection.ids, vec![PhotoId(2)]);
+    }
+
+    #[test]
+    fn select_only_active_without_active_photo_does_not_change_selection() {
+        let mut h = library();
+        // Deselect All keeps the active photo selected, so clear the whole selection state instead.
+        h.app.session.selection = Default::default();
+        assert!(!crate::menus::ui_enabled(&h.app, "library.selectOnlyActive"));
+        assert!(h.app.run("library.selectOnlyActive", json!({})).is_err());
+        select_only_active_chord(&mut h);
+        assert!(h.app.session.selection.ids.is_empty());
+    }
+
     #[test]
     fn library_rating_labels_flags_and_undo() {
         use lightcraft_catalog::{ColorLabel, Flag, PhotoId};

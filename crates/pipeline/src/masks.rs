@@ -398,7 +398,9 @@ fn box_down(m: &Image<u8>, f: usize) -> Plane {
 
 /// Bilinear sample at continuous pixel coordinates (pixel centres at +0.5), edges extended.
 fn bilinear(p: &Plane, x: f32, y: f32) -> f32 {
-    let (fx, fy) = (x - 0.5, y - 0.5);
+    // (held a pixel outside, which reads the same edge: an infinite coordinate reads the edge
+    // instead of a NaN weight and a neighbour index past isize::MAX)
+    let (fx, fy) = (x.clamp(-1.0, p.width as f32 + 1.0) - 0.5, y.clamp(-1.0, p.height as f32 + 1.0) - 0.5);
     let (x0, y0) = (fx.floor(), fy.floor());
     let (tx, ty) = (fx - x0, fy - y0);
     let (x0, y0) = (x0 as isize, y0 as isize);

@@ -380,6 +380,33 @@ fn disk_cache_never_touches_foreign_files() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A shard directory that is a symlink to a folder outside the cache is neither listed, cleared,
+/// pruned, read nor written (issue #1504).
+#[cfg(unix)]
+#[test]
+fn disk_cache_ignores_symlinked_shard_directories() {
+    let dir = temp_dir("symlink-shard");
+    let outside = temp_dir("symlink-outside");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let key = hash_bytes(&[9, 9]);
+    let hex = key.to_string();
+    let sentinel = outside.join(format!("{hex}.jpg"));
+    std::fs::write(&sentinel, vec![7u8; 50_000]).unwrap();
+    std::os::unix::fs::symlink(&outside, dir.join(&hex[..2])).unwrap();
+    let d = DiskCache::new(&dir, 10);
+    assert_eq!(d.size(), 0, "files behind the link are not the cache's");
+    d.prune();
+    assert!(sentinel.exists(), "prune followed the link");
+    assert!(d.get(key).is_none(), "get read through the link");
+    d.put(key, &gradient(16, 16, 1));
+    assert_eq!(std::fs::metadata(&sentinel).unwrap().len(), 50_000, "put wrote through the link");
+    d.clear();
+    assert!(sentinel.exists(), "clear followed the link");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
 /// [`JobPool::wait`] returns once a job finishes, which [`JobPool::try_recv`] then hands out, or
 /// after the timeout.
 #[test]

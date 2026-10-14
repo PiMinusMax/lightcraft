@@ -132,3 +132,30 @@ fn zoomed_in_the_after_side_shows_the_edits() {
         }
     }
 }
+
+/// Show Original (`\`) is not one of the Before / After layouts, so the bottom bar's
+/// Before/After (Y) button stays dark for it; clicking the button then lays out Before and After
+/// side by side, as it does from the plain view. It used to light up for `\` too, so the same
+/// lit button stood for two different views (#1497).
+#[test]
+fn show_original_does_not_light_the_before_after_button() {
+    assert!(!BeforeAfter::Off.is_layout());
+    assert!(!BeforeAfter::Original.is_layout());
+    for mode in [BeforeAfter::SideBySide, BeforeAfter::Split, BeforeAfter::TopBottom, BeforeAfter::SplitTopBottom] {
+        assert!(mode.is_layout(), "{mode:?}");
+    }
+    let app = LightcraftApp::new(lightcraft_engine::Session::with_demo(), Services { png: None, ..Default::default() });
+    let mut h = Headless::new(app, [1400.0, 900.0], 1.0);
+    let id = h.app.session.visible_cloned()[2];
+    h.request("engine.execute", json!({"command": "library.select", "params": {"ids": [id.0], "active": id.0}}), T);
+    h.app.ui.view = ViewMode::Detail;
+    h.settle(SETTLE);
+    assert_eq!(h.request("engine.execute", json!({"command": "view.showOriginal"}), T)["ok"], true);
+    assert_eq!(h.app.ui.before_after, BeforeAfter::Original);
+    assert!(!h.app.ui.before_after.is_layout(), "the button is dark while the original is shown");
+    h.settle(SETTLE);
+    assert_eq!(h.request("ui.clickWidget", json!({"id": "icon:beforeAfter"}), T)["ok"], true);
+    assert_eq!(h.app.ui.before_after, BeforeAfter::SideBySide, "a click on the dark button opens the layout");
+    assert_eq!(h.request("ui.clickWidget", json!({"id": "icon:beforeAfter"}), T)["ok"], true);
+    assert_eq!(h.app.ui.before_after, BeforeAfter::Off, "a second click closes it");
+}

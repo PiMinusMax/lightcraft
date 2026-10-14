@@ -25,7 +25,7 @@ impl Catalog {
     }
     /// Photo → (stack, position in the stack), for every stacked photo.
     pub fn stack_index(&self) -> HashMap<PhotoId, (StackId, usize)> {
-        self.stacks.values().flat_map(|s| s.photos.iter().enumerate().map(move |(i, p)| (*p, (s.id, i)))).collect()
+        self.stacks.iter().flat_map(|(id, s)| s.photos.iter().enumerate().map(move |(i, p)| (*p, (*id, i)))).collect()
     }
 
     pub(crate) fn validate_stack(&self, id: StackId, photos: &[PhotoId]) -> Result<()> {
@@ -70,7 +70,7 @@ impl Catalog {
             }
         }
         for sid in &touched {
-            for p in self.stacks[sid].photos.clone() {
+            for p in self.stacks.get(sid).map(|s| s.photos.clone()).unwrap_or_default() {
                 push(&mut order, p);
             }
         }
@@ -186,7 +186,10 @@ impl Catalog {
                     if !done.insert(*sid) {
                         continue;
                     }
-                    let s = &self.stacks[sid];
+                    let Some(s) = self.stacks.get(sid) else {
+                        out.push(*id);
+                        continue;
+                    };
                     let members = s.photos.iter().copied().filter(|p| present.contains(p));
                     if s.collapsed {
                         out.extend(members.take(1));

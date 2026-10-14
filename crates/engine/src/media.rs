@@ -67,6 +67,17 @@ pub const RENDER_CACHE_VERSION: u64 = 62;
 /// Thumbnails render at one of these long edges (so window/cell size changes reuse the cache).
 pub const THUMB_SIZES: [usize; 4] = [128, 256, 384, 512];
 
+/// Face tiles are rendered at a multiple of this many pixels ([`crate::Session::face_job`]): the
+/// tile's size follows the thumbnail slider and the screen's scale, and without steps every size
+/// in between would render (and cache) every face again.
+pub const FACE_EDGE_STEP: usize = 16;
+
+/// The edge a face tile asked to be `edge` pixels across is rendered at: the next
+/// [`FACE_EDGE_STEP`], 16..=512.
+pub fn face_edge(edge: usize) -> usize {
+    edge.clamp(16, SourceLevel::Thumb.max_edge()).div_ceil(FACE_EDGE_STEP).saturating_mul(FACE_EDGE_STEP).min(SourceLevel::Thumb.max_edge())
+}
+
 pub fn thumb_bucket(long_edge: usize) -> usize {
     THUMB_SIZES.iter().copied().find(|s| *s >= long_edge).unwrap_or(512)
 }
@@ -741,6 +752,9 @@ pub struct RenderJob {
     pub view_cache: Option<(Arc<PreviewCache>, Hash128)>,
     /// Render for this monitor profile ([`Self::with_display`]).
     pub display: Option<Arc<crate::display::Display>>,
+    /// A face tile that can be cut from the raw's embedded preview, tried before `source`
+    /// ([`crate::Session::face_job`]; `None` for every other job).
+    pub preview_cut: Option<crate::face_tiles::PreviewCut>,
 }
 
 pub struct RenderResult {
@@ -820,6 +834,7 @@ impl RenderJob {
         self.settings = Arc::new(s);
         self.cache = None;
         self.view_cache = None;
+        self.preview_cut = None;
         self
     }
 
@@ -873,6 +888,26 @@ impl RenderJob {
             && let Some(img) = cache.get_at(self.cache_generation, *key)
         {
             let image = Arc::unwrap_or_clone(img);
+            let histogram = Histogram::of_srgb8(&image);
+            return RenderResult {
+                request_id: self.request_id,
+                source_key: self.source_key,
+                photo: self.photo,
+                level: self.level,
+                key: self.key,
+                rendered: Ok(Rendered { image, histogram, deep: None }),
+                gpu_fallback: None,
+                loaded: None,
+                quick: None,
+                display: None,
+            };
+        }
+        // a face tile of an unedited raw: cut from the camera's embedded preview when it is big enough
+        // (the sensor data is never read for it), else rendered from `source` below
+        if let Some(image) = self.preview_cut.as_ref().and_then(|c| c.cut()) {
+            if let Some((cache, key)) = &self.cache {
+                cache.put_at(self.cache_generation, *key, Arc::new(image.clone()));
+            }
             let histogram = Histogram::of_srgb8(&image);
             return RenderResult {
                 request_id: self.request_id,
@@ -1192,6 +1227,7 @@ impl crate::Session {
             stages: None,
             view_cache: None,
             display: None,
+            preview_cut: None,
         })
     }
 
@@ -1243,13 +1279,19 @@ impl crate::Session {
             stages: None,
             view_cache: None,
             display: None,
+            preview_cut: None,
         })
     }
 
     /// A square close-up of `face` (normalized, in the photo's upright frame) for a People card: the
     /// photo's own look with its crop replaced by a square around the face (room for hair and chin),
-    /// `edge` pixels across (≤ 512). The source level is the smallest that keeps the face sharp, up
-    /// to the preview. Cached like [`Self::variant_job`], and `key` likewise follows the content.
+    /// at least `edge` pixels across (rounded up to [`FACE_EDGE_STEP`], ≤ 512, so a tile size
+    /// between two steps reuses the cached one). An unedited raw's tile is cut from the camera's
+    /// embedded preview when that holds the square at [`crate::face_tiles::SOFT_LIMIT`] of the
+    /// size asked or more ([`crate::face_tiles`]); else, and for every other photo, the source
+    /// level is the smallest that keeps the face sharp, up to the preview. Cached (memory and the
+    /// library's thumbnail cache on disk) like [`Self::variant_job`], and `key` likewise follows
+    /// the content: a later launch shows the tile without reading the original.
     pub fn face_job(&mut self, id: PhotoId, face: lightcraft_geom::Rect, edge: usize) -> Option<RenderJob> {
         let p = self.catalog.photo(id)?.clone();
         // `face` is on the upright (EXIF-oriented) photo; the crop below is in the frame after the
@@ -1267,12 +1309,13 @@ impl crate::Session {
         let rect = lightcraft_geom::Rect { x0: x0 / w, y0: y0 / h, x1: (x0 + side) / w, y1: (y0 + side) / h };
         let mut settings = (*p.develop).clone();
         settings.crop = lightcraft_develop::Crop { geometry: lightcraft_geom::CropGeometry { rect, angle: 0.0 }, ..Default::default() };
-        let edge = edge.clamp(16, SourceLevel::Thumb.max_edge());
+        let edge = face_edge(edge);
         // pixels along the long edge that leave `edge` across the crop
         let needed = (edge as f64 * w.max(h) / side).ceil().min(SourceLevel::Preview.max_edge() as f64);
         let level = SourceLevel::for_size(needed as usize);
         let source = self.media.source_ref(&p, level);
         let ck = Self::variant_key(&p, &settings, edge);
+        let preview_cut = self.face_preview_cut(&p, rect, edge, needed as usize);
         Some(RenderJob {
             request_id: 0,
             cache_generation: self.media.rendered.generation(),
@@ -1289,7 +1332,24 @@ impl crate::Session {
             stages: None,
             view_cache: None,
             display: None,
+            preview_cut,
         })
+    }
+
+    /// How a face tile of `p` can come from its embedded preview ([`crate::face_tiles`]): only an
+    /// unedited raw (whose grid thumbnail is that preview too) not known to be offline, upright as
+    /// imported, with a preview loader installed. `rect` is the square around the face, `edge` the
+    /// tile, `needed` the source's long edge the develop render would ask for.
+    fn face_preview_cut(&self, p: &Photo, rect: lightcraft_geom::Rect, edge: usize, needed: usize) -> Option<crate::face_tiles::PreviewCut> {
+        let (path, loader) = self.embedded_of(p)?;
+        if p.develop.orientation != lightcraft_geom::Orientation::Normal || self.media.availability.is_offline(&path) || p.width == 0 || p.height == 0
+        {
+            return None;
+        }
+        let want = needed.max(edge).max(1);
+        let min = (want as f64 * crate::face_tiles::SOFT_LIMIT).ceil() as usize;
+        let aspect = f64::from(p.width) / f64::from(p.height);
+        Some(crate::face_tiles::PreviewCut { path, loader, want, min, rect, aspect, edge })
     }
 
     /// Size-independent cache key of a photo's view render (loupe) for its current settings.
@@ -1427,8 +1487,10 @@ impl crate::Session {
 
     /// A first grid thumbnail for an unedited raw: the cached render for `job` (the real
     /// thumbnail job, from [`Self::thumb_job`]) if there is one — then the result carries
-    /// [`QuickSource::Cached`] and `job.key` and is final — else its embedded preview. `None` for
-    /// other photos (render them directly).
+    /// [`QuickSource::Cached`] and `job.key` and is final — else its embedded preview, else `job`
+    /// itself: the grid queues no render behind an unedited raw's quick thumbnail
+    /// ([`Self::embedded_thumb_is_final`]), so a preview that can't be read must not leave the
+    /// cell empty (issue #1448). `None` for other photos (render them directly).
     pub fn quick_thumb_job(&mut self, job: &RenderJob) -> Option<QuickJob> {
         let p = self.catalog.photo(job.photo)?.clone();
         let (path, l) = self.embedded_of(&p)?;
@@ -1439,7 +1501,7 @@ impl crate::Session {
             key: job.key,
             cached: job.cache.clone().into_iter().collect(),
             embedded: Some((path, l, edge)),
-            small: None,
+            small: Some(Box::new(job.clone())),
         })
     }
 

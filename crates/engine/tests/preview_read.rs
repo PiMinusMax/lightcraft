@@ -20,8 +20,9 @@ fn a_preview_reads_only_the_header_and_the_preview() {
     assert!(file_len > 0, "empty file");
 
     let started = Instant::now();
-    let window =
-        lightcraft_engine::files::preview_window(&path).expect("the file reads").expect("it carries an embedded preview the header can point at");
+    let window = lightcraft_engine::files::preview_window(&path, usize::MAX)
+        .expect("the file reads")
+        .expect("it carries an embedded preview the header can point at");
     let elapsed = started.elapsed();
     let (_, preview, read) = window;
 

@@ -1426,11 +1426,32 @@ fn sam_by_hand(sam: &lightcraft_engine::segment::Segmenter) -> bool {
 /// The model installation guide.
 const SAM_HELP: &str = "https://github.com/storytold/lightcraft/blob/main/docs/ai-masks.md#getting-the-model";
 
-/// Show the SAM 3 model folder in the file manager (created first, so there is something to show).
-fn show_model_folder(app: &mut LightcraftApp, dir: &std::path::Path) -> Result<(), String> {
+/// Open the configured SAM 3 folder itself; revealing a file opens its parent instead.
+pub(crate) fn show_model_folder(app: &mut LightcraftApp) -> Result<serde_json::Value, String> {
+    let dir = app.session.segmenter.dir.as_ref().ok_or("no folder is set for the SAM 3 model")?;
+    let path = dir.to_str().ok_or("the model folder path is not valid UTF-8")?;
+    let open = app.services.open_with.as_mut().ok_or("opening model folders is not available here")?;
+    // Create only after the host action is available. Existing model files are left alone.
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let reveal = app.services.reveal.as_mut().ok_or("not available here")?;
-    reveal(&dir.to_string_lossy())
+    #[cfg(target_os = "linux")]
+    if let Some(open_folder) = app.services.open_model_folder.clone() {
+        let path = path.to_string();
+        let folder = path.clone();
+        crate::tasks::spawn(
+            app,
+            "Show in File Manager",
+            Some("openModelFolder"),
+            move || open_folder(&folder),
+            |app, ctx, result| {
+                if let Err(e) = result {
+                    app.toast_error(ctx, e);
+                }
+            },
+        )?;
+        return Ok(json!({"path": path, "background": true}));
+    }
+    open(path, "")?;
+    Ok(json!({"path": path}))
 }
 
 /// The SAM 3 dialog: what the model is, its size and licence, and the download's progress.
@@ -1488,13 +1509,13 @@ fn sam_model_body(app: &mut LightcraftApp, ui: &mut egui::Ui, error: Option<&str
             .color(t.text_dim),
         );
         ui.horizontal_wrapped(|ui| {
-            if let Some(dir) = dir.filter(|_| app.services.reveal.is_some()) {
+            if dir.is_some() && crate::menus::ui_enabled(app, "app.openSamModelFolder") {
                 let r = ui.button(crate::i18n::tr(crate::menus::reveal_label()));
                 crate::widgets::register(ui.ctx(), "button:samFolder", r.rect);
                 if r.clicked()
-                    && let Err(e) = show_model_folder(app, &dir)
+                    && let Err(e) = app.run("app.openSamModelFolder", json!({}))
                 {
-                    app.toast(ui.ctx(), e);
+                    app.toast_error(ui.ctx(), e);
                 }
             }
             let r = ui.link(crate::i18n::tr("How to install the model")).on_hover_text(SAM_HELP);

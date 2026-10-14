@@ -262,6 +262,11 @@ pub struct ImportTask {
     auto: bool,
     /// Auto Import: the selection to keep.
     keep_selection: Option<lightcraft_engine::Selection>,
+    /// The selection and source as the import last left them: a change between frames is the
+    /// user choosing another photo or view, which the end of the import doesn't take away.
+    left: Option<(lightcraft_engine::Selection, lightcraft_engine::LibrarySource)>,
+    /// The user chose another photo or view while the import ran.
+    moved_on: bool,
     run: Option<ImportRun>,
     /// The import's row in the activity stack (its ✕ and `activity.cancel` set the run's cancel flag).
     guard: Option<lightcraft_engine::activity::TaskGuard>,
@@ -689,6 +694,9 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
     let Some(run) = task.run.as_mut() else { return };
     let batches = run.next_batches();
     let finished = batches.is_none();
+    if task.left.as_ref().is_some_and(|(sel, source)| *sel != app.session.selection || *source != app.session.source) {
+        task.moved_on = true;
+    }
     for prepared in batches.into_iter().flatten() {
         commit_batch(app, &mut task, prepared);
         // arriving photos don't take over the selection
@@ -696,6 +704,7 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
             app.session.selection = sel.clone();
         }
     }
+    task.left = Some((app.session.selection.clone(), app.session.source));
     if let Some(run) = &task.run {
         task.total = run.total.load(Ordering::Relaxed).max(task.total);
         task.done = run.done.load(Ordering::Relaxed);
@@ -807,7 +816,8 @@ fn xmp_warnings_text(warnings: &[ImportWarning]) -> String {
     )
 }
 
-/// The import is done (or cancelled): one undo step, select the first photo, say what happened.
+/// The import is done (or cancelled): one undo step, show and select the first photo (unless the
+/// user chose another meanwhile), say what happened.
 fn finish(app: &mut LightcraftApp, ctx: &egui::Context, task: ImportTask) {
     let steps = app.session.undo.len().saturating_sub(task.undo0);
     let plural = |n: usize| if n == 1 { "" } else { "s" };
@@ -835,7 +845,12 @@ fn finish(app: &mut LightcraftApp, ctx: &egui::Context, task: ImportTask) {
         }
         return;
     }
-    if let Some(f) = task.first {
+    if let Some(f) = task.first.filter(|_| !task.moved_on) {
+        // a view the new photos aren't in (an album, Picks, a Local folder) would leave the active
+        // photo off screen: show All Photos, as Lightroom shows the import's own collection (#1446)
+        if !app.session.visible().contains(&lightcraft_catalog::PhotoId(f)) {
+            let _ = app.run("library.source", json!({"kind": "all"}));
+        }
         let _ = app.run("library.select", json!({"ids": [f]}));
     }
     let plural = |n: usize| if n == 1 { "" } else { "s" };

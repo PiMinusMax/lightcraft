@@ -1115,6 +1115,10 @@ mod tests {
             ("cr3-canon-m50-craw.cr3", 0x9aacbfe66f505e1bu64),
             ("cr3-canon-r8-raw.cr3", 0x63c1c6d8d1eb2312u64),
             ("cr3-canon-r8-craw.cr3", 0xf836a663a795a375u64),
+            ("cr3-canon-rp-raw.cr3", 0x5cb0f46404b8b663u64),
+            ("cr3-canon-rp-craw.cr3", 0xf48df06ca1d67382u64),
+            ("cr3-canon-rp-raw-crop.cr3", 0x46808a9de3b3dcc7u64),
+            ("cr3-canon-rp-craw-crop.cr3", 0x39a60c4efed4e1f4u64),
         ] {
             let path = std::path::Path::new(&directory).join(name);
             let bytes = std::fs::read(path).unwrap();

@@ -761,3 +761,27 @@ fn bench_luminance_slider() {
         eprintln!("luminance {l}: with the stage cache {:.0} ms, without {:.0} ms", cached.as_secs_f64() * 1e3, t.elapsed().as_secs_f64() * 1e3);
     }
 }
+
+/// A crop a hair wide (or of no size, as a command or a sidecar can set) shown to fit made the
+/// tone, clarity and dehaze stages blur with sigmas of millions of pixels (infinite for no size):
+/// the box width's square overflowed (a panic in debug builds, a radius of billions of pixels and
+/// a hung render in release ones). The blur is held to twice the picture's size: the render is
+/// quick and its pixels are numbers.
+#[test]
+fn sliver_crops_render_quickly_with_wide_stages_on() {
+    let src = scene();
+    for (rect, angle) in [([0.0, 0.0, 1e-9, 1.0], 45.0), ([0.5, 0.5, 0.5, 0.5], 0.0), ([0.0, 0.0, 1e-5, 1.0], -30.0)] {
+        let mut s = DevelopSettings::default();
+        s.crop.geometry.rect = lightcraft_geom::Rect::new(rect[0], rect[1], rect[2], rect[3]);
+        s.crop.geometry.angle = angle;
+        s.effects.clarity = 80.0;
+        s.effects.dehaze = 50.0;
+        s.effects.texture = 40.0;
+        s.light.highlights = -60.0;
+        s.light.shadows = 60.0;
+        let t = std::time::Instant::now();
+        let r = render(&src, &SourceInfo::default(), &s, &RenderRequest::fit(280, 180));
+        assert!(t.elapsed().as_secs_f64() < 20.0, "{rect:?}: {:?}", t.elapsed());
+        assert!(r.image.width >= 1 && r.image.height >= 1, "{rect:?}");
+    }
+}

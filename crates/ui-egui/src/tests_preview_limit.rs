@@ -862,6 +862,25 @@ mod in_the_loupe {
         }
     }
 
+    // …and with no monitor profile chosen but a screen that reports one (macOS: previews follow
+    // the screen's profile, #787), the sharp window is painted too (#1365): every Mac renders for
+    // a display
+    #[test]
+    fn with_the_screen_profile_the_window_is_drawn() {
+        let (mut h, native) = detail();
+        h.app.services.screen_profile = Some(Box::new(|| Some(lightcraft_codecs::icc::write_named(lightcraft_codecs::NamedSpace::DisplayP3))));
+        h.step();
+        assert!(h.app.ui.settings.display_profile.is_empty(), "no profile chosen");
+        assert!(h.app.renderer.display_id().is_some(), "the screen's profile is in use");
+        h.request("engine.execute", json!({"command": "view.zoom100"}), T);
+        h.settle(SETTLE);
+        assert!(rendered_long_edge(&h) < native, "the whole frame is smaller than the photo");
+        let (whole, window) = (drawn(&h, Slot::Main), drawn(&h, Slot::Region));
+        assert!(!whole.is_empty(), "the whole-frame render is painted");
+        assert!(!window.is_empty(), "the window is painted");
+        assert!(window[0].0 > whole[0].0, "over the whole-frame render");
+    }
+
     /// Compare view of the demo library at `zoom`, settled.
     fn compare_at(zoom: crate::state::Zoom) -> Headless {
         let (mut h, _) = detail();

@@ -113,6 +113,8 @@ pub struct LoadReport {
     /// The library was in an older catalog format (`0` = before format versions: a log without a
     /// snapshot) and was rewritten in this version's format ([`VERSION`]).
     pub upgraded_from: Option<u32>,
+    /// What [`Catalog::repair`] changed in a damaged snapshot (empty for a sound one).
+    pub repaired: Vec<String>,
 }
 
 /// Where persistence time goes (reported by `library.info` → `persistence`; printed to stderr
@@ -328,7 +330,12 @@ impl Journal {
                     return Err(newer(format!("{SNAPSHOT} is catalog format v{}", h.version)));
                 }
                 let s: SnapFile = serde_json::from_slice(&bytes).map_err(|e| CatalogError::Corrupt(format!("{SNAPSHOT}: {e}")))?;
-                (s.catalog, s.seq, Some(h.version))
+                let mut catalog = s.catalog;
+                report.repaired = catalog.repair();
+                for r in &report.repaired {
+                    log::warn!("{SNAPSHOT}: {r}");
+                }
+                (catalog, s.seq, Some(h.version))
             }
             None => (Catalog::new(), 0, None),
         };

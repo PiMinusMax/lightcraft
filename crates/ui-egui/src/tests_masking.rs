@@ -1373,7 +1373,8 @@ fn ai_masks_without_the_model_offer_the_download() {
         assert!(h.app.widgets.iter().any(|(id, _)| id == "link:samHelp"), "no installation guide link");
         let shown = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let log = shown.clone();
-        h.app.services.reveal = Some(Box::new(move |p: &str| {
+        h.app.services.open_with = Some(Box::new(move |p: &str, editor: &str| {
+            assert_eq!(editor, "", "open the model directory with the default application");
             log.lock().unwrap().push(p.to_string());
             Ok(())
         }));

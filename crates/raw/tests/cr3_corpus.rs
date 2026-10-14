@@ -124,3 +124,31 @@ fn canon_m50_craw_crop_is_the_shot_aspect() {
     let raw = decode(&bytes).unwrap();
     assert_eq!((raw.crop.x, raw.crop.y, raw.crop.width, raw.crop.height), (1012, 12, 4000, 4000));
 }
+
+#[test]
+fn canon_rp_lossless_sensor_is_exact() {
+    // raw.pixls.us/getfile.php/4674; SHA256
+    // dcbd0f6f9929de2e2331b0fd10a9d01e7cfd04c5a5e4038456de1647d714cdf2
+    check("cr3-canon-rp-raw.cr3", 0x5cb0_f464_04b8_b663, (6384, 4224), (6240, 4160));
+}
+
+#[test]
+fn canon_rp_craw_sensor_is_exact() {
+    // raw.pixls.us/getfile.php/4672; SHA256
+    // bd3270610593d37ff8a399908bb9406a4e32f9151d55bf19ac1cf8f10d787b46
+    check("cr3-canon-rp-craw.cr3", 0xf48d_f06c_a1d6_7382, (6384, 4224), (6240, 4160));
+}
+
+#[test]
+fn canon_rp_crop_mode_lossless_sensor_is_exact() {
+    // 1.6x crop mode: a single tile. raw.pixls.us/getfile.php/4673; SHA256
+    // 7d4ba45dc9264d598336133593c677b09774bcdf13b602ee770e72415a652a16
+    check("cr3-canon-rp-raw-crop.cr3", 0x4680_8a9d_e3b3_dcc7, (4032, 2656), (3888, 2592));
+}
+
+#[test]
+fn canon_rp_crop_mode_craw_sensor_is_exact() {
+    // raw.pixls.us/getfile.php/4671; SHA256
+    // 4a859ab137f792aedaf3416b0aad1497ebaab02052a49453902e226699154aa7
+    check("cr3-canon-rp-craw-crop.cr3", 0x39a6_0c4e_fed4_e1f4, (4032, 2656), (3888, 2592));
+}

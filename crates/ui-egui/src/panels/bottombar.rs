@@ -6,7 +6,7 @@ use serde_json::json;
 
 use crate::LightcraftApp;
 use crate::icons::{Icon, paint};
-use crate::state::{BeforeAfter, ViewMode, Zoom};
+use crate::state::{ViewMode, Zoom};
 use crate::theme::Tokens;
 use crate::widgets::{icon_button, register, stars};
 
@@ -178,16 +178,8 @@ fn right_side(app: &mut LightcraftApp, ui: &mut egui::Ui, full: Rect, compact_zo
     if app.ui.view == ViewMode::Survey {
         // no zoom or thumbnail size in Survey
     } else if matches!(app.ui.view, ViewMode::Detail | ViewMode::Compare) {
-        if icon_button(
-            &mut child,
-            "beforeAfter",
-            Icon::BeforeAfter,
-            vec2(30.0, 30.0),
-            app.ui.before_after != BeforeAfter::Off,
-            true,
-            "Before/After (Y)",
-        )
-        .clicked()
+        if icon_button(&mut child, "beforeAfter", Icon::BeforeAfter, vec2(30.0, 30.0), app.ui.before_after.is_layout(), true, "Before/After (Y)")
+            .clicked()
         {
             let _ = app.run("view.beforeAfter", json!({}));
         }

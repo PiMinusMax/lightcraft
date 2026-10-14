@@ -673,10 +673,33 @@ pub(crate) fn prepare(
 /// The airlight of the whole output frame, estimated on a small render of it (`proxy_w` px wide):
 /// a windowed render must dehaze with the frame's airlight, not that of the pixels it holds.
 pub(crate) fn frame_airlight(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, frame: &Frame, proxy_w: usize, proxy_h: usize) -> f32 {
-    let mut img = frame.sample(src, proxy_w, proxy_h);
+    let mut img = Rgb32f::clone(&frame_proxy(src, frame, proxy_w, proxy_h));
     white_balance(&mut img, info, s);
     let sigma = (0.02 * frame.px_per_long(proxy_w)).max(1.0) as f32;
     airlight(&gaussian(&img.map(dark_of), sigma))
+}
+
+/// How many airlight proxies [`frame_proxy`] keeps (one per photo and frame being zoomed into; each ≤ 1.8 MB).
+const FRAME_PROXIES_KEPT: usize = 4;
+
+/// `frame.sample(src, w, h)`, kept for the last few (source, frame, size): sampling a 64 MP original down to the
+/// airlight proxy reads all of it (~190 ms of CPU), and every window of a zoomed view with Dehaze asked for it again,
+/// on each pan and slider tick. The proxy is taken before white balance, so a WB change still hits.
+fn frame_proxy(src: &Rgb32f, frame: &Frame, w: usize, h: usize) -> Arc<Rgb32f> {
+    type Entry = (u64, Frame, usize, usize, Arc<Rgb32f>);
+    static CACHE: std::sync::Mutex<Vec<Entry>> = std::sync::Mutex::new(Vec::new());
+    let key = crate::optics::fingerprint(src);
+    let found = |c: &[Entry]| c.iter().find(|e| e.0 == key && e.1 == *frame && (e.2, e.3) == (w, h)).map(|e| e.4.clone());
+    if let Some(img) = found(&CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)) {
+        return img;
+    }
+    let img = Arc::new(frame.sample(src, w, h));
+    let mut c = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    c.push((key, frame.clone(), w, h, img.clone()));
+    if c.len() > FRAME_PROXIES_KEPT {
+        c.remove(0);
+    }
+    img
 }
 
 /// The airlight is estimated from every `AIRLIGHT_STEP`-th value of the dark channel.
@@ -1002,6 +1025,36 @@ mod tests {
         assert!(c[0] > c[2], "{c:?}");
         // luminance preserved
         assert!((luminance_2020(c) - 0.3).abs() < 0.01);
+    }
+
+    // A windowed render's airlight proxy is kept per (source, frame, size): the airlight is the one sampling anew gives,
+    // and another source or frame of the same size gets its own, never the proxy kept for the last one
+    #[test]
+    fn the_kept_airlight_proxy_matches_a_fresh_one_and_misses_on_another_source_or_frame() {
+        let (info, s) = (SourceInfo::default(), DevelopSettings::default());
+        let hazy = Rgb32f::from_fn(300, 200, |x, y| {
+            let v = 0.05 + 0.6 * x as f32 / 300.0;
+            [v, v * 0.95, v * (0.8 + 0.2 * y as f32 / 200.0)]
+        });
+        let other = Rgb32f::from_fn(300, 200, |x, y| [0.02 + 0.1 * ((x + y) % 7) as f32 / 7.0; 3]);
+        let fresh = |src: &Rgb32f, frame: &Frame| {
+            let mut img = frame.sample(src, 48, 32);
+            white_balance(&mut img, &info, &s);
+            airlight(&gaussian(&img.map(dark_of), (0.02 * frame.px_per_long(48)).max(1.0) as f32))
+        };
+        let frame = crate::frame_for(&hazy, &info, &s, true);
+        let kept = frame_proxy(&hazy, &frame, 48, 32);
+        assert!(Arc::ptr_eq(&kept, &frame_proxy(&hazy, &frame, 48, 32)), "the second ask is served from the cache");
+        assert_eq!(frame_airlight(&hazy, &info, &s, &frame, 48, 32).to_bits(), fresh(&hazy, &frame).to_bits());
+        assert_eq!(frame_airlight(&hazy, &info, &s, &frame, 48, 32).to_bits(), fresh(&hazy, &frame).to_bits());
+        // another source of the same size
+        assert_ne!(fresh(&other, &frame), fresh(&hazy, &frame));
+        assert_eq!(frame_airlight(&other, &info, &s, &frame, 48, 32).to_bits(), fresh(&other, &frame).to_bits());
+        // the same source, cropped to its darker half
+        let mut cropped = frame.clone();
+        cropped.crop.rect.x1 = 0.5;
+        assert_ne!(fresh(&hazy, &cropped), fresh(&hazy, &frame));
+        assert_eq!(frame_airlight(&hazy, &info, &s, &cropped, 48, 32).to_bits(), fresh(&hazy, &cropped).to_bits());
     }
 
     #[test]

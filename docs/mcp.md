@@ -22,6 +22,9 @@ it open, `--library` on the same folder fails with "This library is already open
 `--demo` starts the headless session with the procedurally generated demo library;
 `--compact` lists only the helper tools (see below). In connect mode the server starts even when
 the app is not running yet and connects on the first call (and reconnects if the app restarts).
+A request is sent again only when it never reached the app. If the connection drops after a request
+was sent but before its reply, the tool fails with "the outcome is unknown" and nothing is resent, so a
+command such as undo can't run twice: check the app's state before retrying.
 
 Logs go to stderr; stdout carries only protocol messages.
 
@@ -285,7 +288,7 @@ lightcraft-cli calibrate --max 300 ~/Pictures/2026   # camera colour profiles (d
 `app.export` (MCP `export` tool, `lightcraft-cli run`, the desktop app) takes `addToPhotos: true` and
 `photosAlbum` to hand the files it wrote to Apple Photos, into that album (a top-level album of exactly that
 name, made when missing). The result's `applePhotos` is the import job: `{job, running, requested, album}`
-plus `{imported, ids, warning?}`, `{error}` or `{skipped}` once Photos is done; the files are written either
+plus `{imported, ids, warning?}`, `{error}` or `{skipped}` (with `cancelled: true` when the export was cancelled) once Photos is done; the files are written either
 way. Headless (this server, `lightcraft-cli`) waits for Photos by default; the desktop app (connect mode)
 answers with the running job and `export.photosImports {job}` gives the outcome. `export.addToPhotos {paths,
 album?, wait?}` does the same for files already on disk (`wait` defaults to true headless, false in the desktop

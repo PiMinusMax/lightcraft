@@ -6,7 +6,7 @@ use lightcraft_geom::Orientation;
 use lightcraft_meta::Metadata;
 use lightcraft_raster::Rgb32f;
 use lightcraft_raster::resample::{Filter, fit};
-use lightcraft_raw::ColorData;
+use lightcraft_raw::{ColorData, Opcode};
 
 use crate::{MergeError, Result};
 
@@ -36,6 +36,10 @@ pub struct Frame {
     pub metadata: Metadata,
     /// Raw files: the source's `BaselineExposure` (EV), carried into the output.
     pub baseline_exposure: f64,
+    /// Raw files: the lens corrections the source applies (`WarpRectilinear`, `WarpRectilinear2`, `FixVignetteRadial`,
+    /// in order), re-expressed for `image` (the default crop, not yet turned), for the merged DNG to carry. Empty for
+    /// other sources and once [`Frame::orient`] has turned the pixels.
+    pub lens: Vec<Opcode>,
 }
 
 impl Frame {
@@ -53,6 +57,7 @@ impl Frame {
             orientation: Orientation::Normal,
             metadata: Metadata::default(),
             baseline_exposure: 0.0,
+            lens: Vec::new(),
         }
     }
 
@@ -63,11 +68,12 @@ impl Frame {
         self.image.height
     }
 
-    /// Apply the display orientation to the pixels.
+    /// Apply the display orientation to the pixels. The lens corrections, written for the unturned pixels, are dropped.
     pub fn orient(&mut self) {
         if self.orientation != Orientation::Normal {
             self.image = self.image.oriented(self.orientation);
             self.orientation = Orientation::Normal;
+            self.lens.clear();
         }
     }
 }
@@ -120,7 +126,21 @@ pub fn load_frame_with(bytes: &[u8], max_edge: Option<usize>, orient: bool, colo
     let exposure = exif_exposure(&metadata);
     if lightcraft_raw::probe(bytes).is_some() {
         let mut raw = lightcraft_raw::decode(bytes).map_err(|e| MergeError::Decode(e.to_string()))?;
-        // geometric lens corrections stay with the develop settings ("profile corrections")
+        // Lens corrections stay with the develop settings ("profile corrections"): frames are merged uncorrected, and
+        // the output DNG carries the reference frame's corrections, re-expressed for the default crop `develop` keeps.
+        // The DNG 1.6 skip rule is applied here, so no `WarpRectilinear2` is left optional.
+        let (aw, ah) = (raw.active_area.width, raw.active_area.height);
+        let crop = raw.develop_crop(aw, ah);
+        let lens = lightcraft_raw::opcodes::applied_ops(&raw.opcodes.list3)
+            .filter(|op| op.is_lens_correction())
+            .filter_map(|op| op.cropped(aw, ah, crop))
+            .map(|op| match op {
+                Opcode::WarpRectilinear2 { planes, center, reciprocal, .. } => {
+                    Opcode::WarpRectilinear2 { planes, center, reciprocal, optional: false }
+                }
+                op => op,
+            })
+            .collect();
         raw.opcodes.list3.retain(|op| !op.is_lens_correction());
         if let Some(color) = colour(&mut raw, bytes) {
             raw.color = color;
@@ -146,6 +166,7 @@ pub fn load_frame_with(bytes: &[u8], max_edge: Option<usize>, orient: bool, colo
             orientation: raw.orientation,
             metadata: if raw.metadata == Metadata::default() { metadata } else { raw.metadata.clone() },
             baseline_exposure: raw.color.baseline_exposure,
+            lens,
         };
         if f.exposure.is_none() {
             f.exposure = exif_exposure(&f.metadata);
@@ -176,6 +197,7 @@ pub fn load_frame_with(bytes: &[u8], max_edge: Option<usize>, orient: bool, colo
         orientation: Orientation::from_exif(d.orientation),
         metadata,
         baseline_exposure: 0.0,
+        lens: Vec::new(),
     };
     if orient {
         f.orient();
