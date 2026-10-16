@@ -147,7 +147,7 @@ pub fn legacy_to_kelvin(temp: f64, tint: f64, as_shot: (f64, f64)) -> (f64, f64)
 /// edited on a rendered photo or a raw without matrices never pass for Kelvin when pasted onto one that has them.
 pub fn normalize_wb(d: &mut DevelopSettings, info: &SourceInfo) {
     use lightcraft_develop::{WbMode, WbScale};
-    if !(info.raw && !info.relative_wb) {
+    if !info.raw || info.relative_wb {
         d.wb.scale = WbScale::Legacy;
         return;
     }
@@ -306,47 +306,78 @@ pub struct NrColor {
     pub t: f32,
 }
 
-/// Noise-reduction parameters at an output long edge of `out_long` px (see [`denoise`]).
-pub fn nr_params(s: &DevelopSettings, src_long: usize, out_long: usize) -> (Option<NrLum>, Option<NrColor>) {
+/// Output pixels per pixel of the original photo for an output of `px_per_long` pixels per unit
+/// of the long edge of an original `native_long` pixels long, at most 1 ([`crate::Plan::detail_scale`]).
+pub fn detail_scale(px_per_long: f64, native_long: usize) -> f32 {
+    let k = (px_per_long / native_long.max(1) as f64) as f32;
+    if k.is_finite() { k.clamp(0.0, 1.0) } else { 1.0 }
+}
+
+/// Smallest radius (px) noise reduction filters a preview with: [`gaussian`] makes no blur below
+/// about 0.58 px and one 3-px box from there ([`lightcraft_raster::blur::box_sigma`]).
+const NR_MIN_SIGMA: f32 = 1.0;
+
+/// Below this fade a preview's noise reduction is not drawn at all (less than 1 % of a 1-px blur).
+const NR_MIN_BLEND: f32 = 0.01;
+
+/// Radius and blend weight that stand in for a blur of `sigma` px: below [`NR_MIN_SIGMA`] the
+/// smallest blur the filter makes, blended in by the ratio of their variances, which keeps the
+/// smoothing's second moment (how much it softens the finest detail) that of `sigma`.
+fn nr_radius(sigma: f32) -> (f32, f32) {
+    if sigma >= NR_MIN_SIGMA {
+        return (sigma, 1.0);
+    }
+    let made = lightcraft_raster::blur::box_sigma(NR_MIN_SIGMA);
+    (NR_MIN_SIGMA, (sigma / made).powi(2).min(1.0))
+}
+
+/// Noise-reduction parameters at `scale` output pixels per pixel of the original
+/// ([`crate::Plan::detail_scale`]; see [`denoise`]). Noise lives at the original's pixels, so the
+/// radii are the full-size radii times `scale`, and the guided filter's `eps` (the variance it
+/// treats as noise) follows the noise variance, which averaging `1/scale × 1/scale` pixels into one
+/// multiplies by `scale²`. A radius below [`NR_MIN_SIGMA`] fades instead ([`nr_radius`]): previews look like
+/// the full-size render scaled down (issue #960). At `scale` 1 these are the full-size parameters.
+pub fn nr_params(s: &DevelopSettings, scale: f32) -> (Option<NrLum>, Option<NrColor>) {
     let lum = (s.detail.nr_luminance / 100.0) as f32;
     let col = (s.detail.nr_color / 100.0) as f32;
-    let scale = (out_long as f32 / src_long.max(1) as f32).clamp(0.05, 1.0);
-    let l = (lum > 0.0).then(|| {
+    let scale = if scale.is_finite() { scale.clamp(0.0, 1.0) } else { 1.0 };
+    let l = (lum > 0.0).then(|| nr_radius((1.0 + 2.5 * lum) * scale)).filter(|&(_, w)| w >= NR_MIN_BLEND).map(|(sigma, w)| {
         let detail = (s.detail.nr_detail / 100.0) as f32;
-        NrLum { sigma: (1.0 + 2.5 * lum) * scale.max(0.4), eps: 0.002 + lum * lum * 0.25 * (1.0 - 0.7 * detail), k: lum.sqrt() }
+        let eps = ((0.002 + lum * lum * 0.25 * (1.0 - 0.7 * detail)) * scale * scale).max(1e-7);
+        NrLum { sigma, eps, k: lum.sqrt() * w }
     });
-    let c = (col > 0.0).then(|| {
-        let sigma = (1.5 + 6.0 * col) * scale.max(0.35) * (1.0 + (s.detail.nr_color_smoothness / 100.0) as f32);
+    let smooth = 1.0 + (s.detail.nr_color_smoothness / 100.0) as f32;
+    let c = (col > 0.0).then(|| nr_radius((1.5 + 6.0 * col) * scale * smooth)).filter(|&(_, w)| w >= NR_MIN_BLEND).map(|(sigma, w)| {
         let keep = (s.detail.nr_color_detail / 100.0) as f32 * 0.5;
-        NrColor { sigma, t: col * (1.0 - keep) }
+        NrColor { sigma, t: col * (1.0 - keep) * w }
     });
     (l, c)
 }
 
 /// Noise reduction at output resolution: luminance via an edge-aware self-guided filter on
 /// log-luminance, colour by blurring chromaticity (rgb / Y) and re-applying the original luminance.
-/// Radii scale with how much the source was downsampled (preview noise is already averaged out).
+/// `scale`: output pixels per pixel of the original ([`nr_params`]).
 /// `lum_stats`: the statistics of the wavelet luminance NR from the whole frame (`None`: from `img`).
-pub fn denoise(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long: usize, lum_stats: Option<&crate::nrl::Stats>) {
-    let y = denoise_colour(img, s, src_long, out_long);
-    denoise_luminance(img, s, src_long, out_long, lum_stats, y);
+pub fn denoise(img: &mut Rgb32f, s: &DevelopSettings, scale: f32, lum_stats: Option<&crate::nrl::Stats>) {
+    let y = denoise_colour(img, s, scale);
+    denoise_luminance(img, s, scale, lum_stats, y);
 }
 
 /// Whether the luminance NR runs as the wavelet filter after the colour NR ([`denoise_luminance`])
 /// rather than as the old filter before it.
-pub fn wavelet_luminance_nr(s: &DevelopSettings, src_long: usize, out_long: usize) -> bool {
-    nr_params(s, src_long, out_long).0.is_some() && wavelet_luminance(s)
+pub fn wavelet_luminance_nr(s: &DevelopSettings, scale: f32) -> bool {
+    nr_params(s, scale).0.is_some() && wavelet_luminance(s)
 }
 
 /// The first part of [`denoise`]: everything but the wavelet luminance NR. Its result does not depend
 /// on Luminance, Detail and Contrast when [`wavelet_luminance_nr`] holds, so a render can keep it while
 /// those sliders move. When the joint colour NR ran and the wavelet luminance NR follows, the luminance
 /// of the result (that NR's input, made as the colour NR writes each row).
-pub fn denoise_colour(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, out_long: usize) -> Option<Plane> {
-    let (lum, col) = nr_params(s, src_long, out_long);
+pub fn denoise_colour(img: &mut Rgb32f, s: &DevelopSettings, scale: f32) -> Option<Plane> {
+    let (lum, col) = nr_params(s, scale);
     let w = img.width;
     // From process V4 the wavelet luminance NR runs after the colour NR, which leaves Y unchanged.
-    let new_lum = wavelet_luminance_nr(s, src_long, out_long);
+    let new_lum = wavelet_luminance_nr(s, scale);
     if let Some(nr) = lum.filter(|_| !new_lum) {
         let _t = crate::profiling().then(std::time::Instant::now);
         let l = img.map(log_lum);
@@ -364,7 +395,7 @@ pub fn denoise_colour(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, ou
         }
     }
     if col.is_some() && joint_colour_nr(s) {
-        let p = nrc_params(s, src_long, out_long)?;
+        let p = nrc_params(s, scale)?;
         return crate::nrc_joint::denoise(img, &p, (s.detail.nr_color_detail / 100.0) as f32, (s.detail.nr_color / 100.0) as f32, new_lum);
     } else if let Some(nr) = col {
         let _t = crate::profiling().then(std::time::Instant::now);
@@ -394,12 +425,11 @@ pub fn denoise_colour(img: &mut Rgb32f, s: &DevelopSettings, src_long: usize, ou
 pub fn denoise_luminance(
     img: &mut Rgb32f,
     s: &DevelopSettings,
-    src_long: usize,
-    out_long: usize,
+    scale: f32,
     lum_stats: Option<&crate::nrl::Stats>,
     y: Option<Plane>,
 ) {
-    if wavelet_luminance_nr(s, src_long, out_long) {
+    if wavelet_luminance_nr(s, scale) {
         let d = &s.detail;
         let p = crate::nrl::Params {
             amount: (d.nr_luminance / 100.0) as f32,
@@ -439,16 +469,16 @@ pub struct NrcParams {
     pub passes: Vec<NrcPass>,
 }
 
-/// The new colour noise reduction's parameters at an output long edge of `out_long` px, `None`
-/// when Color is 0.
-pub fn nrc_params(s: &DevelopSettings, src_long: usize, out_long: usize) -> Option<NrcParams> {
+/// The new colour noise reduction's parameters at `scale` output pixels per pixel of the original
+/// ([`crate::Plan::detail_scale`]), `None` when Color is 0.
+pub fn nrc_params(s: &DevelopSettings, scale: f32) -> Option<NrcParams> {
     let amount = (s.detail.nr_color / 100.0) as f32;
     if amount <= 0.0 {
         return None;
     }
     let detail = (s.detail.nr_color_detail / 100.0) as f32;
     let smooth = 1.0 + (s.detail.nr_color_smoothness / 100.0) as f32;
-    let scale = (out_long as f32 / src_long.max(1) as f32).clamp(0.05, 1.0);
+    let scale = if scale.is_finite() { scale.clamp(0.05, 1.0) } else { 1.0 };
     let sigma = (2.0 + 10.0 * amount) * smooth * scale;
     let k = 64.0 * amount * (1.5 - detail);
     // the coefficients vary over about sigma: a grid of sigma / 2 holds them
@@ -744,7 +774,7 @@ mod tests {
             let mut s = DevelopSettings { process: p.version(), ..Default::default() };
             s.detail.nr_color = 50.0;
             let mut o = img.clone();
-            denoise(&mut o, &s, w, w, None);
+            denoise(&mut o, &s, 1.0, None);
             o
         };
         let (v1, v2, v3) = (run(Process::V1), run(Process::V2), run(Process::V3));
@@ -754,7 +784,7 @@ mod tests {
         let mut s = DevelopSettings { process: Process::V3.version(), ..Default::default() };
         s.detail.nr_color = 50.0;
         let mut joint = img.clone();
-        let p = nrc_params(&s, w, w).expect("Color 50 has parameters");
+        let p = nrc_params(&s, 1.0).expect("Color 50 has parameters");
         crate::nrc_joint::denoise(&mut joint, &p, (s.detail.nr_color_detail / 100.0) as f32, 0.5, false);
         assert!(joint.data == v3.data, "V3 is the joint method");
     }
@@ -778,7 +808,7 @@ mod tests {
             let mut s = DevelopSettings { process: p.version(), ..Default::default() };
             s.detail.nr_luminance = 50.0;
             let mut o = img.clone();
-            denoise(&mut o, &s, w, w, None);
+            denoise(&mut o, &s, 1.0, None);
             o
         };
         let (v2, v3, v4) = (run(Process::V2), run(Process::V3), run(Process::V4));
@@ -826,7 +856,7 @@ mod tests {
                     let mut s = DevelopSettings::default();
                     s.detail.nr_color = nr;
                     let mut a = img.clone();
-                    denoise(&mut a, &s, w, w, None);
+                    denoise(&mut a, &s, 1.0, None);
                     let m = mean(&a);
                     let clipped0 = mean(&img.map(|p| p.map(|v| v.max(0.0))));
                     let sd = |im: &Rgb32f, mm: [f64; 3]| {
@@ -910,7 +940,7 @@ mod tests {
             let mut s = DevelopSettings::default();
             s.detail.nr_color = nr;
             let mut o = img.clone();
-            denoise(&mut o, &s, w, w, None);
+            denoise(&mut o, &s, 1.0, None);
             let px = |x: usize, y: usize| o.data[y * w + x];
             // edge: chroma error 1..8 px either side, relative to the step between the two colours
             let step = dist(chroma(red), chroma(green));
@@ -1098,7 +1128,7 @@ mod nr_tests {
         let (v0, m0) = var(&img);
         let mut s = DevelopSettings::default();
         s.detail.nr_luminance = 80.0;
-        denoise(&mut img, &s, 64, 64, None);
+        denoise(&mut img, &s, 1.0, None);
         let (v1, m1) = var(&img);
         assert!(v1 < v0 * 0.5, "{v0} -> {v1}");
         assert!((m1 - m0).abs() < 0.01);

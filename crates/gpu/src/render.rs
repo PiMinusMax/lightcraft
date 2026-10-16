@@ -676,7 +676,6 @@ pub fn render(
     lap("sample", &mut t, &mut cx);
 
     // 2. white balance, defringe, spots, noise reduction
-    let out_long = plan.frame.output_long(w, h);
     // kept as they are unless this render makes new ones (moving Exposure must not drop them)
     let mut pre_lum = cached.as_ref().and_then(|e| e.pre_lum.clone());
     let mut kept_stats = cached.as_ref().and_then(|e| e.lum_stats.clone());
@@ -688,7 +687,7 @@ pub fn render(
                 Some((_, b)) => b,
                 None => Arc::new(linear(&mut cx, &sampled, info, &plan, &mut host)),
             };
-            let wavelet = local::wavelet_luminance_nr(s, plan.src_long, out_long);
+            let wavelet = local::wavelet_luminance_nr(s, plan.detail_scale);
             let lin = if wavelet {
                 let stats = match cached.as_ref().and_then(|e| e.lum_stats.clone()).filter(|(k, _)| *k == plan.pre_key) {
                     Some((_, st)) => Some(st),
@@ -884,7 +883,7 @@ fn linear(cx: &mut Cx<'_>, sampled: &Buf, info: &SourceInfo, plan: &Plan<'_>, ho
 fn denoise(cx: &mut Cx<'_>, img: Buf, plan: &Plan<'_>) -> Buf {
     let (w, h) = (plan.w, plan.h);
     let n = w * h;
-    let (lum, col) = local::nr_params(&plan.settings, plan.src_long, plan.frame.output_long(w, h));
+    let (lum, col) = local::nr_params(&plan.settings, plan.detail_scale);
     let mut img = img;
     // the old luminance filter for edits before process V4 (the wavelet one runs after the colour NR)
     if let Some(nr) = lum.filter(|_| !local::wavelet_luminance(&plan.settings)) {
@@ -896,7 +895,7 @@ fn denoise(cx: &mut Cx<'_>, img: Buf, plan: &Plan<'_>) -> Buf {
         img = out;
     }
     if col.is_some() && local::joint_colour_nr(&plan.settings) {
-        let Some(p) = local::nrc_params(&plan.settings, plan.src_long, plan.frame.output_long(w, h)) else { return img };
+        let Some(p) = local::nrc_params(&plan.settings, plan.detail_scale) else { return img };
         let s = &plan.settings.detail;
         let (detail, amount) = ((s.nr_color_detail / 100.0) as f32, (s.nr_color / 100.0) as f32);
         if let Some(out) = color_nr_joint(cx, &img, w, h, &p, detail, amount) {
@@ -906,7 +905,7 @@ fn denoise(cx: &mut Cx<'_>, img: Buf, plan: &Plan<'_>) -> Buf {
         let mut host = cx.read_rgb(&img, w, h);
         let mut d = (*plan.settings).clone();
         d.detail.nr_luminance = 0.0;
-        local::denoise(&mut host, &d, plan.src_long, plan.frame.output_long(w, h), None);
+        local::denoise(&mut host, &d, plan.detail_scale, None);
         return cx.gpu.upload(rgb_words(&host));
     }
     if let Some(nr) = col {
@@ -1413,7 +1412,8 @@ fn masks(cx: &mut Cx<'_>, lin: &Buf, prep: &Prep, plan: &Plan<'_>, host: &mut Ho
                 }
                 MaskShape::Brush { strokes } => {
                     let dabs: Vec<_> = strokes.iter().map(|st| lightcraft_pipeline::masks::brush_dabs(st, frame, w, h)).collect();
-                    if dabs.iter().map(|d| d.dabs.len()).sum::<usize>() > MAX_DABS {
+                    // pen pressure varies radius and flow per dab, which the kernel doesn't take: the CPU rasterizes it
+                    if dabs.iter().map(|d| d.dabs.len()).sum::<usize>() > MAX_DABS || dabs.iter().any(|d| !d.pressure.is_empty()) {
                         None
                     } else if dabs.iter().any(|d| d.auto) {
                         // Auto Mask: stroke by stroke (each one refined before it's combined)

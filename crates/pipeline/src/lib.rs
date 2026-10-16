@@ -96,6 +96,11 @@ pub struct SourceInfo {
     /// The raw's own local tone mapping (DNG `ProfileGainTableMap`), rendered only when the
     /// photo's Profile option asks for it ([`local_tone`]).
     pub local_tone: Option<Arc<local_tone::LocalTone>>,
+    /// Long edge (px) of the original photo, when the source handed to the renderer is a smaller
+    /// copy of it (the app's thumbnail and preview levels); `None`: the source is the original.
+    /// Noise reduction sizes its radii in the original's pixels ([`Plan::detail_scale`]), so a
+    /// preview looks like the full-size render scaled down (issue #960).
+    pub native_long: Option<usize>,
 }
 
 impl Default for SourceInfo {
@@ -111,6 +116,7 @@ impl Default for SourceInfo {
             camera_tone: None,
             mattes: None,
             local_tone: None,
+            native_long: None,
         }
     }
 }
@@ -372,6 +378,9 @@ pub struct Plan<'a> {
     pub px_per_long: f64,
     /// Long edge of the source buffer (px).
     pub src_long: usize,
+    /// Output pixels per pixel of the original photo ([`SourceInfo::native_long`], else the source
+    /// buffer), at most 1: the scale of noise reduction, whose radii are in the original's pixels.
+    pub detail_scale: f32,
     /// Key of the resampled source (together with the source buffer's identity).
     pub geo: u64,
     /// Key of the white-balanced, retouched, denoised image (and of the planes computed from it).
@@ -420,6 +429,10 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
     let (full_w, full_h) = frame.fit(req.max_w, req.max_h);
     // sizes and scale are those of the whole output; a window only narrows what is drawn
     let px_per_long = frame.px_per_long(full_w);
+    let src_long = src.width.max(src.height);
+    // (an original reported smaller than the source is the source)
+    let native_long = info.native_long.unwrap_or(0).max(src_long).max(1);
+    let detail_scale = local::detail_scale(px_per_long, native_long);
     let mut fixed_air = None;
     let mut keep = None;
     let full = (frame.clone(), full_w, full_h);
@@ -437,7 +450,7 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
             // wavelet its coarsest level. Keep those reads outside the requested zoom window, just
             // as spot reads are.
             let joint = local::joint_colour_nr(s)
-                .then(|| local::nrc_params(s, src.width.max(src.height), frame.output_long(full_w, full_h)))
+                .then(|| local::nrc_params(s, detail_scale))
                 .flatten()
                 .map_or(0, |params| params.passes.last().map_or(0, |p| (6.0 * p.sigma).ceil() as usize).saturating_add(4));
             let lum = if s.detail.nr_luminance > 0.0 && local::wavelet_luminance(s) { nrl::halo() } else { 0 };
@@ -456,7 +469,6 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         }
         None => (frame, full_w, full_h),
     };
-    let src_long = src.width.max(src.height);
     let geo = hash_of((format!("{frame:?}"), w, h));
     let (wb_t, wb_tint) = local::effective_wb(info, s);
     let eyes = redeye::resolve(src, &s.red_eye, s.orientation, &frame, w, h, px_per_long);
@@ -473,6 +485,7 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         if local::wavelet_luminance(s) { [0; 3] } else { lum },
         [d.nr_color, d.nr_color_detail, d.nr_color_smoothness].map(f64::to_bits),
         src_long,
+        detail_scale.to_bits(),
     ));
     let pre_nr_key = hash_of((
         geo,
@@ -485,9 +498,29 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         local_tone::enabled(info, s),
         src_long,
     ));
-    let lin_key =
-        hash_of((pre_nr_key, [d.nr_luminance, d.nr_detail, d.nr_contrast, d.nr_color, d.nr_color_detail, d.nr_color_smoothness].map(f64::to_bits)));
-    Plan { settings, frame, w, h, px_per_long, src_long, geo, lin_key, pre_key, pre_nr_key, eyes, fixed_air, keep, mattes: info.mattes.clone(), full }
+    let lin_key = hash_of((
+        pre_nr_key,
+        [d.nr_luminance, d.nr_detail, d.nr_contrast, d.nr_color, d.nr_color_detail, d.nr_color_smoothness].map(f64::to_bits),
+        detail_scale.to_bits(),
+    ));
+    Plan {
+        settings,
+        frame,
+        w,
+        h,
+        px_per_long,
+        src_long,
+        detail_scale,
+        geo,
+        lin_key,
+        pre_key,
+        pre_nr_key,
+        eyes,
+        fixed_air,
+        keep,
+        mattes: info.mattes.clone(),
+        full,
+    }
 }
 
 /// The wavelet luminance NR's statistics, measured on fixed tiles of the whole frame (see
@@ -629,7 +662,7 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
         Src::Shared(a) => a,
     };
     let plan = plan(src_img, info, s, req);
-    let Plan { ref frame, w, h, px_per_long, src_long, geo, lin_key, .. } = plan;
+    let Plan { ref frame, w, h, px_per_long, detail_scale, geo, lin_key, .. } = plan;
     let s = &*plan.settings;
 
     let shared = match (&src, cache) {
@@ -643,7 +676,6 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
     };
     lap("sample", &mut t);
 
-    let out_long = frame.output_long(w, h);
     // kept as they are unless this render makes new ones (moving Exposure must not drop them)
     let mut pre_lum = cached.as_ref().and_then(|e| e.pre_lum.clone());
     let mut kept_stats = cached.as_ref().and_then(|e| e.lum_stats.clone());
@@ -653,7 +685,7 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
             // Without a cache the resampled buffer is ours: work on it in place.
             let mut img = Arc::unwrap_or_clone(sampled.clone());
             lin_cpu(&mut img, info, &plan);
-            local::denoise(&mut img, s, src_long, out_long, lum_stats(src_img, info, &plan).as_ref());
+            local::denoise(&mut img, s, detail_scale, lum_stats(src_img, info, &plan).as_ref());
             Arc::new(img)
         }
         None => {
@@ -665,11 +697,11 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
                 None => {
                     let mut img = (*sampled).clone();
                     lin_cpu(&mut img, info, &plan);
-                    let y = local::denoise_colour(&mut img, s, src_long, out_long);
+                    let y = local::denoise_colour(&mut img, s, detail_scale);
                     (Arc::new(img), y)
                 }
             };
-            let lin = if !local::wavelet_luminance_nr(s, src_long, out_long) {
+            let lin = if !local::wavelet_luminance_nr(s, detail_scale) {
                 pre.clone()
             } else {
                 let stats = match cached.as_ref().and_then(|e| e.lum_stats.clone()).filter(|(k, _)| *k == plan.pre_key) {
@@ -677,7 +709,7 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
                     None => lum_stats(src_img, info, &plan),
                 };
                 let mut img = (*pre).clone();
-                local::denoise_luminance(&mut img, s, src_long, out_long, stats.as_ref(), y);
+                local::denoise_luminance(&mut img, s, detail_scale, stats.as_ref(), y);
                 kept_stats = stats.map(|st| (plan.pre_key, st));
                 Arc::new(img)
             };
@@ -745,7 +777,11 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
 /// exposed scene colours, as [`MaskShape::ColorRange`](lightcraft_develop::MaskShape) compares
 /// them), averaged over 3 × 3 pixels of a render fitting `req`. `None` outside the image.
 pub fn color_range_sample(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, req: &RenderRequest, p: lightcraft_geom::Point) -> Option<[f64; 3]> {
-    let plan = plan(src, info, s, req);
+    // Pick from the same settings as the render: disabled panels contribute nothing, and an
+    // SDR preview of an HDR edit includes the SDR rendition's exposure offset.
+    let effective = s.effective();
+    let rendition = settings_for(&effective, req);
+    let plan = plan(src, info, &rendition, req);
     let mut img = plan.frame.sample(src, plan.w, plan.h);
     lin_cpu(&mut img, info, &plan);
     let o = plan.frame.norm_to_out(plan.w, plan.h).apply(p);
@@ -753,7 +789,7 @@ pub fn color_range_sample(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, 
     if cx < 0 || cy < 0 || cx >= plan.w as i64 || cy >= plan.h as i64 {
         return None;
     }
-    let gain = (s.light.exposure as f32).exp2();
+    let gain = (plan.settings.light.exposure as f32).exp2();
     let mut acc = [0f64; 3];
     let mut n = 0.0;
     for y in (cy - 1).max(0)..=(cy + 1).min(plan.h as i64 - 1) {
@@ -839,6 +875,8 @@ mod tests_geometry;
 mod tests_hdr;
 #[cfg(test)]
 mod tests_local;
+#[cfg(test)]
+mod tests_nr_scale;
 #[cfg(test)]
 mod tests_tone;
 #[cfg(test)]
