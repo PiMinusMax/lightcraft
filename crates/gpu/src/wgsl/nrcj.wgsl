@@ -319,10 +319,15 @@ fn nrcj_pilot(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgrou
         let vb = ub - mv;
         let tv = (va * va + vp * vp + vb * vb) / nv;
         let vvar = tv.x + tv.y + tv.z;
-        if (vh > max(4.0, 4.0 * vvar)) {
+        // the axis choice fades in between 0.8 and 1.25 times its bound (nrc_joint::pilot_pick)
+        let sv = smoothstep(0.8, 1.25, vh / max(4.0, 4.0 * vvar));
+        let sh = smoothstep(0.8, 1.25, vvar / max(4.0, 4.0 * vh));
+        if (sv >= 1.0) {
             out = mv;
-        } else if (vvar > max(4.0, 4.0 * vh)) {
+        } else if (sh >= 1.0) {
             out = mh;
+        } else {
+            out = out + (mv - out) * sv + (mh - out) * sh;
         }
     }
     dst[3u * i] = out.x;

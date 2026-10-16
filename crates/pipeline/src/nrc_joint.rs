@@ -140,26 +140,38 @@ fn fit_noise(samples: Vec<NoiseSample>) -> JointNoise {
         if pts.is_empty() {
             continue;
         }
-        // Seed from the darker half, then include all bands with a bounded influence for
-        // unexpectedly high residuals (foliage etc.). Refit rather than clamp the intercept.
-        let (mut a, mut b) = fit_nonneg_line(&pts[..pts.len().div_ceil(2)]);
-        for _ in 0..4 {
-            let weighted: Vec<_> = pts
-                .iter()
-                .filter_map(|&(y, v, w)| {
-                    let excess = v / (a * y + b).max(1e-14);
-                    (excess <= 4.0).then_some((y, v, w * (2.0 / excess.max(2.0)).powi(4)))
-                })
-                .collect();
-            if !weighted.is_empty() {
-                (a, b) = fit_nonneg_line(&weighted);
-                ymax[i] = weighted.iter().map(|p| p.0 as f32).fold(0.0, f32::max);
-            }
-        }
+        let (a, b, top) = robust_line(pts);
+        ymax[i] = top;
         model.alpha[i] = a as f32;
         model.beta[i] = (b as f32).max(1e-14);
     }
     JointNoise { model, ymax, tolerance: 1.0 }
+}
+
+/// The noise line `v = a·y + b` through the bands `(y, variance, weight)` and the brightest band it
+/// rests on. Seeded from the darker half, then all bands with a bounded influence for unexpectedly
+/// high residuals (foliage etc.); refit rather than clamp the intercept.
+pub(crate) fn robust_line(pts: &[(f64, f64, f64)]) -> (f64, f64, f32) {
+    let (mut a, mut b) = fit_nonneg_line(&pts[..pts.len().div_ceil(2)]);
+    let mut ymax = 0.0;
+    for _ in 0..4 {
+        // A band's weight fades to 0 between 4 and 5 times the fitted noise instead of dropping at
+        // 4: a band at the bound must not flip in or out with the last bits of the samples (the
+        // GPU's differ from the CPU's there), which moved the fit by a few percent.
+        let weighted: Vec<_> = pts
+            .iter()
+            .filter_map(|&(y, v, w)| {
+                let excess = v / (a * y + b).max(1e-14);
+                let fade = (5.0 - excess).clamp(0.0, 1.0);
+                (fade > 0.0).then_some((y, v, w * (2.0 / excess.max(2.0)).powi(4) * fade))
+            })
+            .collect();
+        if !weighted.is_empty() {
+            (a, b) = fit_nonneg_line(&weighted);
+            ymax = weighted.iter().map(|p| p.0 as f32).fold(0.0, f32::max);
+        }
+    }
+    (a, b, ymax)
 }
 
 /// Squared distance beyond the expected noise in a difference of two guide samples. A small
@@ -261,11 +273,7 @@ fn pilot(original: &Rgb32f, noise: &JointNoise) -> Planes {
                     };
                     let (mh, vh) = axis(l, r);
                     let (mv, vvar) = axis(u, d);
-                    if vh > 4.0f32.max(4.0 * vvar) {
-                        *o = mv;
-                    } else if vvar > 4.0f32.max(4.0 * vh) {
-                        *o = mh;
-                    }
+                    *o = pilot_pick(*o, mh, vh, mv, vvar);
                 }
             }
             for (((c, y), u), v) in out.iter().zip(ry.iter_mut()).zip(ru.iter_mut()).zip(rv.iter_mut()) {
@@ -274,6 +282,23 @@ fn pilot(original: &Rgb32f, noise: &JointNoise) -> Planes {
         },
     );
     planes
+}
+
+/// The pilot at one pixel from its isotropic blur `o`, the horizontal mean `mh` and noise-normalised
+/// variance `vh`, and the vertical ones `mv`, `vvar`: the mean along the clearly smoother axis where
+/// the other is more than 4 times as rough (and above 4), the blur where neither is. The choice fades
+/// in between 0.8 and 1.25 times that bound instead of switching at it, so a pixel near the bound
+/// takes nearly the same pilot when the noise model moves by a hair.
+pub(crate) fn pilot_pick(o: [f32; 3], mh: [f32; 3], vh: f32, mv: [f32; 3], vvar: f32) -> [f32; 3] {
+    let sv = smoothstep(0.8, 1.25, vh / 4.0f32.max(4.0 * vvar));
+    let sh = smoothstep(0.8, 1.25, vvar / 4.0f32.max(4.0 * vh));
+    if sv >= 1.0 {
+        mv
+    } else if sh >= 1.0 {
+        mh
+    } else {
+        std::array::from_fn(|i| o[i] + (mv[i] - o[i]) * sv + (mh[i] - o[i]) * sh)
+    }
 }
 
 /// The two chroma components `R − Y`, `B − Y`, or a pair of per-axis values (horizontal, vertical).
@@ -1012,6 +1037,42 @@ mod tests {
 
     /// The speck brake takes the colour out of a compact, isoluminant 2 × 2 speck (as demosaicing leaves
     /// them at high ISO), more at Color 100 than at 25, but leaves a coloured star (a luminance peak) alone.
+    #[test]
+    fn noise_line_does_not_jump_when_a_band_crosses_the_outlier_bound() {
+        // The luminance bands of a 640-px preview of demo scene 0 after luminance NR. Its band at
+        // 0.593 sat at 4 times the first fit: the CPU's samples put it just above, the GPU's just
+        // below, and the fits came out 2.6 % apart (CPU and GPU renders then differed by 10 levels).
+        let mut pts: Vec<(f64, f64, f64)> = [
+            (0.009, 5.028e-7),
+            (0.022, 1.554e-4),
+            (0.063, 1.459e-4),
+            (0.147, 9.728e-6),
+            (0.213, 2.701e-5),
+            (0.272, 5.077e-6),
+            (0.315, 3.236e-5),
+            (0.356, 2.531e-5),
+            (0.390, 5.329e-6),
+            (0.420, 4.924e-6),
+            (0.467, 5.453e-5),
+            (0.530, 1.823e-5),
+            (0.593, 0.0),
+            (0.648, 1.501e-8),
+            (0.667, 1.898e-8),
+            (0.996, 3.490e-7),
+        ]
+        .map(|(y, v)| (y, v, 5649.0))
+        .to_vec();
+        let (a, b) = fit_nonneg_line(&pts[..pts.len().div_ceil(2)]);
+        let bound = 4.0 * (a * 0.593 + b);
+        let mut fit = |k: f64| {
+            pts[12].1 = bound * k;
+            robust_line(&pts)
+        };
+        let (below, above) = (fit(1.0 - 1e-6), fit(1.0 + 1e-6));
+        assert!((below.1 / above.1 - 1.0).abs() < 1e-4, "{below:?} vs {above:?}");
+        assert!((below.0 - above.0).abs() <= 1e-4 * below.0.abs().max(1e-12), "{below:?} vs {above:?}");
+    }
+
     #[test]
     fn speck_brake_removes_compact_colour_specks_but_not_stars() {
         let dark = [0.004f32; 3];
