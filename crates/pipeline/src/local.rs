@@ -422,13 +422,7 @@ pub fn denoise_colour(img: &mut Rgb32f, s: &DevelopSettings, scale: f32) -> Opti
 
 /// The second part of [`denoise`]: the wavelet luminance NR (when [`wavelet_luminance_nr`]).
 /// `y`: the luminance of `img` when the caller has it ([`denoise_colour`]'s result), else it is computed.
-pub fn denoise_luminance(
-    img: &mut Rgb32f,
-    s: &DevelopSettings,
-    scale: f32,
-    lum_stats: Option<&crate::nrl::Stats>,
-    y: Option<Plane>,
-) {
+pub fn denoise_luminance(img: &mut Rgb32f, s: &DevelopSettings, scale: f32, lum_stats: Option<&crate::nrl::Stats>, y: Option<Plane>) {
     if wavelet_luminance_nr(s, scale) {
         let d = &s.detail;
         let p = crate::nrl::Params {

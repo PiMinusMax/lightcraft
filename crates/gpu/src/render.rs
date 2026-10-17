@@ -273,18 +273,16 @@ pub(crate) fn gaussian_owned(cx: &mut Cx<'_>, src: Buf, w: usize, h: usize, nc: 
     let Some(radii) = lightcraft_raster::blur::radii_for(sigma, w, h) else {
         return src;
     };
-    let passes: Vec<(&str, usize)> = radii.iter().map(|r| ("box_h", *r)).chain(radii.iter().map(|r| ("box_v", *r))).filter(|p| p.1 > 0).collect();
+    let passes: Vec<(bool, usize)> = radii.iter().map(|r| (true, *r)).chain(radii.iter().map(|r| (false, *r))).filter(|p| p.1 > 0).collect();
     if passes.is_empty() {
         return src;
     }
-    // pass i reads bufs[(i + 1) % 2] and writes bufs[i % 2]: the first reads the source
+    // pass i reads bufs[(i + 1) % 2] and writes bufs[i % 2]: the first reads the source. The passes
+    // go through `box_pass`, as `gaussian`'s do, so both dispatch the box kernels alike.
     let bufs = [cx.gpu.buffer(w * h * nc), src];
-    for (i, (k, r)) in passes.iter().enumerate() {
-        let chunk = (2 * r + 1).clamp(CHUNK, 128);
-        let groups = if *k == "box_h" { groups2(w.div_ceil(chunk), h, [64, 4]) } else { groups2(w, h.div_ceil(chunk), [64, 4]) };
-        let p = [w as u32, h as u32, nc as u32, *r as u32, chunk as u32];
+    for (i, (horizontal, r)) in passes.iter().enumerate() {
         let (out, prev) = (&bufs[i % 2], &bufs[(i + 1) % 2]);
-        cx.run(k, &p, &[Some(prev), Some(out)], groups);
+        box_pass(cx, *horizontal, prev, out, (w, h), nc, *r);
     }
     let last = (passes.len() - 1) % 2;
     let [a, b] = bufs;
@@ -1580,6 +1578,29 @@ mod tests {
 
     /// The blur against `lightcraft_raster::blur::gaussian`: widths that do and don't fill the last
     /// workgroup, windows wider than the image, and 1, 2 (as two planes) and 3 channels.
+    #[test]
+    fn gaussian_owned_matches_gaussian() {
+        // gaussian_owned once dispatched box_h one thread per chunk of columns after box_h had become
+        // one thread per pixel: only the first w / chunk columns were blurred (the wavelet luminance NR's
+        // coarse levels then differed from the CPU by up to 0.15).
+        let Some(gpu) = crate::device() else { return };
+        let _scope = crate::ctx::RenderScope::new(gpu);
+        let v = |x: usize, y: usize, c: usize| ((x * 7 + y * 13 + c * 5) % 17) as f32 / 16.0 + if x % 61 < 3 { 2.0 } else { 0.0 };
+        for (w, h) in [(200, 150), (1000, 5), (5, 40)] {
+            for sigma in [0.8f32, 2.0, 4.5, 30.0] {
+                for nc in [1, 3] {
+                    let words: Vec<f32> = (0..w * h * nc).map(|i| v((i / nc) % w, (i / nc) / w, i % nc)).collect();
+                    let mut cx = Cx::new(gpu);
+                    let src = gpu.upload(&words);
+                    let want = gaussian(&mut cx, &src, w, h, nc, sigma);
+                    let got = gaussian_owned(&mut cx, src, w, h, nc, sigma);
+                    let (want, got): (Vec<f32>, Vec<f32>) = (cx.read(&want, w * h * nc), cx.read(&got, w * h * nc));
+                    assert_eq!(want, got, "{w}×{h} nc={nc} sigma={sigma}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn gaussian_matches_cpu() {
         use lightcraft_raster::blur;
