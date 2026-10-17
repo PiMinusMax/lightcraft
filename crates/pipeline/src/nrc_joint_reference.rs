@@ -1,5 +1,7 @@
-//! TEST ONLY: the joint colour NR as of 8b89526d, kept unchanged as the reference the optimised
-//! `nrc_joint` must reproduce bit for bit.
+//! TEST ONLY: the joint colour NR as of 8b89526d, kept as the reference the optimised `nrc_joint`
+//! must reproduce bit for bit. Changed since only where `nrc_joint` changed its result on purpose:
+//! the noise line's outlier bands fade out (`nrc_joint::robust_line`) and the pilot's axis choice
+//! fades in (`nrc_joint::pilot_pick`).
 //!
 //! Linear colour NR with a fixed, denoised joint guide. Strength controls the spatial scale;
 //! noise-normalized guide distances control which neighbours can exchange colour. Both chroma
@@ -11,7 +13,7 @@ use lightcraft_raster::{Rgb32f, blur::gaussian, resample::Filter};
 
 use crate::{
     for_rows,
-    local::{NrcNoise, NrcParams, fit_nonneg_line},
+    local::{NrcNoise, NrcParams},
 };
 
 #[derive(Debug)]
@@ -104,20 +106,8 @@ fn noise_model(img: &Rgb32f) -> JointNoise {
         }
         // Seed from the darker half, then include all bands with a bounded influence for
         // unexpectedly high residuals (foliage etc.). Refit rather than clamp the intercept.
-        let (mut a, mut b) = fit_nonneg_line(&pts[..pts.len().div_ceil(2)]);
-        for _ in 0..4 {
-            let weighted: Vec<_> = pts
-                .iter()
-                .filter_map(|&(y, v, w)| {
-                    let excess = v / (a * y + b).max(1e-14);
-                    (excess <= 4.0).then_some((y, v, w * (2.0 / excess.max(2.0)).powi(4)))
-                })
-                .collect();
-            if !weighted.is_empty() {
-                (a, b) = fit_nonneg_line(&weighted);
-                ymax[i] = weighted.iter().map(|p| p.0 as f32).fold(0.0, f32::max);
-            }
-        }
+        let (a, b, top) = crate::nrc_joint::robust_line(pts);
+        ymax[i] = top;
         model.alpha[i] = a as f32;
         model.beta[i] = (b as f32).max(1e-14);
     }
@@ -165,11 +155,7 @@ fn pilot(original: &Rgb32f, noise: &JointNoise) -> Rgb32f {
                     })
                     .sum::<f32>();
             }
-            if variances[0] > 4.0f32.max(4.0 * variances[1]) {
-                *out = means[1];
-            } else if variances[1] > 4.0f32.max(4.0 * variances[0]) {
-                *out = means[0];
-            }
+            *out = crate::nrc_joint::pilot_pick(*out, means[0], variances[0], means[1], variances[1]);
         }
     });
     guide
