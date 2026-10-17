@@ -18,12 +18,14 @@ pub const LEVELS: usize = 5;
 /// Levels with a robust (median) local energy; coarser levels average.
 pub const ROBUST_LEVELS: usize = 2;
 
-/// The sliders, 0–1.
+/// The sliders, 0–1, and the scale of the image filtered.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Params {
     pub amount: f32,
     pub detail: f32,
     pub contrast: f32,
+    /// Output pixels per pixel of the original (`Plan::detail_scale`, 1 at full size; see [`threshold`]).
+    pub scale: f32,
 }
 
 /// Gaussian window of the local energy of coarse level `j` (px).
@@ -45,12 +47,39 @@ pub fn halo() -> usize {
 /// flattens towards 100, which would otherwise take fine texture. Detail lowers the threshold on the
 /// fine levels (Amount 50: 16–51 % noise left), Contrast on the coarse ones (coarse noise and faint coarse
 /// texture kept from about half to most).
-pub fn threshold(p: &Params, j: usize) -> f32 {
+fn full_size_threshold(p: &Params, j: usize) -> f32 {
     let a = p.amount.clamp(0.0, 1.0);
     let t = (2.0 * a * (1.0 - 0.25 * a)).sqrt();
     let f = if j < ROBUST_LEVELS { 1.25 - 0.5 * p.detail.clamp(0.0, 1.0) } else { 1.0 - 0.8 * p.contrast.clamp(0.0, 1.0) };
     t * f
 }
+
+/// Threshold of level `j` of an image at `p.scale` output pixels per pixel of the original. Noise
+/// lives at the original's pixels (issue #960): level `j` of a preview holds the detail of level
+/// `j + log2(1 / scale)` of the original, so it takes that level's full-size threshold (interpolated
+/// between whole levels), and a level coarser than the original's coarsest is left alone, as the
+/// full-size render leaves it. A preview then looks like the full-size render scaled down; at
+/// scale 1 (and down to a fifth) this is [`full_size_threshold`] of the shifted level.
+pub fn threshold(p: &Params, j: usize) -> f32 {
+    let scale = if p.scale.is_finite() && p.scale > 0.0 { p.scale.min(1.0) } else { 1.0 };
+    let at = |l: usize| if l < LEVELS { full_size_threshold(p, l) } else { 0.0 };
+    let m = j as f32 + (1.0 / scale).log2();
+    if m >= LEVELS as f32 {
+        return 0.0;
+    }
+    let lo = m.floor();
+    let frac = m - lo;
+    let lo = lo as usize;
+    let t = if frac <= 0.0 { at(lo) } else { at(lo) * (1.0 - frac) + at(lo + 1) * frac };
+    // Below a fifth of the original's size the noise is mostly averaged away and what the frame's
+    // flattest blocks measure as noise is largely texture: the thresholds fade out towards a 20th, so
+    // a grid thumbnail is never further from the full-size render scaled down than one without
+    // noise reduction (as the guided filter's radii fade below a pixel, `local::nr_params`).
+    t * ((scale - PREVIEW_FADE.0) / (PREVIEW_FADE.1 - PREVIEW_FADE.0)).clamp(0.0, 1.0)
+}
+
+/// Scales between which [`threshold`] fades from none to full.
+const PREVIEW_FADE: (f32, f32) = (0.05, 0.2);
 
 const B3: [f32; 5] = [1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0];
 
@@ -600,7 +629,7 @@ mod tests {
     fn reduces_noise_in_shadows_and_keeps_the_mean() {
         let (_, mut img) = noisy(256, 128, |x, _| if x < 128 { 0.004 } else { 0.2 }, |y| (0.002 * y + 4e-6).sqrt());
         let before = [stats(&img, 16..112, 16..112), stats(&img, 144..240, 16..112)];
-        denoise(&mut img, &Params { amount: 0.5, detail: 0.5, contrast: 0.0 }, None);
+        denoise(&mut img, &Params { amount: 0.5, detail: 0.5, contrast: 0.0, scale: 1.0 }, None);
         let after = [stats(&img, 16..112, 16..112), stats(&img, 144..240, 16..112)];
         for (b, a) in before.iter().zip(&after) {
             assert!(a.1 < 0.5 * b.1, "noise {} -> {}", b.1, a.1);
@@ -613,7 +642,7 @@ mod tests {
     fn black_pixels_are_not_kept_black() {
         let (_, mut img) = noisy(64, 64, |_, _| 0.05, |y| (0.002 * y + 4e-6).sqrt());
         img.data[32 * 64 + 32] = [0.0; 3];
-        denoise(&mut img, &Params { amount: 1.0, detail: 0.5, contrast: 0.0 }, None);
+        denoise(&mut img, &Params { amount: 1.0, detail: 0.5, contrast: 0.0, scale: 1.0 }, None);
         assert!(luminance_2020(img.data[32 * 64 + 32]) > 0.01);
     }
 
@@ -623,7 +652,7 @@ mod tests {
         let (_, img) = noisy(128, 128, |x, y| 0.1 + 0.02 * ((x / 16 + y / 16) % 2) as f32, |y| (0.002 * y + 4e-6).sqrt());
         let run = |detail, contrast| {
             let mut a = img.clone();
-            denoise(&mut a, &Params { amount: 0.5, detail, contrast }, None);
+            denoise(&mut a, &Params { amount: 0.5, detail, contrast, scale: 1.0 }, None);
             a
         };
         let base = run(0.5, 0.0);
@@ -636,7 +665,7 @@ mod tests {
     fn scaling_the_input_scales_the_output() {
         let src = lightcraft_scenes::demo_library()[0].render(200, 133);
         let g = 2f32.powf(1.3);
-        let p = Params { amount: 0.3, detail: 0.5, contrast: 0.0 };
+        let p = Params { amount: 0.3, detail: 0.5, contrast: 0.0, scale: 1.0 };
         let mut a = src.clone();
         denoise(&mut a, &p, None);
         let mut b = src.map(|c| c.map(|v| v * g));
@@ -690,7 +719,7 @@ mod tests {
 
     fn run(img: &Rgb32f, amount: f32, stats: Option<&Stats>) -> Rgb32f {
         let mut out = img.clone();
-        denoise(&mut out, &Params { amount, detail: 0.5, contrast: 0.0 }, stats);
+        denoise(&mut out, &Params { amount, detail: 0.5, contrast: 0.0, scale: 1.0 }, stats);
         out
     }
 
@@ -1059,13 +1088,13 @@ mod tests {
             )
         };
         for a in [0.1f32, 0.25, 0.5, 0.75, 1.0] {
-            eprintln!("H amount {a} (detail 0.5, contrast 0): {}", measure(Params { amount: a, detail: 0.5, contrast: 0.0 }));
+            eprintln!("H amount {a} (detail 0.5, contrast 0): {}", measure(Params { amount: a, detail: 0.5, contrast: 0.0, scale: 1.0 }));
         }
         for d in [0.0f32, 0.25, 0.75, 1.0] {
-            eprintln!("H detail {d} (amount 0.5, contrast 0): {}", measure(Params { amount: 0.5, detail: d, contrast: 0.0 }));
+            eprintln!("H detail {d} (amount 0.5, contrast 0): {}", measure(Params { amount: 0.5, detail: d, contrast: 0.0, scale: 1.0 }));
         }
         for c in [0.25f32, 0.5, 0.75, 1.0] {
-            eprintln!("H contrast {c} (amount 0.5, detail 0.5): {}", measure(Params { amount: 0.5, detail: 0.5, contrast: c }));
+            eprintln!("H contrast {c} (amount 0.5, detail 0.5): {}", measure(Params { amount: 0.5, detail: 0.5, contrast: c, scale: 1.0 }));
         }
         // E: dark colour: chroma differences kept
         for base in [[0.001f32, 0.02, 0.04], [0.0005, 0.004, 0.01]] {

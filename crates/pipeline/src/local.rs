@@ -429,6 +429,7 @@ pub fn denoise_luminance(img: &mut Rgb32f, s: &DevelopSettings, scale: f32, lum_
             amount: (d.nr_luminance / 100.0) as f32,
             detail: (d.nr_detail / 100.0) as f32,
             contrast: (d.nr_contrast / 100.0) as f32,
+            scale,
         };
         crate::nrl::denoise_y(img, &p, lum_stats, y);
     }
@@ -809,7 +810,7 @@ mod tests {
         assert!(v2.data == v3.data, "V2 and V3 share main's luminance NR");
         assert!(v3.data != v4.data, "V4 takes the wavelet luminance NR");
         let mut wavelet = img.clone();
-        crate::nrl::denoise(&mut wavelet, &crate::nrl::Params { amount: 0.5, detail: 0.5, contrast: 0.0 }, None);
+        crate::nrl::denoise(&mut wavelet, &crate::nrl::Params { amount: 0.5, detail: 0.5, contrast: 0.0, scale: 1.0 }, None);
         assert!(wavelet.data == v4.data, "V4 is the wavelet filter");
     }
 

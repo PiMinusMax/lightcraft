@@ -691,7 +691,7 @@ pub fn render(
                     Some((_, st)) => Some(st),
                     None => lightcraft_pipeline::lum_stats(src, info, &plan),
                 };
-                let out = luminance_nr(&mut cx, &pre, w, h, s, stats.as_ref());
+                let out = luminance_nr(&mut cx, &pre, w, h, s, plan.detail_scale, stats.as_ref());
                 kept_stats = stats.map(|st| (plan.pre_key, st));
                 Arc::new(out)
             } else {
@@ -931,10 +931,15 @@ fn nrl_smooth(cx: &mut Cx<'_>, src: &Buf, w: usize, h: usize, j: usize) -> Buf {
 /// of `img`, with the whole frame's `stats` (measured on the CPU, `lightcraft_pipeline::lum_stats`). The
 /// same steps as the CPU: Y and its à trous levels, each level's detail formed in place of the finer
 /// approximation and shrunk into the change of Y, which is then added to R, G and B.
-fn luminance_nr(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, s: &DevelopSettings, stats: Option<&nrl::Stats>) -> Buf {
+fn luminance_nr(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, s: &DevelopSettings, scale: f32, stats: Option<&nrl::Stats>) -> Buf {
     let n = w * h;
     let d = &s.detail;
-    let p = nrl::Params { amount: (d.nr_luminance / 100.0) as f32, detail: (d.nr_detail / 100.0) as f32, contrast: (d.nr_contrast / 100.0) as f32 };
+    let p = nrl::Params {
+        amount: (d.nr_luminance / 100.0) as f32,
+        detail: (d.nr_detail / 100.0) as f32,
+        contrast: (d.nr_contrast / 100.0) as f32,
+        scale,
+    };
     let Some(stats) = stats.filter(|_| w >= 8 && h >= 8 && p.amount > 0.0) else {
         return cx.copy(img);
     };

@@ -26,6 +26,17 @@ V1 to V3 keep the guided filter on log luminance. Issue #1129 has the measuremen
 - **Order and cache.** It runs after the colour NR, which hands it the luminance of its result. The stage cache
   keeps the image before it and its statistics (`Plan::pre_key`), so its sliders do not redo the colour NR.
 
+## Previews
+
+Noise lives at the original's pixels (issue #960), so a preview at `scale` output pixels per original pixel
+(`Plan::detail_scale`) filters its level `j` with the threshold of the original's level `j + log2(1 / scale)`,
+interpolated between whole levels; a level coarser than the original's coarsest is left alone, as the full-size
+render leaves it (`nrl::threshold`). Below a fifth of the original's size the thresholds fade out towards a
+20th: the noise is mostly averaged away there, and what the flattest blocks measure is largely texture. A
+preview is then as close to the full-size render scaled down as with the guided filter, relative to how much
+each removes (`tests_nr_scale::wavelet_luminance_nr_preview_matches_full_size_scaled_down`: 0.31 of the
+difference without noise reduction at 0.5, 0.38 at 0.33, never above 1).
+
 ## Local checks
 
 ```sh
