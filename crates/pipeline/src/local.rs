@@ -356,13 +356,14 @@ pub fn nr_params(s: &DevelopSettings, scale: f32) -> (Option<NrLum>, Option<NrCo
 
 /// Noise reduction at output resolution: luminance via an edge-aware self-guided filter on
 /// log-luminance, colour by blurring chromaticity (rgb / Y) and re-applying the original luminance.
-/// `scale`: output pixels per pixel of the original ([`nr_params`]).
-pub fn denoise(img: &mut Rgb32f, s: &DevelopSettings, scale: f32) {
+/// `scale`: output pixels per pixel of the original ([`nr_params`]). `colour_noise`: the whole
+/// frame's noise model for the joint colour NR ([`crate::colour_noise`]; `None`: measured on `img`).
+pub fn denoise(img: &mut Rgb32f, s: &DevelopSettings, scale: f32, colour_noise: Option<&crate::nrc_joint::JointNoise>) {
     let (lum, col) = nr_params(s, scale);
     if col.is_some() && joint_colour_nr(s) {
         apply_nr(img, lum, None);
         if let Some(p) = nrc_params(s, scale) {
-            crate::nrc_joint::denoise(img, &p, (s.detail.nr_color_detail / 100.0) as f32, (s.detail.nr_color / 100.0) as f32);
+            crate::nrc_joint::denoise(img, &p, (s.detail.nr_color_detail / 100.0) as f32, (s.detail.nr_color / 100.0) as f32, colour_noise);
         }
         return;
     }
@@ -738,7 +739,7 @@ mod tests {
             let mut s = DevelopSettings { process: p.version(), ..Default::default() };
             s.detail.nr_color = 50.0;
             let mut o = img.clone();
-            denoise(&mut o, &s, 1.0);
+            denoise(&mut o, &s, 1.0, None);
             o
         };
         let (v1, v2, v3) = (run(Process::V1), run(Process::V2), run(Process::V3));
@@ -749,7 +750,7 @@ mod tests {
         s.detail.nr_color = 50.0;
         let mut joint = img.clone();
         let p = nrc_params(&s, 1.0).expect("Color 50 has parameters");
-        crate::nrc_joint::denoise(&mut joint, &p, (s.detail.nr_color_detail / 100.0) as f32, 0.5);
+        crate::nrc_joint::denoise(&mut joint, &p, (s.detail.nr_color_detail / 100.0) as f32, 0.5, None);
         assert!(joint.data == v3.data, "V3 is the joint method");
     }
 
@@ -790,7 +791,7 @@ mod tests {
                     let mut s = DevelopSettings::default();
                     s.detail.nr_color = nr;
                     let mut a = img.clone();
-                    denoise(&mut a, &s, 1.0);
+                    denoise(&mut a, &s, 1.0, None);
                     let m = mean(&a);
                     let clipped0 = mean(&img.map(|p| p.map(|v| v.max(0.0))));
                     let sd = |im: &Rgb32f, mm: [f64; 3]| {
@@ -874,7 +875,7 @@ mod tests {
             let mut s = DevelopSettings::default();
             s.detail.nr_color = nr;
             let mut o = img.clone();
-            denoise(&mut o, &s, 1.0);
+            denoise(&mut o, &s, 1.0, None);
             let px = |x: usize, y: usize| o.data[y * w + x];
             // edge: chroma error 1..8 px either side, relative to the step between the two colours
             let step = dist(chroma(red), chroma(green));
@@ -1062,7 +1063,7 @@ mod nr_tests {
         let (v0, m0) = var(&img);
         let mut s = DevelopSettings::default();
         s.detail.nr_luminance = 80.0;
-        denoise(&mut img, &s, 1.0);
+        denoise(&mut img, &s, 1.0, None);
         let (v1, m1) = var(&img);
         assert!(v1 < v0 * 0.5, "{v0} -> {v1}");
         assert!((m1 - m0).abs() < 0.01);

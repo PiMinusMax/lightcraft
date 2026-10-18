@@ -35,10 +35,18 @@ fn yuv(c: [f32; 3]) -> [f32; 3] {
 /// Luminance bands with predominantly texture may only lower their weight in the fit: they
 /// cannot force a shadow scene's extrapolated highlight noise arbitrarily high.
 fn noise_model(img: &Rgb32f) -> JointNoise {
-    let mut samples = Vec::new();
-    let stride = noise_sample_stride(img.len());
     if img.width < 3 || img.height < 3 {
         return JointNoise { model: NrcNoise { alpha: [0.0; 3], beta: [1e-14; 3] }, ymax: [0.0; 3], tolerance: 1.0 };
+    }
+    let mut samples = Vec::new();
+    push_samples(img, noise_sample_stride(img.len()), &mut samples);
+    noise_from_samples(samples)
+}
+
+/// The noise samples of `img` (Y, R-Y, B-Y) every `stride` pixels, in pixel order (see [`noise_model`]).
+fn push_samples(img: &Rgb32f, stride: usize, samples: &mut Vec<NoiseSample>) {
+    if img.width < 3 || img.height < 3 {
+        return;
     }
     for index in (0..img.len()).step_by(stride) {
         let (x, y) = (index % img.width, index / img.width);
@@ -67,6 +75,37 @@ fn noise_model(img: &Rgb32f) -> JointNoise {
         if valid {
             samples.push((brightness.max(0.0), residual));
         }
+    }
+}
+
+/// Side of the tiles a frame's noise is measured on (px).
+const TILE: usize = 128;
+/// Tiles per row and column: many small tiles follow a mostly dark frame's few bright parts better
+/// than a few large ones.
+const GRID: usize = 12;
+
+/// The windows of a `full_w × full_h` frame its noise is measured on: the whole frame up to the
+/// area of `GRID²` tiles, else `GRID × GRID` tiles spread evenly over it. A windowed render sees
+/// only part of the frame; measured on these, every window of it gets the same noise model.
+pub fn tiles(full_w: usize, full_h: usize) -> Vec<crate::PixelWindow> {
+    if full_w * full_h <= GRID * GRID * TILE * TILE || full_w < 2 * TILE || full_h < 2 * TILE {
+        return vec![crate::PixelWindow { x: 0, y: 0, w: full_w, h: full_h }];
+    }
+    let at = |n: usize, k: usize| ((n - TILE) as f64 * (k as f64 + 0.5) / GRID as f64).round() as usize;
+    (0..GRID * GRID).map(|k| crate::PixelWindow { x: at(full_w, k % GRID), y: at(full_h, k / GRID), w: TILE, h: TILE }).collect()
+}
+
+/// The noise model of `tiles` of a frame (linear RGB at output scale, see [`tiles`]): the same
+/// measurement as for a whole image, with the samples of all tiles together.
+pub fn noise_of_tiles(tiles: &[Rgb32f]) -> JointNoise {
+    let transformed: Vec<Rgb32f> = tiles.iter().map(|t| t.map(yuv)).collect();
+    let stride = noise_sample_stride(transformed.iter().map(Rgb32f::len).sum());
+    let mut samples = Vec::new();
+    for t in &transformed {
+        push_samples(t, stride, &mut samples);
+    }
+    if samples.is_empty() {
+        return JointNoise { model: NrcNoise { alpha: [0.0; 3], beta: [1e-14; 3] }, ymax: [0.0; 3], tolerance: 1.0 };
     }
     noise_from_samples(samples)
 }
@@ -538,13 +577,19 @@ fn despeck(img: &mut Rgb32f, noise: &JointNoise, brake: SpeckBrake) {
     }
 }
 
-pub(crate) fn denoise(img: &mut Rgb32f, params: &NrcParams, detail: f32, amount: f32) {
+/// `noise`: the frame's noise model (see [`noise_of_tiles`]); `None` measures it on `img`.
+pub(crate) fn denoise(img: &mut Rgb32f, params: &NrcParams, detail: f32, amount: f32, noise: Option<&JointNoise>) {
     // Continuous ramp from zero; from the ordinary default Color=25 onward the spatial
     // scale controls the extra smoothing. Noise calibration and edge decisions stay fixed.
-    denoise_grid(img, params, 1, detail, strength(amount), speck_brake(amount));
+    denoise_with(img, params, 1, detail, strength(amount), speck_brake(amount), noise);
 }
 
+#[cfg(test)]
 fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, strength: f32, brake: SpeckBrake) {
+    denoise_with(img, params, step, detail, strength, brake, None);
+}
+
+fn denoise_with(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, strength: f32, brake: SpeckBrake, noise: Option<&JointNoise>) {
     if img.is_empty() || strength <= 0.0 {
         return;
     }
@@ -590,7 +635,10 @@ fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, 
     };
     let mut tt = start;
     lap("transform", &mut tt);
-    let mut noise = noise_model(&original);
+    let mut noise = match noise {
+        Some(n) => *n,
+        None => noise_model(&original),
+    };
     lap("noise model", &mut tt);
     noise.tolerance = tolerance(detail);
     despeck(&mut original, &noise, brake);

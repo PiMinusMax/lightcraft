@@ -9,6 +9,7 @@ use lightcraft_geom::Orientation;
 use lightcraft_pipeline::finish::{FinishParams, MASK_TERMS, mask_terms};
 use lightcraft_pipeline::geometry::SampleMode;
 use lightcraft_pipeline::local::plane_at;
+use lightcraft_pipeline::nrc_joint::JointNoise;
 use lightcraft_pipeline::{Plan, RenderRequest, Rendered, SourceInfo, local};
 use lightcraft_raster::resample::Filter;
 use lightcraft_raster::{Histogram, Plane, Rgb32f, Rgba8};
@@ -33,6 +34,8 @@ struct Entry {
     geo: u64,
     sampled: Arc<Buf>,
     lin: Option<(u64, Arc<Buf>)>,
+    /// The joint colour NR's noise model of the whole frame, keyed by `Plan::noise_key`.
+    colour_noise: Option<(u64, JointNoise)>,
     planes: Planes,
 }
 
@@ -644,9 +647,15 @@ pub fn render(
     lap("sample", &mut t, &mut cx);
 
     // 2. white balance, defringe, spots, noise reduction
+    let mut colour_noise = cached.as_ref().and_then(|e| e.colour_noise).filter(|(k, _)| *k == plan.noise_key);
     let lin = match cached.as_ref().and_then(|e| e.lin.clone()).filter(|(k, _)| *k == plan.lin_key) {
         Some((_, b)) => b,
-        None => Arc::new(linear(&mut cx, &sampled, info, &plan, &mut host)),
+        None => {
+            if colour_noise.is_none() {
+                colour_noise = lightcraft_pipeline::colour_noise(src, info, &plan).map(|n| (plan.noise_key, n));
+            }
+            Arc::new(linear(&mut cx, &sampled, info, &plan, &mut host, colour_noise.as_ref().map(|c| &c.1)))
+        }
     };
     lap("wb/nr", &mut t, &mut cx);
 
@@ -662,7 +671,7 @@ pub fn render(
     }
     lap("planes", &mut t, &mut cx);
     if let Some(c) = stages {
-        c.put(Entry { src: src.clone(), geo: plan.geo, sampled, lin: Some((plan.lin_key, lin.clone())), planes });
+        c.put(Entry { src: src.clone(), geo: plan.geo, sampled, lin: Some((plan.lin_key, lin.clone())), colour_noise, planes });
     }
 
     // 4. masks
@@ -788,8 +797,8 @@ fn unwritten(data: &[[u8; 4]]) -> usize {
     data.chunks(4096).filter(|c| c.iter().fold(255u8, |a, p| a & p[3]) != 255).map(|c| c.iter().filter(|p| p[3] != 255).count()).sum()
 }
 
-/// The white-balanced, retouched, denoised image.
-fn linear(cx: &mut Cx<'_>, sampled: &Buf, info: &SourceInfo, plan: &Plan<'_>, host: &mut Host) -> Buf {
+/// The white-balanced, retouched, denoised image (`colour_noise`: see `denoise`).
+fn linear(cx: &mut Cx<'_>, sampled: &Buf, info: &SourceInfo, plan: &Plan<'_>, host: &mut Host, colour_noise: Option<&JointNoise>) -> Buf {
     let (w, h) = (plan.w, plan.h);
     let n = w * h;
     let s = &*plan.settings;
@@ -817,11 +826,12 @@ fn linear(cx: &mut Cx<'_>, sampled: &Buf, info: &SourceInfo, plan: &Plan<'_>, ho
             eyed
         }
     };
-    denoise(cx, img, plan)
+    denoise(cx, img, plan, colour_noise)
 }
 
-/// Noise reduction (`local::denoise`).
-fn denoise(cx: &mut Cx<'_>, img: Buf, plan: &Plan<'_>) -> Buf {
+/// Noise reduction (`local::denoise`). `colour_noise`: the whole frame's noise model for the joint colour
+/// NR (`lightcraft_pipeline::colour_noise`); `None`: measured on `img`.
+fn denoise(cx: &mut Cx<'_>, img: Buf, plan: &Plan<'_>, colour_noise: Option<&JointNoise>) -> Buf {
     let (w, h) = (plan.w, plan.h);
     let n = w * h;
     let (lum, col) = local::nr_params(&plan.settings, plan.detail_scale);
@@ -838,14 +848,14 @@ fn denoise(cx: &mut Cx<'_>, img: Buf, plan: &Plan<'_>) -> Buf {
         let Some(p) = local::nrc_params(&plan.settings, plan.detail_scale) else { return img };
         let s = &plan.settings.detail;
         let (detail, amount) = ((s.nr_color_detail / 100.0) as f32, (s.nr_color / 100.0) as f32);
-        if let Some(out) = color_nr_joint(cx, &img, w, h, &p, detail, amount) {
+        if let Some(out) = color_nr_joint(cx, &img, w, h, &p, detail, amount, colour_noise) {
             return out;
         }
         // too small for the noise samples, or not even one band fits the device: this step on the CPU
         let mut host = cx.read_rgb(&img, w, h);
         let mut d = (*plan.settings).clone();
         d.detail.nr_luminance = 0.0;
-        local::denoise(&mut host, &d, plan.detail_scale);
+        local::denoise(&mut host, &d, plan.detail_scale, colour_noise);
         return cx.gpu.upload(rgb_words(&host));
     }
     if let Some(nr) = col {
@@ -902,9 +912,19 @@ fn band_budget_from(free: u64, pooled: u64, renders: usize) -> usize {
 /// The joint colour noise reduction (`lightcraft_pipeline::nrc_joint`) on the GPU, the same steps as the
 /// CPU: only the noise samples are read back (the noise model is fitted on the CPU, by the same code).
 /// Large images are filtered in horizontal bands whose halo covers every step's reach, so each kept pixel
-/// gets the whole-image result; the noise model is the whole image's. `None` when the image is too small
-/// for the noise samples (the caller falls back to the CPU).
-fn color_nr_joint(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, p: &local::NrcParams, detail: f32, amount: f32) -> Option<Buf> {
+/// gets the whole-image result; the noise model is the whole image's, or `frame_noise` (the whole frame's,
+/// for a window). `None` when the image is too small for the noise samples (the caller falls back to the CPU).
+#[allow(clippy::too_many_arguments)]
+fn color_nr_joint(
+    cx: &mut Cx<'_>,
+    img: &Buf,
+    w: usize,
+    h: usize,
+    p: &local::NrcParams,
+    detail: f32,
+    amount: f32,
+    frame_noise: Option<&JointNoise>,
+) -> Option<Buf> {
     use lightcraft_pipeline::nrc_joint;
     let strength = nrc_joint::strength(amount);
     let brake = nrc_joint::speck_brake(amount);
@@ -916,27 +936,32 @@ fn color_nr_joint(cx: &mut Cx<'_>, img: &Buf, w: usize, h: usize, p: &local::Nrc
     }
     let n = w * h;
     let started = profiling().then(std::time::Instant::now);
-    // noise samples of the whole image: same pixels as the CPU, fitted by the same code
-    let stride = nrc_joint::noise_sample_stride(n);
-    let count = n.div_ceil(stride);
-    let smp = cx.gpu.buffer(11 * count);
-    nrcj(cx, "nrcj_samples", count, &[count as u32, w as u32, h as u32, stride as u32], img, None, &smp);
-    let raw: Vec<f32> = cx.read(&smp, 11 * count);
-    drop(smp);
-    if let Some(t) = started {
-        eprintln!("  gpu joint samples + read: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
-    }
-    let samples: Vec<nrc_joint::NoiseSample> = raw
-        .as_chunks::<11>()
-        .0
-        .iter()
-        .filter(|s| s[0] == 1.0 && s.iter().all(|v| v.is_finite()))
-        .map(|s| (s[1], [[s[2], s[3], s[4]], [s[5], s[6], s[7]], [s[8], s[9], s[10]]]))
-        .collect();
-    let mut noise = nrc_joint::noise_from_samples(samples);
+    let mut noise = match frame_noise {
+        Some(noise) => *noise,
+        None => {
+            // noise samples of the whole image: same pixels as the CPU, fitted by the same code
+            let stride = nrc_joint::noise_sample_stride(n);
+            let count = n.div_ceil(stride);
+            let smp = cx.gpu.buffer(11 * count);
+            nrcj(cx, "nrcj_samples", count, &[count as u32, w as u32, h as u32, stride as u32], img, None, &smp);
+            let raw: Vec<f32> = cx.read(&smp, 11 * count);
+            drop(smp);
+            if let Some(t) = started {
+                eprintln!("  gpu joint samples + read: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+            }
+            let samples: Vec<nrc_joint::NoiseSample> = raw
+                .as_chunks::<11>()
+                .0
+                .iter()
+                .filter(|s| s[0] == 1.0 && s.iter().all(|v| v.is_finite()))
+                .map(|s| (s[1], [[s[2], s[3], s[4]], [s[5], s[6], s[7]], [s[8], s[9], s[10]]]))
+                .collect();
+            nrc_joint::noise_from_samples(samples)
+        }
+    };
     noise.tolerance = nrc_joint::tolerance(detail);
     if let Some(t) = started {
-        eprintln!("  gpu joint noise model: {:.1} ms ({count} samples)", t.elapsed().as_secs_f64() * 1e3);
+        eprintln!("  gpu joint noise model: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
     }
     let sigma = p.passes.last().map_or(0.0, |q| q.sigma);
     let plan = nrc_joint::scale_plan(sigma, w, h);
