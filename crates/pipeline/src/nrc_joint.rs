@@ -47,6 +47,18 @@ pub(crate) fn noise_model_of(img: &Rgb32f, transform: impl Fn([f32; 3]) -> [f32;
     noise_from_samples(noise_samples_of(img, noise_sample_stride(img.len()), transform))
 }
 
+/// The noise model of `tiles` of a frame (linear RGB at output scale, see `nrl::tiles`): the same
+/// measurement as for a whole image, with the samples of all tiles together. A windowed render sees
+/// only part of the frame; measured on these, every window of it gets the same noise model.
+pub fn noise_of_tiles(tiles: &[Rgb32f]) -> JointNoise {
+    let stride = noise_sample_stride(tiles.iter().map(Rgb32f::len).sum());
+    let samples: Vec<NoiseSample> = tiles.iter().flat_map(|t| noise_samples_of(t, stride, yuv)).collect();
+    if samples.is_empty() {
+        return JointNoise { model: NrcNoise { alpha: [0.0; 3], beta: [1e-14; 3] }, ymax: [0.0; 3], tolerance: 1.0 };
+    }
+    noise_from_samples(samples)
+}
+
 /// The noise samples of [`noise_model_of`] at every `stride`-th pixel of `img` (none for images
 /// smaller than 3 × 3).
 pub(crate) fn noise_samples_of(img: &Rgb32f, stride: usize, transform: impl Fn([f32; 3]) -> [f32; 3]) -> Vec<NoiseSample> {
@@ -554,16 +566,17 @@ fn despeck(img: &mut Rgb32f, noise: &JointNoise, brake: SpeckBrake) {
 
 /// Joint colour NR of `img` in place; with `want_y`, also the luminance (`luminance_2020`) of the result,
 /// computed row by row as each row is written (the luminance NR's input, without another pass).
-/// `None` when nothing was done or `want_y` is false.
-pub(crate) fn denoise(img: &mut Rgb32f, params: &NrcParams, detail: f32, amount: f32, want_y: bool) -> Option<Plane> {
+/// `None` when nothing was done or `want_y` is false. `noise`: the frame's noise model (see
+/// [`noise_of_tiles`]); `None` measures it on `img`.
+pub(crate) fn denoise(img: &mut Rgb32f, params: &NrcParams, detail: f32, amount: f32, want_y: bool, noise: Option<&JointNoise>) -> Option<Plane> {
     // Continuous ramp from zero; from the ordinary default Color=25 onward the spatial
     // scale controls the extra smoothing. Noise calibration and edge decisions stay fixed.
-    denoise_grid_y(img, params, 1, detail, strength(amount), speck_brake(amount), want_y)
+    denoise_grid_y(img, params, 1, detail, strength(amount), speck_brake(amount), want_y, noise)
 }
 
 #[cfg(test)]
 fn denoise_grid(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, strength: f32, brake: SpeckBrake) {
-    denoise_grid_y(img, params, step, detail, strength, brake, false);
+    denoise_grid_y(img, params, step, detail, strength, brake, false, None);
 }
 
 /// Each row of `img` through `f`, and with `y` the row's luminance after it.
@@ -581,7 +594,17 @@ fn rows_with_y(img: &mut Rgb32f, y: Option<&mut Plane>, f: impl Fn(usize, &mut [
     }
 }
 
-fn denoise_grid_y(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32, strength: f32, brake: SpeckBrake, want_y: bool) -> Option<Plane> {
+#[allow(clippy::too_many_arguments)]
+fn denoise_grid_y(
+    img: &mut Rgb32f,
+    params: &NrcParams,
+    step: usize,
+    detail: f32,
+    strength: f32,
+    brake: SpeckBrake,
+    want_y: bool,
+    noise: Option<&JointNoise>,
+) -> Option<Plane> {
     if img.is_empty() || strength <= 0.0 {
         return None;
     }
@@ -627,7 +650,10 @@ fn denoise_grid_y(img: &mut Rgb32f, params: &NrcParams, step: usize, detail: f32
     };
     let mut tt = start;
     lap("transform", &mut tt);
-    let mut noise = noise_model(&original);
+    let mut noise = match noise {
+        Some(n) => *n,
+        None => noise_model(&original),
+    };
     lap("noise model", &mut tt);
     noise.tolerance = tolerance(detail);
     despeck(&mut original, &noise, brake);
@@ -1156,7 +1182,7 @@ mod tests {
         for step in [1usize, 2] {
             let mut img = noisy(&clean, 0x2545_f491_4f6c_dd1d, 0.006);
             let mut plain = img.clone();
-            let y = denoise_grid_y(&mut img, &params(step), step, 0.5, 1.0, speck_brake(1.0), true);
+            let y = denoise_grid_y(&mut img, &params(step), step, 0.5, 1.0, speck_brake(1.0), true, None);
             denoise_grid(&mut plain, &params(step), step, 0.5, 1.0, speck_brake(1.0));
             assert!(img.data == plain.data, "step {step}: the image changed");
             let y = y.expect("luminance");

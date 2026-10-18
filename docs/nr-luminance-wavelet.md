@@ -14,7 +14,7 @@ V1 to V3 keep the guided filter on log luminance. Issue #1129 has the measuremen
   line or edge is supported along its own direction and an isolated speck is not. On the coarse levels a Gaussian
   mean of `d²`.
 - **Noise model** (`nrl::stats`), measured on fixed tiles of the whole frame (`nrl::tiles`, the same for every
-  window): each level's energy in blocks, the low tail of the block energies (texture and edges only raise a block),
+  window; the joint colour NR measures its noise model on the same tiles, made once per render): each level's energy in blocks, the low tail of the block energies (texture and edges only raise a block),
   `var(Y) = α·Y + β` fitted at level 0, each level's gain relative to it. Relative to white noise, a level may not
   carry more than all coarser ones (a texture bump) nor more than twice the next finer one (content at the coarse
   scales of a small preview).

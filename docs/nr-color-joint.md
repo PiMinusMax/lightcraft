@@ -35,6 +35,17 @@ of the method, including the square-root and per-channel variants it replaced, i
   px at full size, scaled with the output).
 - Windowed 8-bit renders request extra surrounding pixels for the diffusion's spatial
   dependencies. The existing window/full-frame comparison retains its original tolerance.
+- The noise model belongs to the whole frame, not to the pixels a render holds
+  (`lightcraft_pipeline::colour_noise`). A frame larger than 12 × 12 tiles of 128 px is measured
+  on the tiles the luminance NR's statistics use (`nrl::tiles`, made once for both), resampled,
+  tone-mapped, white-balanced and, before process V4, luminance-denoised like the frame (retouching
+  and defringe are left out); a smaller frame rendered whole is measured on itself, a window of it on
+  the whole frame. So a loupe window is filtered like the same pixels of the full render or the export
+  (`joint_colour_nr_measures_the_noise_of_the_whole_frame`). The model is kept in the stage cache:
+  moving a colour slider does not measure again.
+- The stage cache keys the denoised image (and the image before the luminance NR) by the filters in
+  use, so a change of process (Update to Current Process, undo) never reuses another filter's result
+  (`a_process_change_does_not_reuse_the_other_noise_filters`).
 
 ## Local checks
 

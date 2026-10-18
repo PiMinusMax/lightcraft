@@ -358,8 +358,16 @@ pub fn nr_params(s: &DevelopSettings, scale: f32) -> (Option<NrLum>, Option<NrCo
 /// log-luminance, colour by blurring chromaticity (rgb / Y) and re-applying the original luminance.
 /// `scale`: output pixels per pixel of the original ([`nr_params`]).
 /// `lum_stats`: the statistics of the wavelet luminance NR from the whole frame (`None`: from `img`).
-pub fn denoise(img: &mut Rgb32f, s: &DevelopSettings, scale: f32, lum_stats: Option<&crate::nrl::Stats>) {
-    let y = denoise_colour(img, s, scale);
+/// `colour_noise`: the joint colour NR's noise model of the whole frame ([`crate::colour_noise`];
+/// `None`: measured on `img`).
+pub fn denoise(
+    img: &mut Rgb32f,
+    s: &DevelopSettings,
+    scale: f32,
+    lum_stats: Option<&crate::nrl::Stats>,
+    colour_noise: Option<&crate::nrc_joint::JointNoise>,
+) {
+    let y = denoise_colour(img, s, scale, colour_noise);
     denoise_luminance(img, s, scale, lum_stats, y);
 }
 
@@ -369,34 +377,47 @@ pub fn wavelet_luminance_nr(s: &DevelopSettings, scale: f32) -> bool {
     nr_params(s, scale).0.is_some() && wavelet_luminance(s)
 }
 
+/// The luminance NR that runs before the colour NR: main's guided filter on log luminance, unless the
+/// wavelet luminance NR runs after the colour NR instead ([`wavelet_luminance_nr`]).
+pub fn luminance_before_colour(img: &mut Rgb32f, s: &DevelopSettings, scale: f32) {
+    let Some(nr) = nr_params(s, scale).0.filter(|_| !wavelet_luminance_nr(s, scale)) else { return };
+    let w = img.width;
+    let _t = crate::profiling().then(std::time::Instant::now);
+    let l = img.map(log_lum);
+    let f = guided(&l, nr.sigma, nr.eps);
+    for_rows(&mut img.data, w, |y, row| {
+        for (x, p) in row.iter_mut().enumerate() {
+            let i = y * w + x;
+            let d = (f.data[i] - l.data[i]) * nr.k;
+            let g = d.exp2();
+            *p = p.map(|v| v * g);
+        }
+    });
+    if let Some(t) = _t {
+        eprintln!("    nr luminance: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+    }
+}
+
 /// The first part of [`denoise`]: everything but the wavelet luminance NR. Its result does not depend
 /// on Luminance, Detail and Contrast when [`wavelet_luminance_nr`] holds, so a render can keep it while
 /// those sliders move. When the joint colour NR ran and the wavelet luminance NR follows, the luminance
-/// of the result (that NR's input, made as the colour NR writes each row).
-pub fn denoise_colour(img: &mut Rgb32f, s: &DevelopSettings, scale: f32) -> Option<Plane> {
-    let (lum, col) = nr_params(s, scale);
+/// of the result (that NR's input, made as the colour NR writes each row). `colour_noise`: see [`denoise`].
+pub fn denoise_colour(img: &mut Rgb32f, s: &DevelopSettings, scale: f32, colour_noise: Option<&crate::nrc_joint::JointNoise>) -> Option<Plane> {
+    let (_, col) = nr_params(s, scale);
     let w = img.width;
     // From process V4 the wavelet luminance NR runs after the colour NR, which leaves Y unchanged.
     let new_lum = wavelet_luminance_nr(s, scale);
-    if let Some(nr) = lum.filter(|_| !new_lum) {
-        let _t = crate::profiling().then(std::time::Instant::now);
-        let l = img.map(log_lum);
-        let f = guided(&l, nr.sigma, nr.eps);
-        for_rows(&mut img.data, w, |y, row| {
-            for (x, p) in row.iter_mut().enumerate() {
-                let i = y * w + x;
-                let d = (f.data[i] - l.data[i]) * nr.k;
-                let g = d.exp2();
-                *p = p.map(|v| v * g);
-            }
-        });
-        if let Some(t) = _t {
-            eprintln!("    nr luminance: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
-        }
-    }
+    luminance_before_colour(img, s, scale);
     if col.is_some() && joint_colour_nr(s) {
         let p = nrc_params(s, scale)?;
-        return crate::nrc_joint::denoise(img, &p, (s.detail.nr_color_detail / 100.0) as f32, (s.detail.nr_color / 100.0) as f32, new_lum);
+        return crate::nrc_joint::denoise(
+            img,
+            &p,
+            (s.detail.nr_color_detail / 100.0) as f32,
+            (s.detail.nr_color / 100.0) as f32,
+            new_lum,
+            colour_noise,
+        );
     } else if let Some(nr) = col {
         let _t = crate::profiling().then(std::time::Instant::now);
         let chroma = img.map(|c| {
@@ -769,7 +790,7 @@ mod tests {
             let mut s = DevelopSettings { process: p.version(), ..Default::default() };
             s.detail.nr_color = 50.0;
             let mut o = img.clone();
-            denoise(&mut o, &s, 1.0, None);
+            denoise(&mut o, &s, 1.0, None, None);
             o
         };
         let (v1, v2, v3) = (run(Process::V1), run(Process::V2), run(Process::V3));
@@ -780,7 +801,7 @@ mod tests {
         s.detail.nr_color = 50.0;
         let mut joint = img.clone();
         let p = nrc_params(&s, 1.0).expect("Color 50 has parameters");
-        crate::nrc_joint::denoise(&mut joint, &p, (s.detail.nr_color_detail / 100.0) as f32, 0.5, false);
+        crate::nrc_joint::denoise(&mut joint, &p, (s.detail.nr_color_detail / 100.0) as f32, 0.5, false, None);
         assert!(joint.data == v3.data, "V3 is the joint method");
     }
 
@@ -803,7 +824,7 @@ mod tests {
             let mut s = DevelopSettings { process: p.version(), ..Default::default() };
             s.detail.nr_luminance = 50.0;
             let mut o = img.clone();
-            denoise(&mut o, &s, 1.0, None);
+            denoise(&mut o, &s, 1.0, None, None);
             o
         };
         let (v2, v3, v4) = (run(Process::V2), run(Process::V3), run(Process::V4));
@@ -851,7 +872,7 @@ mod tests {
                     let mut s = DevelopSettings::default();
                     s.detail.nr_color = nr;
                     let mut a = img.clone();
-                    denoise(&mut a, &s, 1.0, None);
+                    denoise(&mut a, &s, 1.0, None, None);
                     let m = mean(&a);
                     let clipped0 = mean(&img.map(|p| p.map(|v| v.max(0.0))));
                     let sd = |im: &Rgb32f, mm: [f64; 3]| {
@@ -935,7 +956,7 @@ mod tests {
             let mut s = DevelopSettings::default();
             s.detail.nr_color = nr;
             let mut o = img.clone();
-            denoise(&mut o, &s, 1.0, None);
+            denoise(&mut o, &s, 1.0, None, None);
             let px = |x: usize, y: usize| o.data[y * w + x];
             // edge: chroma error 1..8 px either side, relative to the step between the two colours
             let step = dist(chroma(red), chroma(green));
@@ -1123,7 +1144,7 @@ mod nr_tests {
         let (v0, m0) = var(&img);
         let mut s = DevelopSettings::default();
         s.detail.nr_luminance = 80.0;
-        denoise(&mut img, &s, 1.0, None);
+        denoise(&mut img, &s, 1.0, None, None);
         let (v1, m1) = var(&img);
         assert!(v1 < v0 * 0.5, "{v0} -> {v1}");
         assert!((m1 - m0).abs() < 0.01);
