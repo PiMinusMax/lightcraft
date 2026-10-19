@@ -449,18 +449,18 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
                 let (pw, ph) = (((full_w as f64 * k).round() as usize).max(1), ((full_h as f64 * k).round() as usize).max(1));
                 fixed_air = Some(local::frame_airlight(src, info, s, &frame, pw, ph));
             }
-            // (spots grow the rendered window; only 8-bit renders are cut back to the request)
+            // (spots grow the rendered window of 8-bit renders; a grown window is cut back to the request)
             let mut work = if req.depth == OutputDepth::U8 { spots::window_for_reads(s, &frame, full_w, full_h, px_per_long, win) } else { win };
             // The joint diffusion reads a chain of neighbours across its scales, the luminance
             // wavelet its coarsest level. Keep those reads outside the requested zoom window, just
-            // as spot reads are.
+            // as spot reads are, at every depth.
             let joint = local::joint_colour_nr(s)
                 .then(|| local::nrc_params(s, detail_scale))
                 .flatten()
                 .map_or(0, |params| params.passes.last().map_or(0, |p| (6.0 * p.sigma).ceil() as usize).saturating_add(4));
             let lum = if s.detail.nr_luminance > 0.0 && local::wavelet_luminance(s) { nrl::halo() } else { 0 };
             let halo = joint.max(lum);
-            if req.depth == OutputDepth::U8 && halo > 0 {
+            if halo > 0 {
                 let x = work.x.saturating_sub(halo);
                 let y = work.y.saturating_sub(halo);
                 let right = work.x.saturating_add(work.w).saturating_add(halo).min(full_w);
@@ -820,6 +820,10 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
     }
     if req.depth != OutputDepth::U8 {
         let deep = finish::finish_deep(&prep, s, frame, info, req.space, req.depth, req.proof);
+        let deep = match plan.keep {
+            Some(k) => deep.crop(k.x, k.y, k.w, k.h),
+            None => deep,
+        };
         let image = deep.to_rgba8();
         let histogram = Histogram::of_srgb8(&image);
         lap("finish (deep)", &mut t);

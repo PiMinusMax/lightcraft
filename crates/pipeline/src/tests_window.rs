@@ -468,3 +468,29 @@ fn joint_colour_nr_measures_the_noise_of_the_whole_frame() {
         }
     }
 }
+
+// Given a 16-bit or float render of a window with the joint colour and wavelet luminance NR, then
+// its edges are the whole render's too: the window is grown by the filters' reach and cut back
+#[test]
+fn a_deep_window_with_noise_reduction_matches_the_whole_render() {
+    use crate::OutputDepth;
+    use lightcraft_develop::Process;
+    let (w, h, win) = (768, 128, PixelWindow { x: 600, y: 32, w: 96, h: 64 });
+    let src = crate::tests::colour_noise_scene(w, h, w * 2 / 3);
+    for depth in [OutputDepth::U16, OutputDepth::F32Linear] {
+        for (process, lum) in [(Process::V3, 0.0), (Process::LATEST, 30.0)] {
+            let mut s = DevelopSettings { process: process.version(), ..Default::default() };
+            s.detail.nr_color = 25.0;
+            s.detail.nr_color_smoothness = 0.0;
+            s.detail.nr_luminance = lum;
+            let req = RenderRequest { depth, ..RenderRequest::fit(w, h) };
+            let deep = |req: &RenderRequest| render(&src, &SourceInfo::default(), &s, req).deep.map(|d| d.to_rgba8());
+            let (Some(f), Some(part)) = (deep(&req), deep(&RenderRequest { window: Some(win), ..req })) else {
+                panic!("{depth:?}: no deep image");
+            };
+            assert_eq!((part.width, part.height), (win.w, win.h), "{depth:?}: the window's own size");
+            let (max, mean) = compare_inset(&f, &part, win, 0);
+            assert!(max <= 1 && mean <= 0.01, "{depth:?} {process:?} lum {lum}: max {max}, mean {mean:.3}");
+        }
+    }
+}

@@ -1067,10 +1067,12 @@ const VRAM_RESERVE: u64 = 640 << 20;
 /// fixed 2 GB. Tests set it with `Fault::BandBudget`. Comes with the [`BANDS`] lock: the caller holds it
 /// until its bands are done, so no other render plans from the same free memory meanwhile.
 fn band_budget(cx: &Cx<'_>, what: &str) -> (usize, std::sync::MutexGuard<'static, ()>) {
+    // asked before the lock: the first question for a device waits for the driver
+    let free = crate::vram::free_bytes(&cx.gpu.info);
     let lock = BANDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let fixed = BAND_BUDGET.get();
     let renders = RENDERS.load(std::sync::atomic::Ordering::Relaxed);
-    let measured = crate::vram::free_bytes(&cx.gpu.info).map(|free| band_budget_from(free, crate::ctx::memory().pooled, renders));
+    let measured = free.map(|free| band_budget_from(free, crate::ctx::memory().pooled, renders));
     let budget = fixed.or(measured).unwrap_or(2048 << 20);
     if profiling() {
         let source = if fixed.is_some() {
