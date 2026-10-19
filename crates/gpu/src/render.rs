@@ -975,10 +975,12 @@ fn color_nr_joint(
     // speck brake and the guide run). The budget for both together is `band_budget_from` the device memory
     // free right now (where the driver can be asked, `crate::vram`); else a fixed 2 GB. One band plan at a
     // time (`BANDS`), held until the bands are done. PROTOTYPE: `NRV2_GPU_BAND_MB` overrides it.
+    // (free memory asked before the lock: the first question for a device waits for the driver)
+    let free = crate::vram::free_bytes(&cx.gpu.info);
     let _bands = BANDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let fixed = std::env::var("NRV2_GPU_BAND_MB").ok().and_then(|v| v.parse::<usize>().ok()).map(|mb| mb << 20);
     let renders = RENDERS.load(std::sync::atomic::Ordering::Relaxed);
-    let measured = crate::vram::free_bytes(&cx.gpu.info).map(|free| band_budget_from(free, crate::ctx::memory().pooled, renders));
+    let measured = free.map(|free| band_budget_from(free, crate::ctx::memory().pooled, renders));
     let budget = fixed.or(measured).unwrap_or(2048 << 20);
     if profiling() {
         eprintln!(

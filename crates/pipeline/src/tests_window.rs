@@ -425,3 +425,25 @@ fn joint_colour_nr_measures_the_noise_of_the_whole_frame() {
         assert!(max <= 2 && mean <= 0.1, "{w}×{h}: max {max}, mean {mean:.3}");
     }
 }
+
+// Given a 16-bit or float render of a window with the joint colour NR, then its edges are the whole
+// render's too: the window is grown by the filter's reach and cut back
+#[test]
+fn a_deep_window_with_colour_noise_reduction_matches_the_whole_render() {
+    use crate::OutputDepth;
+    let (w, h, win) = (768, 128, PixelWindow { x: 600, y: 32, w: 96, h: 64 });
+    let src = crate::tests::colour_noise_scene(w, h, w * 2 / 3);
+    let mut s = DevelopSettings::default();
+    s.detail.nr_color = 25.0;
+    s.detail.nr_color_smoothness = 0.0;
+    for depth in [OutputDepth::U16, OutputDepth::F32Linear] {
+        let req = RenderRequest { depth, ..RenderRequest::fit(w, h) };
+        let deep = |req: &RenderRequest| render(&src, &SourceInfo::default(), &s, req).deep.map(|d| d.to_rgba8());
+        let (Some(f), Some(part)) = (deep(&req), deep(&RenderRequest { window: Some(win), ..req })) else {
+            panic!("{depth:?}: no deep image");
+        };
+        assert_eq!((part.width, part.height), (win.w, win.h), "{depth:?}: the window's own size");
+        let (max, mean) = compare_inset(&f, &part, win, 0);
+        assert!(max <= 1 && mean <= 0.01, "{depth:?}: max {max}, mean {mean:.3}");
+    }
+}
