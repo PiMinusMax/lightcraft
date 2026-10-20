@@ -4,7 +4,8 @@
 //! caller keeps its fixed budget. The answer is cached for a few seconds: renders ask often, and the
 //! query starts a process on NVIDIA. Only the first question for an adapter waits for the query; later
 //! ones get the last answer while a background thread asks again, so no render (and no lock it holds)
-//! waits for `nvidia-smi`.
+//! waits for `nvidia-smi`. A card is found by its PCI address where the backend reports it, else by its
+//! device id; when that matches several cards (two of the same model), the answer is `None`.
 
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -21,43 +22,100 @@ static CACHE: Cache = Cache::new(TTL);
 
 /// Free device memory of the adapter `info` describes, in bytes, or `None` when it cannot be asked.
 pub fn free_bytes(info: &wgpu::AdapterInfo) -> Option<u64> {
-    CACHE.get((info.vendor, info.device), query)
+    let adapter = Adapter { vendor: info.vendor, device: info.device, bus: pci_address(&info.device_pci_bus_id) };
+    CACHE.get(&adapter, query)
 }
 
-/// The last answer for one adapter (vendor, device): when it was asked, the answer, and whether a
-/// newer one is being asked for.
+/// Which card: vendor and device id, and the PCI address where the backend reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Adapter {
+    vendor: u32,
+    device: u32,
+    bus: Option<Pci>,
+}
+
+/// A PCI address: domain, bus, device, function.
+type Pci = [u32; 4];
+
+/// `0000:01:00.0` (Vulkan, sysfs) or `00000000:01:00.0` (`nvidia-smi`).
+fn pci_address(s: &str) -> Option<Pci> {
+    let mut parts = s.trim().split(':');
+    let (domain, bus, rest) = (parts.next()?, parts.next()?, parts.next()?);
+    let (device, function) = rest.split_once('.')?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let hex = |x: &str| u32::from_str_radix(x.trim(), 16).ok();
+    Some([hex(domain)?, hex(bus)?, hex(device)?, hex(function)?])
+}
+
+/// One card a driver lists, with its free memory in bytes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Card {
+    bus: Option<Pci>,
+    device: u32,
+    free: u64,
+}
+
+/// The free memory of `want` among the listed `cards`: the card at its PCI address when both sides
+/// report one, else the only card with its device id, else the only card listed. `None` when that is
+/// ambiguous or the address is listed by no card.
+fn pick(cards: &[Card], want: &Adapter) -> Option<u64> {
+    if let Some(bus) = want.bus
+        && cards.iter().any(|c| c.bus.is_some())
+    {
+        return cards.iter().find(|c| c.bus == Some(bus)).map(|c| c.free);
+    }
+    let mut same = cards.iter().filter(|c| c.device == want.device);
+    match (same.next(), same.next()) {
+        (Some(c), None) => Some(c.free),
+        (None, _) if cards.len() == 1 => cards.first().map(|c| c.free),
+        _ => None,
+    }
+}
+
+/// The last answer for one adapter: when it was asked, the answer, and since when a newer one is
+/// being asked for.
 struct Answer {
-    adapter: (u32, u32),
+    adapter: Adapter,
     at: Instant,
     free: Option<u64>,
-    asking: bool,
+    asking: Option<Instant>,
 }
+
+type Ask = fn(&Adapter) -> Option<u64>;
+
+/// Adapters remembered (a renderer, a face finder and a model may each use another device).
+const ADAPTERS: usize = 4;
+
+/// A background query not done after this is taken as lost, and the next question asks again.
+const LOST: Duration = Duration::from_secs(10);
 
 struct Cache {
     ttl: Duration,
-    last: Mutex<Option<Answer>>,
+    answers: Mutex<Vec<Answer>>,
 }
 
 impl Cache {
     const fn new(ttl: Duration) -> Self {
-        Cache { ttl, last: Mutex::new(None) }
+        Cache { ttl, answers: Mutex::new(Vec::new()) }
     }
 
     /// The answer of `ask` for `adapter`: cached, refreshed in the background once it is older than the
     /// TTL (in the caller where no thread can be started), and asked for directly the first time.
-    fn get(&'static self, adapter: (u32, u32), ask: fn(u32, u32) -> Option<u64>) -> Option<u64> {
+    fn get(&'static self, adapter: &Adapter, ask: Ask) -> Option<u64> {
         {
-            let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(a) = last.as_mut()
-                && a.adapter == adapter
-            {
-                if a.at.elapsed() >= self.ttl && !a.asking {
-                    let refresh = std::thread::Builder::new().name("vram-query".into()).spawn(move || self.store(adapter, ask(adapter.0, adapter.1)));
+            let mut answers = self.answers.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(a) = answers.iter_mut().find(|a| a.adapter == *adapter) {
+                let busy = a.asking.is_some_and(|t| t.elapsed() < LOST);
+                if a.at.elapsed() >= self.ttl && !busy {
+                    let adapter = *adapter;
+                    let refresh = std::thread::Builder::new().name("vram-query".into()).spawn(move || self.store(adapter, ask(&adapter)));
                     if refresh.is_err() {
-                        drop(last);
-                        return self.ask_now(adapter, ask);
+                        drop(answers);
+                        return self.ask_now(&adapter, ask);
                     }
-                    a.asking = true;
+                    a.asking = Some(Instant::now());
                 }
                 return a.free;
             }
@@ -65,69 +123,85 @@ impl Cache {
         self.ask_now(adapter, ask)
     }
 
-    fn ask_now(&self, adapter: (u32, u32), ask: fn(u32, u32) -> Option<u64>) -> Option<u64> {
-        let free = ask(adapter.0, adapter.1);
-        self.store(adapter, free);
+    fn ask_now(&self, adapter: &Adapter, ask: Ask) -> Option<u64> {
+        let free = ask(adapter);
+        self.store(*adapter, free);
         free
     }
 
-    fn store(&self, adapter: (u32, u32), free: Option<u64>) {
-        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some(Answer { adapter, at: Instant::now(), free, asking: false });
+    /// Keep `adapter`'s answer (each adapter has its own; the oldest one goes when the list is full).
+    fn store(&self, adapter: Adapter, free: Option<u64>) {
+        let mut answers = self.answers.lock().unwrap_or_else(PoisonError::into_inner);
+        answers.retain(|a| a.adapter != adapter);
+        if answers.len() >= ADAPTERS {
+            answers.remove(0);
+        }
+        answers.push(Answer { adapter, at: Instant::now(), free, asking: None });
+    }
+
+    #[cfg(test)]
+    fn asking(&self, adapter: &Adapter) -> bool {
+        self.answers.lock().unwrap_or_else(PoisonError::into_inner).iter().any(|a| a.adapter == *adapter && a.asking.is_some())
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn query(vendor: u32, device: u32) -> Option<u64> {
-    match vendor {
-        NVIDIA => nvidia(device),
-        AMD => amdgpu(vendor, device),
+fn query(adapter: &Adapter) -> Option<u64> {
+    match adapter.vendor {
+        NVIDIA => nvidia(adapter),
+        AMD => amdgpu(adapter),
         _ => None,
     }
 }
 
-/// `nvidia-smi --query-gpu=pci.device_id,memory.free`: one line per GPU, `0xDDDDVVVV, <MiB>`.
+/// `nvidia-smi --query-gpu=pci.bus_id,pci.device_id,memory.free`: one line per GPU,
+/// `DDDDDDDD:BB:DD.F, 0xDDDDVVVV, <MiB>`.
 #[cfg(not(target_arch = "wasm32"))]
-fn nvidia(device: u32) -> Option<u64> {
-    let out = run_with_timeout("nvidia-smi", &["--query-gpu=pci.device_id,memory.free", "--format=csv,noheader,nounits"])?;
-    parse_nvidia(&out, device)
+fn nvidia(adapter: &Adapter) -> Option<u64> {
+    let out = run_with_timeout("nvidia-smi", &["--query-gpu=pci.bus_id,pci.device_id,memory.free", "--format=csv,noheader,nounits"])?;
+    pick(&parse_nvidia(&out), adapter)
 }
 
-/// The free MiB of the GPU whose PCI id names `device`, or of the only GPU listed; in bytes.
-fn parse_nvidia(out: &str, device: u32) -> Option<u64> {
-    let gpus: Vec<(u32, u64)> = out
-        .lines()
+/// The cards `nvidia-smi` lists, free memory in bytes.
+fn parse_nvidia(out: &str) -> Vec<Card> {
+    out.lines()
         .filter_map(|l| {
-            let (id, free) = l.split_once(',')?;
+            let mut f = l.split(',');
+            let (bus, id, free) = (f.next()?, f.next()?, f.next()?);
             let id = u32::from_str_radix(id.trim().trim_start_matches("0x").trim_start_matches("0X"), 16).ok()?;
-            let free: u64 = free.trim().parse().ok()?;
-            Some((id >> 16, free))
+            let free = free.trim().parse::<u64>().ok()?.checked_mul(1 << 20)?;
+            Some(Card { bus: pci_address(bus), device: id >> 16, free })
         })
-        .collect();
-    let free = match gpus.iter().find(|g| g.0 == device) {
-        Some(g) => g.1,
-        None if gpus.len() == 1 => gpus.first()?.1,
-        None => return None,
-    };
-    free.checked_mul(1 << 20)
+        .collect()
 }
 
-/// `mem_info_vram_total - mem_info_vram_used` of the amdgpu card with this vendor and device id.
+/// `mem_info_vram_total - mem_info_vram_used` of the amdgpu card (its sysfs device directory is named
+/// by its PCI address).
 #[cfg(not(target_arch = "wasm32"))]
-fn amdgpu(vendor: u32, device: u32) -> Option<u64> {
+fn amdgpu(adapter: &Adapter) -> Option<u64> {
     let read_hex = |p: &std::path::Path| -> Option<u32> {
         let s = std::fs::read_to_string(p).ok()?;
         u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
     };
     let read_u64 = |p: &std::path::Path| -> Option<u64> { std::fs::read_to_string(p).ok()?.trim().parse().ok() };
+    let mut cards: Vec<Card> = Vec::new();
+    let mut seen = Vec::new();
     for entry in std::fs::read_dir("/sys/class/drm").ok()?.flatten() {
-        let dev = entry.path().join("device");
-        if read_hex(&dev.join("vendor")) != Some(vendor) || read_hex(&dev.join("device")) != Some(device) {
+        // card0 and renderD128 are the same device
+        let Ok(dev) = std::fs::canonicalize(entry.path().join("device")) else { continue };
+        if seen.contains(&dev) || read_hex(&dev.join("vendor")) != Some(adapter.vendor) {
             continue;
         }
-        let (Some(total), Some(used)) = (read_u64(&dev.join("mem_info_vram_total")), read_u64(&dev.join("mem_info_vram_used"))) else { continue };
-        return Some(total.saturating_sub(used));
+        seen.push(dev.clone());
+        let (Some(device), Some(total), Some(used)) =
+            (read_hex(&dev.join("device")), read_u64(&dev.join("mem_info_vram_total")), read_u64(&dev.join("mem_info_vram_used")))
+        else {
+            continue;
+        };
+        let bus = dev.file_name().and_then(|n| pci_address(&n.to_string_lossy()));
+        cards.push(Card { bus, device, free: total.saturating_sub(used) });
     }
-    None
+    pick(&cards, adapter)
 }
 
 /// Run a program and return its standard output, or `None` if it is missing, fails or takes too long.
@@ -167,41 +241,122 @@ fn run_with_timeout(program: &str, args: &[&str]) -> Option<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_stale_answer_is_returned_while_a_new_one_is_asked_for() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static CACHE: Cache = Cache::new(Duration::from_millis(50));
-        static ASKED: AtomicU64 = AtomicU64::new(0);
-        fn slow(_: u32, _: u32) -> Option<u64> {
-            std::thread::sleep(Duration::from_millis(300));
-            Some(ASKED.fetch_add(1, Ordering::SeqCst) + 1)
+    const fn adapter(vendor: u32, device: u32) -> Adapter {
+        Adapter { vendor, device, bus: None }
+    }
+
+    /// Wait until `flag` is set (a fake query that answers when the test says so), at most 10 s.
+    fn wait_for(flag: &std::sync::atomic::AtomicBool) {
+        let start = Instant::now();
+        while !flag.load(std::sync::atomic::Ordering::SeqCst) && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(1));
         }
-        // the first question waits for the answer
-        assert_eq!(CACHE.get((NVIDIA, 1), slow), Some(1));
-        std::thread::sleep(Duration::from_millis(80));
-        // stale: the old answer at once, a new one in the background
-        let t = Instant::now();
-        assert_eq!(CACHE.get((NVIDIA, 1), slow), Some(1));
-        assert_eq!(CACHE.get((NVIDIA, 1), slow), Some(1));
-        assert!(t.elapsed() < Duration::from_millis(200), "waited {:?} for the query", t.elapsed());
-        std::thread::sleep(Duration::from_millis(500));
-        assert_eq!(CACHE.get((NVIDIA, 1), slow), Some(2), "the background answer is kept");
-        assert_eq!(ASKED.load(Ordering::SeqCst), 2, "one query in the background, not one per question");
-        // another adapter is asked for directly
-        assert_eq!(CACHE.get((AMD, 2), slow), Some(3));
+    }
+
+    /// Wait until `cache` has no background query for `a` running, at most 10 s.
+    fn settled(cache: &Cache, a: &Adapter) {
+        let start = Instant::now();
+        while cache.asking(a) && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!cache.asking(a), "the background query finished");
     }
 
     #[test]
-    fn nvidia_output_is_matched_by_device_id() {
-        let two = "0x179B10DE, 3990\n0x1F0810DE, 5120\n";
-        assert_eq!(parse_nvidia(two, 0x1f08), Some(5120 << 20));
-        assert_eq!(parse_nvidia(two, 0x179b), Some(3990 << 20));
+    fn a_stale_answer_is_returned_while_a_new_one_is_asked_for() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        static CACHE: Cache = Cache::new(Duration::from_millis(20));
+        static ASKED: AtomicU64 = AtomicU64::new(0);
+        static ANSWER: AtomicBool = AtomicBool::new(true);
+        fn blocked(_: &Adapter) -> Option<u64> {
+            wait_for(&ANSWER);
+            Some(ASKED.fetch_add(1, Ordering::SeqCst) + 1)
+        }
+        let a = adapter(NVIDIA, 1);
+        // the first question waits for the answer
+        assert_eq!(CACHE.get(&a, blocked), Some(1));
+        std::thread::sleep(Duration::from_millis(40));
+        // stale, and the driver does not answer: the old answer at once, a new one in the background
+        ANSWER.store(false, Ordering::SeqCst);
+        let t = Instant::now();
+        assert_eq!(CACHE.get(&a, blocked), Some(1));
+        assert_eq!(CACHE.get(&a, blocked), Some(1));
+        assert!(t.elapsed() < Duration::from_secs(5), "waited {:?} for the query", t.elapsed());
+        assert!(CACHE.asking(&a));
+        ANSWER.store(true, Ordering::SeqCst);
+        settled(&CACHE, &a);
+        assert_eq!(CACHE.get(&a, blocked), Some(2), "the background answer is kept");
+        assert_eq!(ASKED.load(Ordering::SeqCst), 2, "one query in the background, not one per question");
+        // another adapter is asked for directly
+        assert_eq!(CACHE.get(&adapter(AMD, 2), blocked), Some(3));
+    }
+
+    #[test]
+    fn each_adapter_keeps_its_own_answer() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        static CACHE: Cache = Cache::new(Duration::from_millis(20));
+        static ASKED: AtomicU64 = AtomicU64::new(0);
+        static ANSWER: AtomicBool = AtomicBool::new(true);
+        // card 1 answers when the test says so, card 2 at once; 1000s and 2000s
+        fn ask(a: &Adapter) -> Option<u64> {
+            if a.device == 1 {
+                wait_for(&ANSWER);
+            }
+            Some(a.device as u64 * 1000 + ASKED.fetch_add(1, Ordering::SeqCst))
+        }
+        let (one, two) = (adapter(NVIDIA, 1), adapter(NVIDIA, 2));
+        assert_eq!(CACHE.get(&one, ask), Some(1000));
+        assert_eq!(CACHE.get(&two, ask), Some(2001));
+        std::thread::sleep(Duration::from_millis(40));
+        // card 1 refreshes in the background while card 2 is asked for: neither waits, nor replaces the other
+        ANSWER.store(false, Ordering::SeqCst);
+        assert_eq!(CACHE.get(&one, ask), Some(1000));
+        assert_eq!(CACHE.get(&two, ask), Some(2001));
+        settled(&CACHE, &two);
+        ANSWER.store(true, Ordering::SeqCst);
+        settled(&CACHE, &one);
+        let asked = ASKED.load(Ordering::SeqCst);
+        assert_eq!(asked, 4, "one background query per card");
+        let (a1, a2) = (CACHE.get(&one, ask), CACHE.get(&two, ask));
+        assert!(a1.is_some_and(|v| v / 1000 == 1) && a2.is_some_and(|v| v / 1000 == 2), "{a1:?} {a2:?}");
+        assert_eq!(ASKED.load(Ordering::SeqCst), asked, "fresh answers are not asked for again");
+    }
+
+    #[test]
+    fn pci_addresses_parse_in_both_forms() {
+        assert_eq!(pci_address("0000:01:00.0"), Some([0, 1, 0, 0]));
+        assert_eq!(pci_address("00000000:0A:00.1"), Some([0, 10, 0, 1]));
+        assert_eq!(pci_address(""), None);
+        assert_eq!(pci_address("01:00.0"), None);
+        assert_eq!(pci_address("0000:01:00.0:9"), None);
+    }
+
+    #[test]
+    fn nvidia_output_is_matched_by_address_then_device_id() {
+        let two = "00000000:01:00.0, 0x179B10DE, 3990\n00000000:02:00.0, 0x1F0810DE, 5120\n";
+        let cards = parse_nvidia(two);
+        assert_eq!(pick(&cards, &adapter(NVIDIA, 0x1f08)), Some(5120 << 20));
+        assert_eq!(pick(&cards, &adapter(NVIDIA, 0x179b)), Some(3990 << 20));
         // several GPUs and none matches: unknown
-        assert_eq!(parse_nvidia(two, 0x2204), None);
+        assert_eq!(pick(&cards, &adapter(NVIDIA, 0x2204)), None);
         // a single GPU is taken even if its id is reported differently
-        assert_eq!(parse_nvidia("0x179B10DE, 3990\n", 0x1234), Some(3990 << 20));
+        assert_eq!(pick(&parse_nvidia("00000000:01:00.0, 0x179B10DE, 3990\n"), &adapter(NVIDIA, 0x1234)), Some(3990 << 20));
         // garbage is not a number
-        assert_eq!(parse_nvidia("No devices were found\n", 0x179b), None);
-        assert_eq!(parse_nvidia("", 0x179b), None);
+        assert!(parse_nvidia("No devices were found\n").is_empty());
+        assert_eq!(pick(&parse_nvidia(""), &adapter(NVIDIA, 0x179b)), None);
+    }
+
+    #[test]
+    fn two_cards_of_one_model_are_told_apart_by_address_or_not_at_all() {
+        let twins = parse_nvidia("00000000:01:00.0, 0x1F0810DE, 1000\n00000000:02:00.0, 0x1F0810DE, 6000\n");
+        let at = |bus| Adapter { bus: pci_address(bus), ..adapter(NVIDIA, 0x1f08) };
+        assert_eq!(pick(&twins, &at("0000:02:00.0")), Some(6000 << 20));
+        assert_eq!(pick(&twins, &at("0000:01:00.0")), Some(1000 << 20));
+        // without an address the model alone is ambiguous: no answer, the caller keeps its fixed budget
+        assert_eq!(pick(&twins, &adapter(NVIDIA, 0x1f08)), None);
+        assert_eq!(pick(&twins, &at("")), None);
+        // an address no card has is no card: the model is not looked up instead
+        let mixed = parse_nvidia("00000000:01:00.0, 0x1F0810DE, 1000\n00000000:02:00.0, 0x220410DE, 6000\n");
+        assert_eq!(pick(&mixed, &at("0000:03:00.0")), None);
     }
 }
