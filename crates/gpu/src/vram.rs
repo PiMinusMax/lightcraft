@@ -139,6 +139,17 @@ impl Cache {
         answers.push(Answer { adapter, at: Instant::now(), free, asking: None });
     }
 
+    /// Make `adapter`'s answer as old as the TTL (tests: no waiting, so no answer goes stale by itself
+    /// on a slow machine). `false` when there is no answer, or the clock does not reach that far back.
+    #[cfg(test)]
+    fn expire(&self, adapter: &Adapter) -> bool {
+        let mut answers = self.answers.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(a) = answers.iter_mut().find(|a| a.adapter == *adapter) else { return false };
+        let Some(at) = a.at.checked_sub(self.ttl) else { return false };
+        a.at = at;
+        true
+    }
+
     #[cfg(test)]
     fn asking(&self, adapter: &Adapter) -> bool {
         self.answers.lock().unwrap_or_else(PoisonError::into_inner).iter().any(|a| a.adapter == *adapter && a.asking.is_some())
@@ -265,7 +276,7 @@ mod tests {
     #[test]
     fn a_stale_answer_is_returned_while_a_new_one_is_asked_for() {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-        static CACHE: Cache = Cache::new(Duration::from_millis(20));
+        static CACHE: Cache = Cache::new(Duration::from_secs(30));
         static ASKED: AtomicU64 = AtomicU64::new(0);
         static ANSWER: AtomicBool = AtomicBool::new(true);
         fn blocked(_: &Adapter) -> Option<u64> {
@@ -275,7 +286,7 @@ mod tests {
         let a = adapter(NVIDIA, 1);
         // the first question waits for the answer
         assert_eq!(CACHE.get(&a, blocked), Some(1));
-        std::thread::sleep(Duration::from_millis(40));
+        assert!(CACHE.expire(&a));
         // stale, and the driver does not answer: the old answer at once, a new one in the background
         ANSWER.store(false, Ordering::SeqCst);
         let t = Instant::now();
@@ -294,7 +305,7 @@ mod tests {
     #[test]
     fn each_adapter_keeps_its_own_answer() {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-        static CACHE: Cache = Cache::new(Duration::from_millis(20));
+        static CACHE: Cache = Cache::new(Duration::from_secs(30));
         static ASKED: AtomicU64 = AtomicU64::new(0);
         static ANSWER: AtomicBool = AtomicBool::new(true);
         // card 1 answers when the test says so, card 2 at once; 1000s and 2000s
@@ -307,7 +318,7 @@ mod tests {
         let (one, two) = (adapter(NVIDIA, 1), adapter(NVIDIA, 2));
         assert_eq!(CACHE.get(&one, ask), Some(1000));
         assert_eq!(CACHE.get(&two, ask), Some(2001));
-        std::thread::sleep(Duration::from_millis(40));
+        assert!(CACHE.expire(&one) && CACHE.expire(&two));
         // card 1 refreshes in the background while card 2 is asked for: neither waits, nor replaces the other
         ANSWER.store(false, Ordering::SeqCst);
         assert_eq!(CACHE.get(&one, ask), Some(1000));
