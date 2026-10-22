@@ -362,7 +362,8 @@ fn auto_develop_scopes_auto_sync_and_undo_to_one_photo() {
         assert_eq!(result["before"], before);
         assert_eq!(result["after"], b.session.execute("develop.get", &json!({"id": second.0})).unwrap());
         assert_ne!(result["before"], result["after"]);
-        assert_eq!(b.session.selection.ids, vec![second]);
+        // one request names the photo: the user's selection and active photo stay as they were
+        assert_eq!((b.session.selection.ids.clone(), b.session.selection.active), (vec![first, second], Some(first)));
         assert!(b.session.auto_sync, "keep the user's Auto Sync preference");
         assert_eq!(untouched, b.session.execute("develop.get", &json!({"id": first.0})).unwrap());
         if adjustment == "tone" {

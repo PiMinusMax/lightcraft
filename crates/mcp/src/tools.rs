@@ -188,7 +188,7 @@ pub fn helper_tools(has_ui: bool) -> Vec<Value> {
         tool(
             "auto_develop",
             "Auto-correct a photo",
-            "Apply one automatic correction to an explicit photo: tone replaces exposure, contrast, highlights, shadows, whites, blacks, vibrance and saturation; white_balance replaces white balance. Selects only this photo, so Auto Sync cannot affect other photos. One undo step; returns before/after develop settings. Inspect render_preview before and after. For both corrections, apply white_balance first, then tone.",
+            "Apply one automatic correction to an explicit photo: tone replaces exposure, contrast, highlights, shadows, whites, blacks, vibrance and saturation; white_balance replaces white balance. Edits only this photo in one request: the selection stays as it is and Auto Sync does not carry the correction to other photos. One undo step; returns before/after develop settings. Inspect render_preview before and after. For both corrections, apply white_balance first, then tone.",
             json!({
                 "id": {"type": "integer", "minimum": 1, "description": "Required target photo id from query_photos or doc_inspect"},
                 "adjustment": {"type": "string", "enum": ["tone", "white_balance"], "description": "Which automatic correction to apply"}
@@ -460,13 +460,13 @@ fn check_photo_id(args: &Value) -> Result<(), String> {
 fn auto_develop(b: &mut dyn Backend, args: &Value) -> Result<Value, String> {
     let id = args.get("id").and_then(Value::as_u64).filter(|id| *id > 0).ok_or("missing positive integer photo `id`")?;
     let (command, params) = match args.get("adjustment").and_then(Value::as_str) {
-        Some("tone") => ("develop.auto", json!({})),
-        Some("white_balance") => ("develop.wb", json!({"mode": "auto"})),
+        Some("tone") => ("develop.auto", json!({"id": id})),
+        Some("white_balance") => ("develop.wb", json!({"mode": "auto", "id": id})),
         _ => return Err("`adjustment` must be tone or white_balance".into()),
     };
     let before = exec(b, "develop.get", json!({"id": id}))?;
-    // Replacing the selection with one photo also scopes the engine's Auto Sync.
-    activate(b, args)?;
+    // One request names the photo: the engine edits it alone (no Auto Sync) and leaves the selection as it is,
+    // so a photo the user selects between two requests (`--connect`) is never the one corrected.
     let result = exec(b, command, params)?;
     let after = exec(b, "develop.get", json!({"id": id}))
         .map_err(|e| format!("correction applied to photo {id}, but could not read resulting settings: {e}"))?;
