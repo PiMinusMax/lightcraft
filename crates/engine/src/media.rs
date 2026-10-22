@@ -708,7 +708,7 @@ impl MediaCache {
     }
 
     fn source_ref_plain(&mut self, p: &Photo, level: SourceLevel, cached: bool) -> SourceRef {
-        let outliers = p.develop.detail.nr_outliers;
+        let outliers = p.develop.removes_hot_pixels();
         // a source decoded before the outlier box was switched is decoded again
         if cached && let Some(a) = self.get_source(p.id, level).filter(|a| a.fits_outliers(outliers)) {
             return SourceRef::Loaded(Box::new(a));
@@ -1915,6 +1915,28 @@ mod thumbnail_hash_tests {
         render(&mut s);
         assert_eq!(*asked.lock().unwrap(), [false, true, false, false]);
     }
+    /// With the Detail section's eye off, Remove Hot Pixels contributes nothing either: the raw is decoded without it.
+    #[test]
+    fn detail_eye_off_decodes_the_raw_without_hot_pixel_removal() {
+        let mut s = session();
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = asked.clone();
+        s.media.file_loader = Some(Arc::new(move |_, _, outliers| {
+            log.lock().unwrap().push(outliers);
+            Ok((Rgb32f::new(8, 8), SourceInfo { raw: true, ..Default::default() }))
+        }));
+        for eye in [true, false] {
+            let mut d = (*s.catalog.photo(PhotoId(1)).unwrap().develop).clone();
+            d.detail.nr_outliers = true;
+            d.set_section_enabled("detail", eye);
+            d.light.exposure += 0.1;
+            s.catalog.apply(Op::SetDevelop { id: PhotoId(1), settings: Arc::new(d), label: "eye".into(), edited: None }).unwrap();
+            let r = s.thumb_job(PhotoId(1), 256).unwrap().run();
+            s.accept(&r);
+        }
+        assert_eq!(*asked.lock().unwrap(), [true, false]);
+    }
+
     #[test]
     fn source_from_before_content_reload_is_not_accepted() {
         let mut s = session();

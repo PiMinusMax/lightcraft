@@ -130,7 +130,7 @@ impl WireJob {
     fn source_key(&self) -> String {
         match &self.origin {
             Source::File { path } => {
-                format!("{}:{:?}:{}:{}:{path}", self.cache_generation, self.source_identity, self.max_edge, self.settings.detail.nr_outliers)
+                format!("{}:{:?}:{}:{}:{path}", self.cache_generation, self.source_identity, self.max_edge, self.settings.removes_hot_pixels())
             }
             Source::Demo { scene } => format!("{}:{:?}:{}:demo:{scene}", self.cache_generation, self.source_identity, self.max_edge),
         }
@@ -183,7 +183,7 @@ impl WorkerCore {
             None => {
                 let src = match (&job.origin, original) {
                     (Source::File { .. }, Some(bytes)) => {
-                        let outliers = job.settings.detail.nr_outliers;
+                        let outliers = job.settings.removes_hot_pixels();
                         let (image, info) = lightcraft_engine::files::load_bytes_with(bytes, job.max_edge, outliers)?;
                         DecodedSource { outliers, ..DecodedSource::new(Arc::new(image), Some(info)) }
                     }

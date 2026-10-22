@@ -144,6 +144,12 @@ impl DevelopSettings {
         std::borrow::Cow::Owned(d)
     }
 
+    /// Whether a raw is decoded with its single outlier photosites replaced: Remove Hot Pixels is on and the Detail
+    /// section's eye is too (an Edit-panel section that is off contributes nothing, as in [`Self::effective`]).
+    pub fn removes_hot_pixels(&self) -> bool {
+        self.detail.nr_outliers && self.section_enabled("detail")
+    }
+
     /// How much of the AI-denoised picture to mix in, 0 (none) to 1 (all of it): the Denoise amount, unless the Detail
     /// section is switched off or the value is not a number.
     pub fn denoise_amount(&self) -> f32 {
@@ -169,7 +175,11 @@ impl DevelopSettings {
                 self.curve = d;
             }
             Section::Color => self.wb.mode = WbMode::AsShot,
-            Section::Detail => self.enhance.denoise_on = None,
+            Section::Detail => {
+                self.enhance.denoise_on = None;
+                // not a slider: reset like them, to the general default (off)
+                self.detail.nr_outliers = false;
+            }
             _ => {}
         }
     }
@@ -209,6 +219,14 @@ mod tests {
         let mut target = DevelopSettings::for_raw(5500.0, 10.0).to_json();
         crate::presets::deep_merge(&mut target, &copied);
         assert!(!DevelopSettings::from_json(&target).unwrap().detail.nr_outliers);
+        // the Detail eye switches it off for the decode too, and Reset Detail resets it like the sliders
+        let mut raw = DevelopSettings::for_raw(5500.0, 10.0);
+        assert!(raw.removes_hot_pixels());
+        raw.set_section_enabled("detail", false);
+        assert!(!raw.removes_hot_pixels());
+        raw.set_section_enabled("detail", true);
+        raw.reset_section(Section::Detail);
+        assert!(!raw.detail.nr_outliers && !raw.removes_hot_pixels());
     }
 
     #[test]
