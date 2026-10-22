@@ -205,9 +205,10 @@ impl DecodedSource {
     }
 
     /// Whether this source can stand for one decoded with `outliers`: a raw decode must match it; anything without a
-    /// mosaic (a rendered file, a smart preview, a demo scene) has nothing the flag would change.
+    /// mosaic (a rendered file, a smart preview, a demo scene) has nothing the flag would change. A smart preview's
+    /// facts say `raw` for a raw photo, so it is told apart by `from_proxy`.
     pub fn fits_outliers(&self, outliers: bool) -> bool {
-        self.outliers == outliers || !self.info.as_ref().is_some_and(|i| i.raw)
+        self.outliers == outliers || self.from_proxy || !self.info.as_ref().is_some_and(|i| i.raw)
     }
 
     /// The picture to develop for a Denoise `amount` (0 to 1, see [`DevelopSettings::denoise_amount`]): the plain one,
@@ -1860,6 +1861,17 @@ mod thumbnail_hash_tests {
         assert!(s.media.settings_hashes.entries.is_empty());
         assert!(s.media.settings_hashes.order.is_empty());
     }
+    /// A raw photo's smart preview has no mosaic left: it stands in with the box on or off, so an offline raw keeps
+    /// reusing the decoded proxy instead of reading the file again for every render.
+    #[test]
+    fn a_smart_preview_fits_either_hot_pixel_setting() {
+        let raw = SourceInfo { raw: true, ..Default::default() };
+        let decoded = DecodedSource::new(Arc::new(Rgb32f::new(8, 8)), Some(raw));
+        assert!(decoded.fits_outliers(false) && !decoded.fits_outliers(true), "a raw decode must match the box");
+        let proxy = DecodedSource { from_proxy: true, ..decoded };
+        assert!(proxy.fits_outliers(false) && proxy.fits_outliers(true));
+    }
+
     /// The Remove Hot Pixels box decides how a raw is decoded (#1345): the loader is told, and a source decoded with
     /// the other setting is not reused. A rendered file has no mosaic, so its source stays.
     #[test]

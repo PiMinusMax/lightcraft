@@ -626,7 +626,9 @@ pub struct Detail {
     /// Replace single outlier photosites (noise spikes far above all their same-colour neighbours) in the
     /// raw mosaic before demosaicing, so they do not become coloured dots (#1345). On for newly imported
     /// raws ([`crate::DevelopSettings::for_raw`]); off for edits saved before it existed, so they look the
-    /// same. Raw files only.
+    /// same. Raw files only. Omitted when off, so settings saved before it keep their JSON (and hash, and with it
+    /// their cached thumbnails).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub nr_outliers: bool,
 }
 

@@ -39,6 +39,18 @@ impl DevelopSettings {
         serde_json::from_value(v.clone())
     }
 
+    /// [`Self::to_json`] with Remove Hot Pixels (`detail.nr_outliers`) stated even when off, for JSON that is copied,
+    /// merged, scaled or compared key by key (copy / paste, presets, Auto Sync). The stored JSON leaves it out when
+    /// off, so settings saved before it keep their hash; a merge needs the `false`, or copying Detail would not turn
+    /// the box off and a preset applied at an amount would not find its base value.
+    pub fn to_json_for_merge(&self) -> Value {
+        let mut v = self.to_json();
+        if let Some(detail) = v.get_mut("detail").and_then(Value::as_object_mut) {
+            detail.insert("nr_outliers".into(), Value::Bool(self.detail.nr_outliers));
+        }
+        v
+    }
+
     /// Merge a partial JSON object into these settings (fields not mentioned are kept). A white balance that
     /// names no [`WbScale`] keeps the meaning it always had (`Legacy`), whatever scale these settings were on: a
     /// partial from before the scale existed, or one that never said, must not become Kelvin by landing on
@@ -189,6 +201,14 @@ mod tests {
         assert!(!read.detail.nr_outliers);
         assert_eq!(read.detail.nr_color, 25.0, "the rest of the saved edit is kept");
         assert_ne!(read.hash64(), DevelopSettings::for_raw(5500.0, 10.0).hash64(), "cached renders are told apart");
+        // off is omitted: an edit saved before the box keeps its JSON, and so its hash and cached thumbnails
+        assert_eq!(read.to_json(), saved);
+        // copying Detail still carries the box when it is off
+        let copied = crate::extract_groups(&read, &[crate::SettingsGroup::Detail]);
+        assert_eq!(copied["detail"]["nr_outliers"], false);
+        let mut target = DevelopSettings::for_raw(5500.0, 10.0).to_json();
+        crate::presets::deep_merge(&mut target, &copied);
+        assert!(!DevelopSettings::from_json(&target).unwrap().detail.nr_outliers);
     }
 
     #[test]
