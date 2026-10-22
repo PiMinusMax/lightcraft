@@ -153,9 +153,9 @@ all engine commands through `command_run`.
 `auto_develop` requires both `id` (a positive integer) and `adjustment` (`tone` or
 `white_balance`). It runs `develop.auto {id}` or `develop.wb {mode:"auto", id}` as one
 request: the engine corrects that photo alone, leaves the selection as it is, and Auto Sync
-does not propagate the correction to other selected photos. With `--connect`, a photo the
-user selects in the app meanwhile is therefore never the one corrected. Each correction is
-one undo step, separate from any pending slider interaction.
+does not propagate the correction to other selected photos. With `--connect`, selecting
+another photo in the app meanwhile cannot redirect the correction: it always lands on `id`.
+Each correction is one undo step, separate from any pending slider interaction.
 It returns `{id, adjustment, before, after, result}`; `before` and `after` are full develop
 settings. Tone replaces the eight light/color values used by Auto Settings; white balance
 is a separate choice. When both are wanted, correct white balance before tone.
