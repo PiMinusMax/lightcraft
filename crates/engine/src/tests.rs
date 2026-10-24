@@ -966,6 +966,29 @@ fn auto_sync_carries_remove_hot_pixels_off() {
 }
 
 #[test]
+fn the_hot_pixel_limit_renders_afresh_only_the_photos_that_remove_hot_pixels() {
+    use lightcraft_catalog::PhotoId;
+    let mut s = demo();
+    let ids: Vec<PhotoId> = s.catalog.photos().take(2).map(|p| p.id).collect();
+    let mut d = (*s.develop_of(ids[0]).unwrap()).clone();
+    d.detail.nr_outliers = true;
+    s.set_develop(ids[0], d, "Setup").unwrap();
+    let keys = |s: &mut crate::Session| ids.iter().map(|id| s.thumb_job(*id, 256).unwrap().cache.unwrap().1).collect::<Vec<_>>();
+    let before = keys(&mut s);
+    assert_eq!(s.execute("app.hotPixelLimit", &json!({})).unwrap()["default"], 0.2);
+    assert!(s.execute("app.hotPixelLimit", &json!({"percent": 0})).is_err());
+    assert!(s.execute("app.hotPixelLimit", &json!({"percent": "1"})).is_err());
+    let r = s.execute("app.hotPixelLimit", &json!({"percent": 1.5}));
+    let after = keys(&mut s);
+    // (process-wide: back to the default before anything can fail)
+    s.execute("app.hotPixelLimit", &json!({"percent": 0.2})).unwrap();
+    assert_eq!(r.unwrap()["percent"], 1.5);
+    assert_ne!(after[0], before[0], "a photo that removes hot pixels renders with the new limit");
+    assert_eq!(after[1], before[1], "the other photo's thumbnail stays valid");
+    assert_eq!(keys(&mut s), before, "the default limit keeps the keys it always had");
+}
+
+#[test]
 fn auto_sync_camera_local_tone_off_preserves_other_settings() {
     use lightcraft_catalog::PhotoId;
     let mut s = demo();

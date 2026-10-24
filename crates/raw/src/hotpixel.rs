@@ -19,8 +19,9 @@
 //!    pairs, so a single lit neighbour doesn't count.
 //! 4. The rest are replaced by the median of their same-colour neighbours.
 //!
-//! If more than [`MAX_SHARE`] of the photosites would be replaced, the image doesn't fit the model
-//! (a synthetic pattern, a star field shot through a pinhole) and nothing is changed.
+//! If more than a share of the photosites would be replaced (by default [`HOT_PIXEL_MAX_SHARE`]; the caller may
+//! choose another), the image doesn't fit the model (a synthetic pattern, a star field shot through a pinhole) and
+//! nothing is changed. Real light kept in step 3 doesn't count: a dense star field still has its hot pixels removed.
 
 use crate::{RawData, RawImage};
 use rayon::prelude::*;
@@ -39,8 +40,8 @@ const BINS: usize = 32;
 const MIN_BIN_SAMPLES: usize = 64;
 /// Photosites this close to the active area's edge are left alone (their neighbourhood is cut).
 const MARGIN: usize = 4;
-/// More replaced than this share of the photosites and the result is discarded.
-const MAX_SHARE: f64 = 2e-3;
+/// More replaced than this share of the photosites and the result is discarded (unless the caller chooses another).
+pub const HOT_PIXEL_MAX_SHARE: f64 = 2e-3;
 
 /// For one position in the CFA pattern: the offsets of the nearest same-colour photosites (at most 8,
 /// within two photosites) and of the 8 direct neighbours.
@@ -129,6 +130,11 @@ impl RawImage {
     /// Replace isolated hot photosites by the median of their same-colour neighbours (see the module docs).
     /// Returns how many were replaced. Only single-plane integer CFA data is examined.
     pub fn suppress_hot_pixels(&mut self) -> usize {
+        self.suppress_hot_pixels_with(HOT_PIXEL_MAX_SHARE)
+    }
+
+    /// [`Self::suppress_hot_pixels`], giving up when more than `max_share` of the photosites (0..1) would be replaced.
+    pub fn suppress_hot_pixels_with(&mut self, max_share: f64) -> usize {
         let Some(cfa) = self.cfa.clone() else { return 0 };
         let (w, h, a) = (self.width, self.height, self.active_area);
         let black = self.black.mean();
@@ -154,13 +160,15 @@ impl RawImage {
             let v = View { d: d.as_slice(), w, pw: cfa.width, ph: cfa.height, phases: &phases };
             let Some(noise) = noise_model(&v, (x0, x1, y0, y1), black, range) else { return 0 };
             let candidates = candidates(&v, (x0, x1, y0, y1), black, noise);
-            let sites = (x1 - x0) * (y1 - y0);
-            if candidates.len() as f64 > MAX_SHARE * sites as f64 {
-                return 0;
-            }
             let mut buf = Vec::with_capacity(8);
             let n_cand = candidates.len();
             let kept: Vec<_> = candidates.into_iter().filter(|&(x, y, _)| !lit_around(&v, x, y, black, noise, &mut buf)).collect();
+            // (real light kept above doesn't count against the limit)
+            let sites = (x1 - x0) * (y1 - y0);
+            let limit = max_share * sites as f64;
+            if limit.is_nan() || kept.len() as f64 > limit {
+                return 0;
+            }
             if std::env::var_os("LIGHTCRAFT_PROFILE").is_some() {
                 eprintln!(
                     "  hot pixels: noise σ² = {:.3}·L + {:.1} (σ at 0: {:.1}, at 1 %: {:.1}), {n_cand} candidates, {} real light",
@@ -453,6 +461,47 @@ mod tests {
         set(&mut r, 64, 64, 1500);
         assert_eq!(r.suppress_hot_pixels(), 1);
         assert!(get(&r, 64, 64) < 600);
+    }
+
+    #[test]
+    fn a_dense_star_field_keeps_its_stars_and_loses_its_hot_pixels() {
+        let mut r = mosaic(256, 256);
+        // 225 small stars: more candidates than 0.2 % of the photosites, every one of them real light
+        for sy in 0..15 {
+            for sx in 0..15 {
+                let (cx, cy) = (16 + 16 * sx, 16 + 16 * sy);
+                for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        let v = if dx == 0 && dy == 0 { 12000 } else { 5000 };
+                        set(&mut r, (cx + dx) as usize, (cy + dy) as usize, v);
+                    }
+                }
+            }
+        }
+        let hot = [(24, 24), (105, 72), (201, 153)];
+        for &(x, y) in &hot {
+            set(&mut r, x, y, 9000);
+        }
+        assert_eq!(r.suppress_hot_pixels(), 3);
+        for &(x, y) in &hot {
+            assert!(get(&r, x, y) < 2700, "({x}, {y}) = {}", get(&r, x, y));
+        }
+        assert_eq!(get(&r, 16, 16), 12000, "a star is left alone");
+    }
+
+    #[test]
+    fn the_limit_is_the_callers() {
+        let mut r = mosaic(256, 256);
+        let hot = [(40, 40), (101, 60), (151, 151), (200, 30)];
+        for &(x, y) in &hot {
+            set(&mut r, x, y, 9000);
+        }
+        let before = r.data.clone();
+        // 4 of 248 × 248 photosites: above a limit of 0.005 %, within 0.01 %
+        assert_eq!(r.suppress_hot_pixels_with(5e-5), 0);
+        assert_eq!(r.data, before);
+        assert_eq!(r.suppress_hot_pixels_with(1e-4), 4);
+        assert_eq!(r.clone().suppress_hot_pixels_with(f64::NAN), 0, "a limit that is not a number replaces nothing");
     }
 
     #[test]

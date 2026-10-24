@@ -360,6 +360,34 @@ pub fn bin_factor(raw: &lightcraft_raw::RawImage, max_edge: usize) -> Option<usi
     [8usize, 6, 4, 3, 2].into_iter().find(|&k| raw.can_bin(k) && (long / k >= need || (k == 3 && !raw.can_bin(2) && long / k >= need3)))
 }
 
+/// Remove Hot Pixels leaves a raw alone when more than this share of its photosites would be replaced (Settings ▸
+/// Performance ▸ Hot pixel limit, `app.hotPixelLimit`), as `f64` bits. Process-wide, like the GPU switch.
+static HOT_PIXEL_LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(lightcraft_raw::HOT_PIXEL_MAX_SHARE.to_bits());
+
+/// The share of a raw's photosites Remove Hot Pixels may replace (0..1).
+pub fn hot_pixel_limit() -> f64 {
+    f64::from_bits(HOT_PIXEL_LIMIT.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Set [`hot_pixel_limit`]; false (nothing changed) unless `share` is a new value in 0..=1. Sources decoded before
+/// keep the old limit: the caller forgets them ([`crate::media::MediaCache::clear_sources`]).
+pub fn set_hot_pixel_limit(share: f64) -> bool {
+    if !(0.0..=1.0).contains(&share) {
+        return false;
+    }
+    HOT_PIXEL_LIMIT.swap(share.to_bits(), std::sync::atomic::Ordering::Relaxed) != share.to_bits()
+}
+
+/// What [`hot_pixel_limit`] adds to the render cache keys of `settings`: nothing at the default limit or when they
+/// don't remove hot pixels, so those renders stay valid whatever the limit.
+pub fn hot_pixel_key(settings: &lightcraft_develop::DevelopSettings) -> u64 {
+    let limit = hot_pixel_limit();
+    if !settings.removes_hot_pixels() || limit.to_bits() == lightcraft_raw::HOT_PIXEL_MAX_SHARE.to_bits() {
+        return 0;
+    }
+    limit.to_bits().wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29)
+}
+
 /// Decode a file into a linear Rec.2020 image no larger than `max_edge`, oriented.
 ///
 /// Runs on a rayon worker: its many short parallel loops then start on the worker's own queue
@@ -452,7 +480,7 @@ fn load_bytes_now(
         // single outlier photosites, replaced in the mosaic before anything is developed from it (#1345)
         if outliers {
             let t = std::time::Instant::now();
-            let n = raw.suppress_hot_pixels();
+            let n = raw.suppress_hot_pixels_with(hot_pixel_limit());
             if lightcraft_pipeline::profiling() {
                 eprintln!("[profile] raw outliers: {n} photosites replaced in {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
             }
