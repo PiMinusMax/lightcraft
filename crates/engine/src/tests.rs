@@ -987,7 +987,7 @@ fn the_hot_pixel_limit_renders_afresh_only_the_photos_that_remove_hot_pixels() {
     let r = s.execute("app.hotPixelLimit", &json!({"percent": 1.5}));
     let after = keys(&mut s);
     // (process-wide: back to the default before anything can fail)
-    s.execute("app.hotPixelLimit", &json!({"percent": 0.2})).unwrap();
+    s.execute("app.hotPixelLimit", &json!({"percent": 0.2f32})).unwrap();
     assert_eq!(r.unwrap()["percent"], 1.5);
     assert_ne!(after[0], before[0], "a photo that removes hot pixels renders with the new limit");
     assert_eq!(after[1], before[1], "the other photo's thumbnail stays valid");

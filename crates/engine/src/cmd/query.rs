@@ -259,7 +259,10 @@ pub fn specs() -> Vec<CommandSpec> {
                 let Some(percent) = v.as_f64().filter(|x| (0.001..=100.0).contains(x)) else {
                     return Err(bad("app.hotPixelLimit", "percent must be a number in 0.001..100"));
                 };
-                if crate::files::set_hot_pixel_limit(percent / 100.0) {
+                // (the default as an `f32` from the app's settings, 0.2000000029…, is the default: its keys stay)
+                let default = lightcraft_raw::HOT_PIXEL_MAX_SHARE;
+                let share = if (percent / 100.0 / default - 1.0).abs() < 1e-6 { default } else { percent / 100.0 };
+                if crate::files::set_hot_pixel_limit(share) {
                     // decoded with the old limit, and their render keys change
                     s.media.clear_sources();
                 }
